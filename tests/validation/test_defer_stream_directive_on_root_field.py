@@ -1,0 +1,442 @@
+from functools import partial
+
+from graphql.utilities import build_schema
+from graphql.validation import DeferStreamDirectiveOnRootField
+
+from .harness import assert_validation_errors
+
+schema = build_schema(
+    """
+    type Message {
+      body: String
+      sender: String
+    }
+
+    interface Root {
+      rootField: Message
+    }
+
+    type SubscriptionRoot implements Root {
+      subscriptionField: Message
+      subscriptionListField: [Message]
+      rootField: Message
+    }
+
+    type MutationRoot implements Root {
+      mutationField: Message
+      mutationListField: [Message]
+      rootField: Message
+    }
+
+    type QueryRoot implements Root {
+      message: Message
+      messages: [Message]
+      rootField: Message
+    }
+
+    schema {
+      query: QueryRoot
+      mutation: MutationRoot
+      subscription: SubscriptionRoot
+    }
+    """
+)
+
+assert_errors = partial(
+    assert_validation_errors, DeferStreamDirectiveOnRootField, schema=schema
+)
+
+assert_valid = partial(assert_errors, errors=[])
+
+
+def describe_defer_stream_on_root_field():
+    def defer_fragments_spread_on_root_field():
+        assert_valid(
+            """
+            {
+              ...rootQueryFragment @defer
+            }
+            fragment rootQueryFragment on QueryRoot {
+              message {
+                body
+              }
+            }
+            """
+        )
+
+    def defer_inline_fragment_spread_on_root_query_field():
+        assert_valid(
+            """
+            {
+              ... @defer {
+                message {
+                  body
+                }
+              }
+            }
+            """
+        )
+
+    def defer_fragment_spread_on_root_mutation_field():
+        assert_errors(
+            """
+            mutation {
+              ...rootFragment @defer
+              ...otherFragment
+            }
+            fragment otherFragment on MutationRoot {
+              ...rootFragment
+              mutationListField {
+                body
+              }
+            }
+            fragment rootFragment on MutationRoot {
+              mutationField {
+                body
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Defer directive cannot be used on root"
+                    " mutation type 'MutationRoot'.",
+                    "locations": [(3, 31)],
+                },
+            ],
+        )
+
+    def fragment_spread_cycle_on_root_mutation_field():
+        assert_valid(
+            """
+            mutation {
+              ...rootFragment
+            }
+            fragment rootFragment on MutationRoot {
+              ...otherFragment
+            }
+            fragment otherFragment on MutationRoot {
+              ...rootFragment
+            }
+            """
+        )
+
+    def self_referencing_fragment_spread_on_root_mutation_field():
+        assert_valid(
+            """
+            mutation {
+              ...rootFragment
+            }
+            fragment rootFragment on MutationRoot {
+              ...rootFragment
+            }
+            """
+        )
+
+    def defer_fragment_spread_on_root_mutation_field_interface():
+        assert_errors(
+            """
+            mutation {
+              ...rootFragment
+            }
+            fragment rootFragment on Root {
+              ... @defer {
+                rootField {
+                  body
+                }
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Defer directive cannot be used on root"
+                    " mutation type 'MutationRoot'.",
+                    "locations": [(6, 19)],
+                },
+            ],
+        )
+
+    def defer_inline_fragment_spread_on_root_mutation_field():
+        assert_errors(
+            """
+            mutation {
+              ... @defer {
+                mutationField {
+                  body
+                }
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Defer directive cannot be used on root"
+                    " mutation type 'MutationRoot'.",
+                    "locations": [(3, 19)],
+                },
+            ],
+        )
+
+    def defer_fragment_spread_on_nested_mutation_field():
+        assert_valid(
+            """
+            mutation {
+              mutationField {
+                ... @defer {
+                  body
+                }
+              }
+            }
+            """
+        )
+
+    def defer_fragment_spread_on_root_subscription_field_interface():
+        assert_errors(
+            """
+            subscription {
+              ...rootFragment
+            }
+            fragment rootFragment on Root {
+              ... @defer {
+                rootField {
+                  body
+                }
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Defer directive cannot be used on root"
+                    " subscription type 'SubscriptionRoot'.",
+                    "locations": [(6, 19)],
+                },
+            ],
+        )
+
+    def defer_fragment_spread_on_root_subscription_field():
+        assert_errors(
+            """
+            subscription {
+              ...rootFragment @defer
+            }
+            fragment rootFragment on SubscriptionRoot {
+              subscriptionField {
+                body
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Defer directive cannot be used on root"
+                    " subscription type 'SubscriptionRoot'.",
+                    "locations": [(3, 31)],
+                },
+            ],
+        )
+
+    def defer_inline_fragment_spread_on_root_subscription_field():
+        assert_errors(
+            """
+            subscription {
+              ... @defer {
+                subscriptionField {
+                  body
+                }
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Defer directive cannot be used on root"
+                    " subscription type 'SubscriptionRoot'.",
+                    "locations": [(3, 19)],
+                },
+            ],
+        )
+
+    def defer_fragment_spread_on_nested_subscription_field():
+        assert_valid(
+            """
+            subscription {
+              subscriptionField {
+                ...nestedFragment @defer
+              }
+            }
+            fragment nestedFragment on Message {
+              body
+            }
+            """
+        )
+
+    def stream_field_on_root_query_field():
+        assert_valid(
+            """
+            {
+              messages @stream {
+                name
+              }
+            }
+            """
+        )
+
+    def stream_field_on_fragment_on_root_query_field():
+        assert_valid(
+            """
+            {
+              ...rootFragment
+            }
+            fragment rootFragment on QueryType {
+              messages @stream {
+                name
+              }
+            }
+            """
+        )
+
+    def stream_field_on_root_mutation_field():
+        assert_errors(
+            """
+            mutation {
+              mutationListField @stream {
+                name
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Stream directive cannot be used on root"
+                    " mutation type 'MutationRoot'.",
+                    "locations": [(3, 33)],
+                },
+            ],
+        )
+
+    def stream_field_on_fragment_on_root_mutation_field():
+        assert_errors(
+            """
+            mutation {
+              ...rootFragment
+            }
+            fragment rootFragment on MutationRoot {
+              mutationListField @stream {
+                name
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Stream directive cannot be used on root"
+                    " mutation type 'MutationRoot'.",
+                    "locations": [(6, 33)],
+                },
+            ],
+        )
+
+    def stream_field_on_root_subscription_field():
+        assert_errors(
+            """
+            subscription {
+              subscriptionListField @stream {
+                name
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Stream directive cannot be used on root"
+                    " subscription type 'SubscriptionRoot'.",
+                    "locations": [(3, 37)],
+                },
+            ],
+        )
+
+    def stream_field_on_fragment_on_root_subscription_field():
+        assert_errors(
+            """
+            subscription {
+              ...rootFragment
+            }
+            fragment rootFragment on SubscriptionRoot {
+              subscriptionListField @stream {
+                name
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Stream directive cannot be used on root"
+                    " subscription type 'SubscriptionRoot'.",
+                    "locations": [(6, 37)],
+                },
+            ],
+        )
+
+    def other_directive_on_root_mutation_field():
+        assert_valid(
+            """
+            mutation {
+              mutationField @foo {
+                body
+              }
+            }
+            """
+        )
+
+    def defer_fragment_spread_on_undefined_fragment():
+        assert_valid(
+            """
+            mutation {
+              ...undefinedFragment @defer
+            }
+            """
+        )
+
+    def inline_fragment_without_defer_on_root_mutation_field():
+        assert_valid(
+            """
+            mutation {
+              ... {
+                mutationField {
+                  body
+                }
+              }
+            }
+            """
+        )
+
+    def defer_on_mutation_without_mutation_root_type():
+        query_only_schema = build_schema(
+            """
+            type Query {
+              message: String
+            }
+            """
+        )
+        assert_validation_errors(
+            DeferStreamDirectiveOnRootField,
+            """
+            mutation {
+              ... @defer {
+                message
+              }
+            }
+            """,
+            [],
+            schema=query_only_schema,
+        )
+
+    def fragment_spread_cycle_shared_by_multiple_root_mutations():
+        assert_valid(
+            """
+            mutation First {
+              ...rootFragment
+            }
+            mutation Second {
+              ...rootFragment
+            }
+            fragment rootFragment on MutationRoot {
+              ...otherFragment
+            }
+            fragment otherFragment on MutationRoot {
+              ...rootFragment
+            }
+            """
+        )

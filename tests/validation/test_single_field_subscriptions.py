@@ -1,0 +1,475 @@
+from functools import partial
+
+from graphql.utilities import build_schema
+from graphql.validation import SingleFieldSubscriptionsRule
+from graphql.validation import validation_context as validation_context_module
+
+from .harness import assert_validation_errors
+
+schema = build_schema(
+    """
+    type Message {
+      body: String
+      sender: String
+    }
+
+    type SubscriptionRoot {
+      importantEmails: [String]
+      notImportantEmails: [String]
+      moreImportantEmails: [String]
+      spamEmails: [String]
+      deletedEmails: [String]
+      newMessage: Message
+    }
+
+    type QueryRoot {
+      dummy: String
+    }
+
+    schema {
+      query: QueryRoot
+      subscription: SubscriptionRoot
+    }
+    """
+)
+
+assert_errors = partial(
+    assert_validation_errors, SingleFieldSubscriptionsRule, schema=schema
+)
+
+assert_valid = partial(assert_errors, errors=[])
+
+
+def describe_validate_subscriptions_with_single_field():
+    def valid_subscription():
+        assert_valid(
+            """
+            subscription ImportantEmails {
+              importantEmails
+            }
+            """
+        )
+
+    def fails_with_no_root_field():
+        assert_errors(
+            """
+            subscription NoRootField {
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'NoRootField'"
+                    " must select one top level field.",
+                    "locations": [(2, 38)],
+                }
+            ],
+        )
+
+    def fails_with_no_root_field_in_anonymous_subscription():
+        assert_errors(
+            """
+            subscription {
+            }
+            """,
+            [
+                {
+                    "message": "Anonymous Subscription"
+                    " must select one top level field.",
+                    "locations": [(2, 26)],
+                }
+            ],
+        )
+
+    def fails_with_no_root_field_through_empty_fragment():
+        assert_errors(
+            """
+            subscription {
+              ...Empty
+            }
+            fragment Empty on SubscriptionRoot {
+            }
+            """,
+            [
+                {
+                    "message": "Anonymous Subscription"
+                    " must select one top level field.",
+                    "locations": [(2, 26)],
+                }
+            ],
+        )
+
+    def valid_subscription_with_fragment():
+        assert_valid(
+            """
+            subscription sub {
+              ...newMessageFields
+            }
+
+            fragment newMessageFields on SubscriptionRoot {
+              newMessage {
+                body
+                sender
+              }
+            }
+            """
+        )
+
+    def valid_subscription_with_fragment_and_field():
+        assert_valid(
+            """
+            subscription sub {
+              newMessage {
+                body
+              }
+              ...newMessageFields
+            }
+
+            fragment newMessageFields on SubscriptionRoot {
+              newMessage {
+                body
+                sender
+              }
+            }
+            """
+        )
+
+    def fails_with_more_than_one_root_field():
+        assert_errors(
+            """
+            subscription ImportantEmails {
+              importantEmails
+              notImportantEmails
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'ImportantEmails'"
+                    " must select only one top level field.",
+                    "locations": [(4, 15)],
+                }
+            ],
+        )
+
+    def fails_with_more_than_one_root_field_including_introspection():
+        assert_errors(
+            """
+            subscription ImportantEmails {
+              importantEmails
+              __typename
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'ImportantEmails'"
+                    " must select only one top level field.",
+                    "locations": [(4, 15)],
+                },
+                {
+                    "message": "Subscription 'ImportantEmails'"
+                    " must not select an introspection top level field.",
+                    "locations": [(4, 15)],
+                },
+            ],
+        )
+
+    def fails_with_more_than_one_root_field_including_aliased_introspection():
+        assert_errors(
+            """
+            subscription ImportantEmails {
+              importantEmails
+              ...Introspection
+            }
+            fragment Introspection on SubscriptionRoot {
+              typename: __typename
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'ImportantEmails'"
+                    " must select only one top level field.",
+                    "locations": [(7, 15)],
+                },
+                {
+                    "message": "Subscription 'ImportantEmails'"
+                    " must not select an introspection top level field.",
+                    "locations": [(7, 15)],
+                },
+            ],
+        )
+
+    def fails_with_many_more_than_one_root_field():
+        assert_errors(
+            """
+            subscription ImportantEmails {
+              importantEmails
+              notImportantEmails
+              spamEmails
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'ImportantEmails'"
+                    " must select only one top level field.",
+                    "locations": [(4, 15), (5, 15)],
+                }
+            ],
+        )
+
+    def fails_with_more_than_one_root_field_via_fragments():
+        assert_errors(
+            """
+            subscription ImportantEmails {
+              importantEmails
+              ... {
+                more: moreImportantEmails
+              }
+              ...NotImportantEmails
+            }
+            fragment NotImportantEmails on SubscriptionRoot {
+              notImportantEmails
+              deleted: deletedEmails
+              ...SpamEmails
+            }
+            fragment SpamEmails on SubscriptionRoot {
+              spamEmails
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'ImportantEmails'"
+                    " must select only one top level field.",
+                    "locations": [(5, 17), (10, 15), (11, 15), (15, 15)],
+                },
+            ],
+        )
+
+    def does_not_infinite_loop_on_recursive_fragments():
+        assert_errors(
+            """
+            subscription NoInfiniteLoop {
+              ...A
+            }
+            fragment A on SubscriptionRoot {
+              ...A
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'NoInfiniteLoop'"
+                    " must select one top level field.",
+                    "locations": [(2, 41)],
+                }
+            ],
+        )
+
+    def fails_with_more_than_one_root_field_via_fragments_anonymous():
+        assert_errors(
+            """
+            subscription {
+              importantEmails
+              ... {
+                more: moreImportantEmails
+                ...NotImportantEmails
+              }
+              ...NotImportantEmails
+            }
+            fragment NotImportantEmails on SubscriptionRoot {
+              notImportantEmails
+              deleted: deletedEmails
+              ... {
+                ... {
+                  archivedEmails
+                }
+              }
+              ...SpamEmails
+            }
+            fragment SpamEmails on SubscriptionRoot {
+              spamEmails
+              ...NonExistentFragment
+            }
+            """,
+            [
+                {
+                    "message": "Anonymous Subscription"
+                    " must select only one top level field.",
+                    "locations": [(5, 17), (11, 15), (12, 15), (15, 19), (21, 15)],
+                },
+            ],
+        )
+
+    def fails_with_more_than_one_root_field_in_anonymous_subscriptions():
+        assert_errors(
+            """
+            subscription {
+              importantEmails
+              notImportantEmails
+            }
+            """,
+            [
+                {
+                    "message": "Anonymous Subscription"
+                    " must select only one top level field.",
+                    "locations": [(4, 15)],
+                }
+            ],
+        )
+
+    def fails_with_introspection_field():
+        assert_errors(
+            """
+            subscription ImportantEmails {
+              __typename
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'ImportantEmails' must not"
+                    " select an introspection top level field.",
+                    "locations": [(3, 15)],
+                }
+            ],
+        )
+
+    def fails_with_introspection_field_in_anonymous_subscription():
+        assert_errors(
+            """
+            subscription {
+              __typename
+            }
+            """,
+            [
+                {
+                    "message": "Anonymous Subscription must not"
+                    " select an introspection top level field.",
+                    "locations": [(3, 15)],
+                }
+            ],
+        )
+
+    def fails_with_skip_or_include_directive():
+        assert_errors(
+            """
+            subscription RequiredRuntimeValidation($bool: Boolean!) {
+              newMessage @include(if: $bool) {
+                body
+                sender
+              }
+              disallowedSecondRootField @skip(if: $bool)
+            }
+            """,
+            [
+                {
+                    "message": "Subscription 'RequiredRuntimeValidation' must not"
+                    " use `@skip` or `@include` directives"
+                    " in the top level selection.",
+                    "locations": [(3, 26), (7, 41)],
+                }
+            ],
+        )
+
+    def fails_with_skip_or_include_directive_in_anonymous_subscription():
+        assert_errors(
+            """
+            subscription ($bool: Boolean!) {
+              newMessage @include(if: $bool) {
+                body
+                sender
+              }
+              disallowedSecondRootField @skip(if: $bool)
+            }
+            """,
+            [
+                {
+                    "message": "Anonymous Subscription must not"
+                    " use `@skip` or `@include` directives"
+                    " in the top level selection.",
+                    "locations": [(3, 26), (7, 41)],
+                }
+            ],
+        )
+
+    def skips_if_not_subscription_type():
+        empty_schema = build_schema(
+            """
+            type Query {
+              dummy: String
+            }
+            """
+        )
+        assert_errors(
+            """
+            subscription {
+              __typename
+            }
+            """,
+            [],
+            schema=empty_schema,
+        )
+
+    def shared_fragment_in_multiple_subscriptions():
+        assert_valid(
+            """
+            subscription sub {
+              ...newMessageFields
+            }
+            subscription other {
+              ...newMessageFields
+            }
+
+            fragment newMessageFields on SubscriptionRoot {
+              newMessage {
+                body
+                sender
+              }
+            }
+            """
+        )
+
+    def collects_fields_with_a_directive_variable():
+        assert_valid(
+            """
+            subscription S($condition: Boolean!) {
+              ...newMessageFields @defer(if: $condition)
+            }
+            fragment newMessageFields on SubscriptionRoot {
+              newMessage {
+                body
+                sender
+              }
+            }
+            """
+        )
+
+    def collects_fields_from_fragments_with_different_defer_conditions():
+        assert_valid(
+            """
+            subscription {
+              ...newMessageFields @defer
+              ...newMessageFields @defer(if: false)
+            }
+            fragment newMessageFields on SubscriptionRoot {
+              newMessage {
+                body
+                sender
+              }
+            }
+            """
+        )
+
+    def spends_fragment_work_like_graphql_js(monkeypatch):
+        # A GraphQL-core-only test: spending the work in a hook instead of a wrapper
+        # must not change the work counted (2 root selections, 1 directive with
+        # 1 argument and 1 fragment selection). GraphQL.js counts 5 here as well.
+        document = """
+            subscription {
+              ...newMessageFields @defer(if: false)
+              newMessage { body }
+            }
+            fragment newMessageFields on SubscriptionRoot {
+              newMessage { body sender }
+            }
+            """
+        monkeypatch.setattr(validation_context_module, "MAX_FRAGMENT_WORK", 5)
+        assert_valid(document)
+        monkeypatch.setattr(validation_context_module, "MAX_FRAGMENT_WORK", 4)
+        assert_errors(document, [{"message": "Validation aborted."}])

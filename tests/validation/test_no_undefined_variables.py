@@ -1,0 +1,474 @@
+from functools import partial
+
+from graphql.language import parse
+from graphql.utilities import build_schema
+from graphql.validation import (
+    FieldsOnCorrectTypeRule,
+    NoUndefinedVariablesRule,
+    validate,
+)
+
+from .harness import assert_validation_errors
+
+assert_errors = partial(assert_validation_errors, NoUndefinedVariablesRule)
+
+assert_valid = partial(assert_errors, errors=[])
+
+
+def describe_validate_no_undefined_variables():
+    def fragment_defined_arguments_are_not_undefined_variables():
+        assert_valid(
+            """
+            query Foo {
+              ...FragA
+            }
+            fragment FragA($a: String) on Type {
+              field1(a: $a)
+            }
+            """
+        )
+
+    def defined_variables_used_as_fragment_arguments_are_not_undefined():
+        assert_valid(
+            """
+            query Foo($b: String) {
+              ...FragA(a: $b)
+            }
+            fragment FragA($a: String) on Type {
+              field1
+            }
+            """
+        )
+
+    def variables_used_as_fragment_arguments_may_be_undefined_variables():
+        assert_errors(
+            """
+            query Foo {
+              ...FragA(a: $a)
+            }
+            fragment FragA($a: String) on Type {
+              field1
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(3, 27), (2, 13)],
+                },
+            ],
+        )
+
+    def variables_shadowed_by_parent_fragment_arguments_are_still_undefined():
+        assert_errors(
+            """
+            query Foo {
+              ...FragA
+            }
+            fragment FragA($a: String) on Type {
+              ...FragB
+            }
+            fragment FragB on Type {
+              field1(a: $a)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(9, 25), (2, 13)],
+                },
+            ],
+        )
+
+    def all_variables_defined():
+        assert_valid(
+            """
+            query Foo($a: String, $b: String, $c: String) {
+              field(a: $a, b: $b, c: $c)
+            }
+            """
+        )
+
+    def all_variables_deeply_defined():
+        assert_valid(
+            """
+            query Foo($a: String, $b: String, $c: String) {
+              field(a: $a) {
+                field(b: $b) {
+                  field(c: $c)
+                }
+              }
+            }
+            """
+        )
+
+    def all_variables_deeply_in_inline_fragments_defined():
+        assert_valid(
+            """
+            query Foo($a: String, $b: String, $c: String) {
+              ... on Type {
+                field(a: $a) {
+                  field(b: $b) {
+                    ... on Type {
+                      field(c: $c)
+                    }
+                  }
+                }
+              }
+            }
+            """
+        )
+
+    def all_variables_in_fragments_deeply_defined():
+        assert_valid(
+            """
+            query Foo($a: String, $b: String, $c: String) {
+              ...FragA
+            }
+            fragment FragA on Type {
+              field(a: $a) {
+                ...FragB
+              }
+            }
+            fragment FragB on Type {
+              field(b: $b) {
+                ...FragC
+              }
+            }
+            fragment FragC on Type {
+              field(c: $c)
+            }
+            """
+        )
+
+    def variable_within_single_fragment_defined_in_multiple_operations():
+        assert_valid(
+            """
+            query Foo($a: String) {
+              ...FragA
+            }
+            query Bar($a: String) {
+              ...FragA
+            }
+            fragment FragA on Type {
+              field(a: $a)
+            }
+            """
+        )
+
+    def variable_within_fragments_defined_in_operations():
+        assert_valid(
+            """
+            query Foo($a: String) {
+              ...FragA
+            }
+            query Bar($b: String) {
+              ...FragB
+            }
+            fragment FragA on Type {
+              field(a: $a)
+            }
+            fragment FragB on Type {
+              field(b: $b)
+            }
+            """
+        )
+
+    def variable_within_recursive_fragment_defined():
+        assert_valid(
+            """
+            query Foo($a: String) {
+              ...FragA
+            }
+            fragment FragA on Type {
+              field(a: $a) {
+                ...FragA
+              }
+            }
+            """
+        )
+
+    def variable_not_defined():
+        assert_errors(
+            """
+            query Foo($a: String, $b: String, $c: String) {
+              field(a: $a, b: $b, c: $c, d: $d)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$d' is not defined by operation 'Foo'.",
+                    "locations": [(3, 45), (2, 13)],
+                },
+            ],
+        )
+
+    def variable_not_defined_by_unnamed_query():
+        assert_errors(
+            """
+            {
+              field(a: $a)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined.",
+                    "locations": [(3, 24), (2, 13)],
+                },
+            ],
+        )
+
+    def multiple_variables_not_defined():
+        assert_errors(
+            """
+            query Foo($b: String) {
+              field(a: $a, b: $b, c: $c)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(3, 24), (2, 13)],
+                },
+                {
+                    "message": "Variable '$c' is not defined by operation 'Foo'.",
+                    "locations": [(3, 38), (2, 13)],
+                },
+            ],
+        )
+
+    def variable_in_fragment_not_defined_by_unnamed_query():
+        assert_errors(
+            """
+            {
+              ...FragA
+            }
+            fragment FragA on Type {
+              field(a: $a)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined.",
+                    "locations": [(6, 24), (2, 13)],
+                },
+            ],
+        )
+
+    def variable_in_fragment_not_defined_by_operation():
+        assert_errors(
+            """
+            query Foo($a: String, $b: String) {
+              ...FragA
+            }
+            fragment FragA on Type {
+              field(a: $a) {
+                ...FragB
+              }
+            }
+            fragment FragB on Type {
+              field(b: $b) {
+                ...FragC
+              }
+            }
+            fragment FragC on Type {
+              field(c: $c)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$c' is not defined by operation 'Foo'.",
+                    "locations": [(16, 24), (2, 13)],
+                },
+            ],
+        )
+
+    def multiple_variables_in_fragments_not_defined():
+        assert_errors(
+            """
+            query Foo($b: String) {
+              ...FragA
+            }
+            fragment FragA on Type {
+              field(a: $a) {
+                ...FragB
+              }
+            }
+            fragment FragB on Type {
+              field(b: $b) {
+                ...FragC
+              }
+            }
+            fragment FragC on Type {
+              field(c: $c)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(6, 24), (2, 13)],
+                },
+                {
+                    "message": "Variable '$c' is not defined by operation 'Foo'.",
+                    "locations": [(16, 24), (2, 13)],
+                },
+            ],
+        )
+
+    def single_variable_in_fragment_not_defined_by_multiple_operations():
+        assert_errors(
+            """
+            query Foo($a: String) {
+              ...FragAB
+            }
+            query Bar($a: String) {
+              ...FragAB
+            }
+            fragment FragAB on Type {
+              field(a: $a, b: $b)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$b' is not defined by operation 'Foo'.",
+                    "locations": [(9, 31), (2, 13)],
+                },
+                {
+                    "message": "Variable '$b' is not defined by operation 'Bar'.",
+                    "locations": [(9, 31), (5, 13)],
+                },
+            ],
+        )
+
+    def variables_in_fragment_not_defined_by_multiple_operations():
+        assert_errors(
+            """
+            query Foo($b: String) {
+              ...FragAB
+            }
+            query Bar($a: String) {
+              ...FragAB
+            }
+            fragment FragAB on Type {
+              field(a: $a, b: $b)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(9, 24), (2, 13)],
+                },
+                {
+                    "message": "Variable '$b' is not defined by operation 'Bar'.",
+                    "locations": [(9, 31), (5, 13)],
+                },
+            ],
+        )
+
+    def variable_in_fragment_used_by_other_operation():
+        assert_errors(
+            """
+            query Foo($b: String) {
+              ...FragA
+            }
+            query Bar($a: String) {
+              ...FragB
+            }
+            fragment FragA on Type {
+              field(a: $a)
+            }
+            fragment FragB on Type {
+              field(b: $b)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(9, 24), (2, 13)],
+                },
+                {
+                    "message": "Variable '$b' is not defined by operation 'Bar'.",
+                    "locations": [(12, 24), (5, 13)],
+                },
+            ],
+        )
+
+    def multiple_undefined_variables_produce_multiple_errors():
+        assert_errors(
+            """
+            query Foo($b: String) {
+              ...FragAB
+            }
+            query Bar($a: String) {
+              ...FragAB
+            }
+            fragment FragAB on Type {
+              field1(a: $a, b: $b)
+              ...FragC
+              field3(a: $a, b: $b)
+            }
+            fragment FragC on Type {
+              field2(c: $c)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(9, 25), (2, 13)],
+                },
+                {
+                    "message": "Variable '$a' is not defined by operation 'Foo'.",
+                    "locations": [(11, 25), (2, 13)],
+                },
+                {
+                    "message": "Variable '$c' is not defined by operation 'Foo'.",
+                    "locations": [(14, 25), (2, 13)],
+                },
+                {
+                    "message": "Variable '$b' is not defined by operation 'Bar'.",
+                    "locations": [(9, 32), (5, 13)],
+                },
+                {
+                    "message": "Variable '$b' is not defined by operation 'Bar'.",
+                    "locations": [(11, 32), (5, 13)],
+                },
+                {
+                    "message": "Variable '$c' is not defined by operation 'Bar'.",
+                    "locations": [(14, 25), (5, 13)],
+                },
+            ],
+        )
+
+    def keeps_operation_variables_separate_across_shared_fragments():
+        assert_valid(
+            """
+            query Foo($a: String, $b: String) {
+              field(b: $b)
+              ...FragA
+            }
+            query Bar($a: String) {
+              ...FragA
+            }
+            fragment FragA on Type {
+              field(a: $a)
+            }
+            """
+        )
+
+    def reports_before_errors_inside_the_operation():
+        # A GraphQL-core-only test: like GraphQL.js, the rule reports when entering
+        # an operation, before errors found inside of it.
+        schema = build_schema("type Query { f(arg: String): String }")
+        document = parse("query Q { unknownField f(arg: $a) }")
+        errors = validate(
+            schema, document, [FieldsOnCorrectTypeRule, NoUndefinedVariablesRule]
+        )
+        assert errors == [
+            {
+                "message": "Variable '$a' is not defined by operation 'Q'.",
+                "locations": [(1, 31), (1, 1)],
+            },
+            {
+                "message": "Cannot query field 'unknownField' on type 'Query'.",
+                "locations": [(1, 11)],
+            },
+        ]

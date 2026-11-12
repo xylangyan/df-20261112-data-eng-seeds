@@ -1,0 +1,574 @@
+from functools import partial
+
+from graphql.validation import VariablesInAllowedPositionRule
+
+from .harness import assert_validation_errors
+
+assert_errors = partial(assert_validation_errors, VariablesInAllowedPositionRule)
+
+assert_valid = partial(assert_errors, errors=[])
+
+
+def describe_validate_variables_are_in_allowed_positions():
+    def boolean_to_boolean():
+        assert_valid(
+            """
+            query Query($booleanArg: Boolean)
+            {
+              complicatedArgs {
+                booleanArgField(booleanArg: $booleanArg)
+              }
+            }
+            """
+        )
+
+    def boolean_to_boolean_in_fragment():
+        assert_valid(
+            """
+            fragment booleanArgFrag on ComplicatedArgs {
+              booleanArgField(booleanArg: $booleanArg)
+            }
+            query Query($booleanArg: Boolean)
+            {
+              complicatedArgs {
+                ...booleanArgFrag
+              }
+            }
+            """
+        )
+
+        assert_valid(
+            """
+            query Query($booleanArg: Boolean)
+            {
+              complicatedArgs {
+                ...booleanArgFrag
+              }
+            }
+            fragment booleanArgFrag on ComplicatedArgs {
+              booleanArgField(booleanArg: $booleanArg)
+            }
+            """
+        )
+
+    def non_null_boolean_to_boolean():
+        assert_valid(
+            """
+            query Query($nonNullBooleanArg: Boolean!)
+            {
+              complicatedArgs {
+                booleanArgField(booleanArg: $nonNullBooleanArg)
+              }
+            }
+            """
+        )
+
+    def non_null_boolean_to_boolean_within_fragment():
+        assert_valid(
+            """
+            fragment booleanArgFrag on ComplicatedArgs {
+              booleanArgField(booleanArg: $nonNullBooleanArg)
+            }
+
+            query Query($nonNullBooleanArg: Boolean!)
+            {
+              complicatedArgs {
+                ...booleanArgFrag
+              }
+            }
+            """
+        )
+
+    def array_of_string_to_array_of_string():
+        assert_valid(
+            """
+            query Query($stringListVar: [String])
+            {
+              complicatedArgs {
+                stringListArgField(stringListArg: $stringListVar)
+              }
+            }
+            """
+        )
+
+    def array_of_non_null_string_to_array_of_string():
+        assert_valid(
+            """
+            query Query($stringListVar: [String!])
+            {
+              complicatedArgs {
+                stringListArgField(stringListArg: $stringListVar)
+              }
+            }
+            """
+        )
+
+    def string_to_array_of_string_in_item_position():
+        assert_valid(
+            """
+            query Query($stringVar: String)
+            {
+              complicatedArgs {
+                stringListArgField(stringListArg: [$stringVar])
+              }
+            }
+            """
+        )
+
+    def non_null_string_to_array_of_string_in_item_position():
+        assert_valid(
+            """
+            query Query($stringVar: String!)
+            {
+              complicatedArgs {
+                stringListArgField(stringListArg: [$stringVar])
+              }
+            }
+            """
+        )
+
+    def complex_input_to_complex_input():
+        assert_valid(
+            """
+            query Query($complexVar: ComplexInput)
+            {
+              complicatedArgs {
+                complexArgField(complexArg: $complexVar)
+              }
+            }
+            """
+        )
+
+    def complex_input_to_complex_input_in_field_position():
+        assert_valid(
+            """
+            query Query($boolVar: Boolean = false)
+            {
+              complicatedArgs {
+                complexArgField(complexArg: {requiredArg: $boolVar})
+              }
+            }
+            """
+        )
+
+    def non_null_boolean_to_non_null_boolean_in_directive():
+        assert_valid(
+            """
+            query Query($boolVar: Boolean!)
+            {
+              dog @include(if: $boolVar)
+            }
+            """
+        )
+
+    def int_to_non_null_int():
+        assert_errors(
+            """
+            query Query($intArg: Int) {
+              complicatedArgs {
+                nonNullIntArgField(nonNullIntArg: $intArg)
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$intArg' of type 'Int'"
+                    " used in position expecting type 'Int!'.",
+                    "locations": [(2, 25), (4, 51)],
+                }
+            ],
+        )
+
+    def int_to_non_null_int_within_fragment():
+        assert_errors(
+            """
+            fragment nonNullIntArgFieldFrag on ComplicatedArgs {
+              nonNullIntArgField(nonNullIntArg: $intArg)
+            }
+
+            query Query($intArg: Int) {
+              complicatedArgs {
+                ...nonNullIntArgFieldFrag
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$intArg' of type 'Int'"
+                    " used in position expecting type 'Int!'.",
+                    "locations": [(6, 25), (3, 49)],
+                }
+            ],
+        )
+
+    def int_to_non_null_int_within_nested_fragment():
+        assert_errors(
+            """
+            fragment outerFrag on ComplicatedArgs {
+              ...nonNullIntArgFieldFrag
+            }
+
+            fragment nonNullIntArgFieldFrag on ComplicatedArgs {
+              nonNullIntArgField(nonNullIntArg: $intArg)
+            }
+
+            query Query($intArg: Int) {
+              complicatedArgs {
+                ...outerFrag
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$intArg' of type 'Int'"
+                    " used in position expecting type 'Int!'.",
+                    "locations": [(10, 25), (7, 49)],
+                }
+            ],
+        )
+
+    def string_to_boolean():
+        assert_errors(
+            """
+            query Query($stringVar: String) {
+              complicatedArgs {
+                booleanArgField(booleanArg: $stringVar)
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$stringVar' of type 'String'"
+                    " used in position expecting type 'Boolean'.",
+                    "locations": [(2, 25), (4, 45)],
+                }
+            ],
+        )
+
+    def string_to_array_of_string():
+        assert_errors(
+            """
+            query Query($stringVar: String) {
+              complicatedArgs {
+                stringListArgField(stringListArg: $stringVar)
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$stringVar' of type 'String'"
+                    " used in position expecting type '[String]'.",
+                    "locations": [(2, 25), (4, 51)],
+                }
+            ],
+        )
+
+    def boolean_to_non_null_boolean_in_directive():
+        assert_errors(
+            """
+            query Query($boolVar: Boolean) {
+              dog @include(if: $boolVar)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$boolVar' of type 'Boolean'"
+                    " used in position expecting type 'Boolean!'.",
+                    "locations": [(2, 25), (3, 32)],
+                }
+            ],
+        )
+
+    def string_to_non_null_boolean_in_directive():
+        assert_errors(
+            """
+            query Query($stringVar: String) {
+              dog @include(if: $stringVar)
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$stringVar' of type 'String'"
+                    " used in position expecting type 'Boolean!'.",
+                    "locations": [(2, 25), (3, 32)],
+                }
+            ],
+        )
+
+    def array_of_string_to_array_of_non_null_string():
+        assert_errors(
+            """
+            query Query($stringListVar: [String])
+            {
+              complicatedArgs {
+                stringListNonNullArgField(stringListNonNullArg: $stringListVar)
+              }
+            }
+            """,
+            [
+                {
+                    "message": "Variable '$stringListVar' of type '[String]'"
+                    " used in position expecting type '[String!]'.",
+                    "locations": [(2, 25), (5, 65)],
+                }
+            ],
+        )
+
+    def describe_allows_optional_nullable_variables_with_default_values():
+        def int_to_non_null_int_fails_when_var_provides_null_default_value():
+            assert_errors(
+                """
+                query Query($intVar: Int = null) {
+                  complicatedArgs {
+                    nonNullIntArgField(nonNullIntArg: $intVar)
+                  }
+                }
+                """,
+                [
+                    {
+                        "message": "Variable '$intVar' of type 'Int'"
+                        " used in position expecting type 'Int!'.",
+                        "locations": [(2, 29), (4, 55)],
+                    }
+                ],
+            )
+
+        def undefined_in_directive_with_default_value_with_option():
+            assert_valid(
+                """
+                {
+                  dog @include(if: $x)
+                }
+                """
+            )
+
+    def describe_validates_one_of_input_objects():
+        def allows_exactly_one_non_nullable_variable():
+            assert_valid(
+                """
+                query ($string: String!) {
+                  complicatedArgs {
+                    oneOfArgField(oneOfArg: { stringField: $string })
+                  }
+                }
+                """
+            )
+
+        def forbids_one_nullable_variable():
+            assert_errors(
+                """
+                query ($string: String) {
+                  complicatedArgs {
+                    oneOfArgField(oneOfArg: { stringField: $string })
+                  }
+                }
+                """,
+                [
+                    {
+                        "message": "Variable '$string' is of type 'String'"
+                        " but must be non-nullable to be used for OneOf"
+                        " Input Object 'OneOfInput'.",
+                        "locations": [(2, 24), (4, 60)],
+                    },
+                ],
+            )
+
+    def describe_fragment_arguments_are_validated():
+        def int_to_non_null_int_when_field_argument_provides_default_value():
+            assert_valid(
+                """
+                query Query {
+                  complicatedArgs {
+                    ...A
+                  }
+                }
+                fragment A($intVar: Int) on ComplicatedArgs {
+                  nonNullFieldWithDefault(arg: $intVar)
+                }
+                """
+            )
+
+        def validates_fragment_variables_defined_before_the_operation():
+            assert_errors(
+                """
+                fragment A($intVar: Int) on ComplicatedArgs {
+                  nonNullIntArgField(nonNullIntArg: $intVar)
+                }
+                query Query($intVar: Int!) {
+                  complicatedArgs {
+                    ...A(i: $intVar)
+                  }
+                }
+                """,
+                [
+                    {
+                        "message": "Variable '$intVar' of type 'Int' used"
+                        " in position expecting type 'Int!'.",
+                        "locations": [(2, 28), (3, 53)],
+                    },
+                ],
+            )
+
+        def boolean_to_boolean():
+            assert_valid(
+                """
+                query Query($booleanArg: Boolean)
+                {
+                  complicatedArgs {
+                    ...A(b: $booleanArg)
+                  }
+                }
+                fragment A($b: Boolean) on ComplicatedArgs {
+                  booleanArgField(booleanArg: $b)
+                }
+                """
+            )
+
+        def boolean_to_boolean_with_default_value():
+            assert_valid(
+                """
+                query Query($booleanArg: Boolean)
+                {
+                  complicatedArgs {
+                    ...A(b: $booleanArg)
+                  }
+                }
+                fragment A($b: Boolean = true) on ComplicatedArgs {
+                  booleanArgField(booleanArg: $b)
+                }
+                """
+            )
+
+        def boolean_to_boolean_non_null():
+            assert_errors(
+                """
+                query Query($ab: Boolean)
+                {
+                  complicatedArgs {
+                    ...A(b: $ab)
+                  }
+                }
+                fragment A($b: Boolean!) on ComplicatedArgs {
+                  booleanArgField(booleanArg: $b)
+                }
+                """,
+                [
+                    {
+                        "message": "Variable '$ab' of type 'Boolean'"
+                        " used in position expecting type 'Boolean!'.",
+                        "locations": [(2, 29), (5, 29)],
+                    },
+                ],
+            )
+
+        def int_to_non_null_int_fails_when_variable_provides_null_default_value():
+            assert_errors(
+                """
+                query Query($intVar: Int = null) {
+                  complicatedArgs {
+                    ...A(i: $intVar)
+                  }
+                }
+                fragment A($i: Int!) on ComplicatedArgs {
+                  nonNullIntArgField(nonNullIntArg: $i)
+                }
+                """,
+                [
+                    {
+                        "message": "Variable '$intVar' of type 'Int'"
+                        " used in position expecting type 'Int!'.",
+                        "locations": [(2, 29), (4, 29)],
+                    },
+                ],
+            )
+
+        def int_fragment_arg_to_non_null_int_field_arg_fails_when_shadowed():
+            assert_errors(
+                """
+                query Query($intVar: Int!) {
+                  complicatedArgs {
+                    ...A(i: $intVar)
+                  }
+                }
+                fragment A($intVar: Int) on ComplicatedArgs {
+                  nonNullIntArgField(nonNullIntArg: $intVar)
+                }
+                """,
+                [
+                    {
+                        "message": "Variable '$intVar' of type 'Int'"
+                        " used in position expecting type 'Int!'.",
+                        "locations": [(7, 28), (8, 53)],
+                    },
+                ],
+            )
+
+    def int_to_non_null_int_when_var_provides_non_null_default_value():
+        assert_valid(
+            """
+            query Query($intVar: Int = 1) {
+              complicatedArgs {
+                nonNullIntArgField(nonNullIntArg: $intVar)
+              }
+            }
+            """
+        )
+
+    def int_to_non_null_int_when_optional_arg_provides_default_value():
+        assert_valid(
+            """
+            query Query($intVar: Int) {
+              complicatedArgs {
+                nonNullFieldWithDefault(arg: $intVar)
+              }
+            }
+            """
+        )
+
+    def int_to_non_null_int_when_argument_default_is_inside_fragment():
+        assert_valid(
+            """
+            fragment defaultArgFrag on ComplicatedArgs {
+              nonNullFieldWithDefault(arg: $intVar)
+            }
+
+            query Query($intVar: Int) {
+              complicatedArgs {
+                ...defaultArgFrag
+              }
+            }
+            """
+        )
+
+    def bool_to_non_null_bool_in_directive_with_default_value_with_option():
+        assert_valid(
+            """
+            query Query($boolVar: Boolean = false) {
+              dog @include(if: $boolVar)
+            }
+            """
+        )
+
+
+def describe_non_specified_behavior_of_variables_within_custom_scalars():
+    def allows_using_variables_inside_object_literal_in_custom_scalar():
+        assert_valid(
+            """
+            query Query($x: Float) {
+              dog {
+                distanceFrom(loc: {x: $x, y: 10.0})
+              }
+            }
+            """
+        )
+
+    def allows_using_variables_inside_list_literal_in_custom_scalar():
+        assert_valid(
+            """
+            query Query($x: Float) {
+              dog {
+                distanceFrom(loc: [$x, 10.0])
+              }
+            }
+            """
+        )

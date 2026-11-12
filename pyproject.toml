@@ -1,0 +1,355 @@
+[project]
+name = "graphql-core"
+version = "3.3.2"
+description = "GraphQL-core is a Python port of GraphQL.js, the JavaScript reference implementation for GraphQL."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [ { name = "Christoph Zwerschke", email = "cito@online.de" } ]
+keywords = ["graphql"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/graphql-python/graphql-core"
+Repository = "https://github.com/graphql-python/graphql-core"
+Documentation = "https://graphql-core-3.readthedocs.io/"
+Changelog = "https://github.com/graphql-python/graphql-core/releases"
+
+[dependency-groups]
+test = [
+    "anyio>=4.16,<5",
+    "pytest>=9.2,<10",
+    "pytest-benchmark>=5.3.1,<6",
+    "pytest-cov>=7.1,<8",
+    "pytest-describe>=3.2,<4",
+    "pytest-timeout>=2.4,<3",
+    "pytest-codspeed>=5",
+    "tox>=4.65,<5",
+]
+lint = [
+    "ruff>=0.17.4,<0.18",
+    "mypy>=2.4.1,<3",
+    "bump-my-version>=1.8.1,<2",
+    "typing-extensions>=4.16; python_version<'3.11'",
+]
+doc = [
+    "sphinx>=9.1,<10; python_version>='3.12'",
+    "sphinx_rtd_theme>=3.1,<4; python_version>='3.12'",
+]
+
+[tool.uv]
+link-mode = "copy"
+
+# Configure uv build backend for src layout and sdist contents
+[tool.uv.build-backend]
+module-name = "graphql"
+module-root = "src"
+source-include = [
+    "LICENSE",
+    "README.md",
+    "tests/**",
+    "docs/**",
+    ".editorconfig",
+    ".readthedocs.yaml",
+    "tox.ini",
+    "CODEOWNERS",
+    "SECURITY.md",
+]
+source-exclude = [
+    "docs/_build/**",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "A",      # flake8-builtins
+  "ANN",    # flake8-annotations
+  "ARG",    # flake8-unused-arguments
+  "ASYNC",  # flake8-async
+  "B",      # flake8-bugbear
+  "BLE",    # flake8-blind-except
+  "C4",     # flake8-comprehensions
+  "C90",    # McCabe cyclomatic complexity
+  "COM",    # flake8-commas
+  "D",      # pydocstyle
+  "DTZ",    # flake8-datetimez
+  "E",      # pycodestyle
+  "EM",     # flake8-errmsg
+  "ERA",    # eradicate
+  "EXE",    # flake8-executable
+  "F",      # Pyflakes
+  "FBT",    # flake8-boolean-trap
+  "G",      # flake8-logging-format
+  "I",      # isort
+  "ICN",    # flake8-import-conventions
+  "INP",    # flake8-no-pep420
+  "INT",    # flake8-gettext
+  "ISC",    # flake8-implicit-str-concat
+  "N",      # pep8-naming
+  "PERF",   # perflint
+  "PGH",    # pygrep-hooks
+  "PIE",    # flake8-pie
+  "PL",     # Pylint
+  "PT",     # flake8-pytest-style
+  "PTH",    # flake8-use-pathlib
+  "PYI",    # flake8-pyi
+  "Q",      # flake8-quotes
+  "RET",    # flake8-return
+  "RSE",    # flake8-raise
+  "FURB",   # refurb
+  "RUF",    # Ruff-specific rules
+  "S",      # flake8-bandit
+  "SLF",    # flake8-self
+  "SIM",    # flake8-simplify
+  "T10",    # flake8-debugger
+  "T20",    # flake8-print
+  "TCH",    # flake8-type-checking
+  "TID",    # flake8-tidy-imports
+  "TRY",    # tryceratops
+  "UP",     # pyupgrade
+  "W",      # pycodestyle
+  "YTT",    # flake8-2020
+]
+ignore = [
+  "A005",  # allow using standard-lib module names
+  "ANN401",  # allow explicit Any
+  "COM812",  # allow trailing commas for auto-formatting
+  "D105", "D107",  # no docstring needed for magic methods
+  "D203",  # no blank line before class docstring
+  "D213",  # multi-line docstrings should not start at second line
+  "D400", "D415",  # first line in docstring does not need to be a sentence
+  "D401",  # do not always require imperative mood in first line
+  "FBT001", "FBT002", "FBT003",  # allow boolean parameters
+  "ISC001",  # allow string literal concatenation for auto-formatting
+  "PLC0415",  # allow run-time imports to avoid circular dependencies
+  "PGH003",  # type ignores do not need to be specific
+  "PLR2004",  # allow some "magic" values
+  "PYI034",  # do not check return value of new method
+  "TID252",  # allow relative imports
+  "TRY003",  # allow specific messages outside the exception class
+]
+
+[tool.ruff.lint.per-file-ignores]
+"*/__init__.py" = [
+   "I001",  # imports do not need to be sorted
+]
+"src/graphql/execution/*" = [
+    "ARG002",  # allow unused arguments in overridable hook methods
+    "BLE001",  # allow catching blind exception
+]
+"src/graphql/language/ast.py" = [
+    "D101",  # do not require docstrings
+]
+"src/graphql/language/parser.py" = [
+    "RSE102",  # raised exception may need to be called
+]
+"src/graphql/type/introspection.py" = [
+    "ANN001", "ANN003", "ANN204", "ANN205",  # allow missing type annotations
+    "N803",  # allow JavaScript style arguments
+]
+"src/graphql/utilities/get_introspection_query.py" = [
+    "D101",  # allow missing class docstrings
+    "N815",  # allow JavaScript style class attributes
+]
+"src/graphql/utilities/type_info.py" = [
+    "D102",  # allow missing method docstrings
+]
+"src/graphql/validation/rules/*" = [
+    "D102",  # allow missing method docstrings
+]
+"src/graphql/validation/validation_context.py" = [
+    "D102",  # allow missing method docstrings
+]
+"tests/*" = [
+    "ANN001", "ANN002", "ANN003",  # allow missing type annotations
+    "ANN201", "ANN202", "ANN204", "ANN205",  # allow missing type annotations
+    "B011",  # allow always failing assertions
+    "B904",  # allow raising exceptions without context
+    "C901",  # allow complex functions
+    "D100", "D101", "D102", "D103",  # allow missing docstrings
+    "EM101", "EM102",  # allow passing literal strings to exceptions
+    "N802", "N803", "N806", "N815", "N816",  # allow JavaScript style names
+    "PLR0915",  # allow many statements
+    "PT015",  # allow always failing assertions
+    "RUF012",  # allow mutable class attributes
+    "S101",  # allow assertions
+    "S301",  # allow pickling
+    "TRY002", "TRY301",  # less strict handling of exceptions
+]
+"tests/star_wars_schema.py" = [
+    "A002",  # allow shadowin builtins
+    "ERA001",  # allow commented-out code
+]
+"tests/test_docs.py" = [
+    "S102",  # allow use of exec
+]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "double"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 50
+
+[tool.ruff.lint.pylint]
+max-args = 15
+max-branches = 50
+max-returns = 25
+max-statements = 125
+
+[tool.ruff.format]
+indent-style = "space"
+quote-style = "double"
+skip-magic-trailing-comma = false
+
+[tool.coverage.run]
+branch = true
+source = ["src", "tests"]
+omit = [
+    "*/conftest.py",
+    "*/test_*_fuzz.py",
+    "*/assert_valid_name.py",
+    "*/cached_property.py",
+    "*/character_classes.py",
+    "*/is_iterable.py",
+    "*/subscription/__init__.py"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "except ImportError:",
+    "# Python <",
+    'sys\.version_info <',
+    "raise NotImplementedError",
+    "assert False,",
+    '\s+next\($',
+    "if MYPY:",
+    "if TYPE_CHECKING:",
+    '^\s+\.\.\.$',
+    '^\s+pass$',
+    ': \.\.\.$'
+]
+ignore_errors = true
+
+[tool.mypy]
+# our try/except typing imports only resolve from 3.11 on
+python_version = "3.11"
+check_untyped_defs = true
+no_implicit_optional = true
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+mypy_path = ["src"]
+
+[[tool.mypy.overrides]]
+module = [
+    "graphql.type.introspection",
+    "tests.*"
+]
+disallow_untyped_defs = false
+
+[tool.pyright]
+# silence pyright since we're using mypy already
+reportArgumentType = false
+reportAssignmentType = false
+reportAttributeAccessIssue = false
+reportIncompatibleVariableOverride = false
+reportInvalidTypeForm = false
+reportMissingModuleSource = false
+reportMissingTypeArgument = false
+reportReturnType = false
+reportTypedDictNotRequiredAccess = false
+reportUnknownArgumentType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnnecessaryIsInstance = false
+reportUnknownVariableType = false
+ignore = ["**/test_*"]  # test functions
+
+[tool.pylint.basic]
+max-module-lines = 2000
+
+[tool.pylint.messages_control]
+disable = [
+    "method-hidden",
+    "missing-module-docstring",  # test modules
+    "redefined-outer-name",
+    "unused-variable",  # test functions
+]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+# Only run benchmarks as tests.
+# To actually run the benchmarks, use --benchmark-enable on the command line.
+# To run the slow tests (fuzzing), add --run-slow on the command line.
+addopts = "--benchmark-disable"
+# Deactivate default name pattern for test classes (we use pytest_describe).
+python_classes = "PyTest*"
+# Handle all async fixtures and tests automatically by asyncio,
+asyncio_mode = "strict"
+# Use the functions scope as the default for asynchronous tests.
+asyncio_default_fixture_loop_scope = "function"
+# Set a timeout in seconds for aborting tests that run too long.
+timeout = "100"
+# Ignore config options not (yet) available in older Python versions.
+filterwarnings = "ignore::pytest.PytestConfigWarning"
+# All tests can be found in the tests directory.
+testpaths = ["tests"]
+
+[tool.bumpversion]
+current_version = "3.3.2"
+commit = false
+tag = false
+parse = '''(?x)
+    (?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)
+    (?:(?P<release>a|b|rc)(?P<build>\d+))?
+'''
+serialize = [
+    "{major}.{minor}.{patch}{release}{build}",
+    "{major}.{minor}.{patch}",
+]
+
+[tool.bumpversion.parts.release]
+values = ["a", "b", "rc", "final"]
+optional_value = "final"
+
+[[tool.bumpversion.files]]
+filename = "src/graphql/version.py"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "docs/conf.py"
+search = 'version = release = "{current_version}"'
+replace = 'version = release = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "README.md"
+search = "{current_version} of GraphQL-core"
+replace = "{new_version} of GraphQL-core"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+regex = true
+search = '^version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"

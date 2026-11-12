@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import re
+from re import Pattern
+
+import pytest
+
+from graphql.language import parse
+from graphql.utilities import build_schema, get_introspection_query
+from graphql.validation import validate
+
+dummy_schema = build_schema(
+    """
+  type Query {
+    dummy: String
+  }
+  """
+)
+
+
+class ExcpectIntrospectionQuery:
+    def __init__(self, **options):
+        query = get_introspection_query(**options)
+        validation_errors = validate(dummy_schema, parse(query))
+        assert validation_errors == []
+        self.query = query
+
+    def to_match(self, name: str, times: int = 1) -> None:
+        pattern = self.to_reg_exp(name)
+        assert len(pattern.findall(self.query)) == times
+
+    def to_not_match(self, name: str) -> None:
+        pattern = self.to_reg_exp(name)
+        assert not pattern.search(self.query)
+
+    def to_contain(self, text: str) -> None:
+        assert text in self.query
+
+    def to_not_contain(self, text: str) -> None:
+        assert text not in self.query
+
+    @staticmethod
+    def to_reg_exp(name: str) -> Pattern:
+        return re.compile(rf"\b{name}\b")
+
+
+def describe_get_introspection_query():
+    def skips_all_description_fields():
+        ExcpectIntrospectionQuery().to_match("description", 5)
+        ExcpectIntrospectionQuery(descriptions=True).to_match("description", 5)
+        ExcpectIntrospectionQuery(descriptions=False).to_not_match("description")
+
+    def includes_is_repeatable_field_on_directives():
+        ExcpectIntrospectionQuery().to_not_match("isRepeatable")
+        ExcpectIntrospectionQuery(directive_is_repeatable=True).to_match("isRepeatable")
+        ExcpectIntrospectionQuery(directive_is_repeatable=False).to_not_match(
+            "isRepeatable"
+        )
+
+    def includes_description_field_on_schema():
+        ExcpectIntrospectionQuery().to_match("description", 5)
+        ExcpectIntrospectionQuery(schema_description=False).to_match("description", 5)
+        ExcpectIntrospectionQuery(schema_description=True).to_match("description", 6)
+        ExcpectIntrospectionQuery(
+            descriptions=False, schema_description=True
+        ).to_not_match("description")
+
+    def includes_specified_by_url_field():
+        ExcpectIntrospectionQuery().to_not_match("specifiedByURL")
+        ExcpectIntrospectionQuery(specified_by_url=True).to_match("specifiedByURL")
+        ExcpectIntrospectionQuery(specified_by_url=False).to_not_match("specifiedByURL")
+
+    def includes_is_deprecated_field_on_input_values():
+        ExcpectIntrospectionQuery().to_match("isDeprecated", 2)
+        ExcpectIntrospectionQuery(input_value_deprecation=True).to_match(
+            "isDeprecated", 3
+        )
+        ExcpectIntrospectionQuery(input_value_deprecation=False).to_match(
+            "isDeprecated", 2
+        )
+
+    def includes_deprecation_reason_field_on_input_values():
+        ExcpectIntrospectionQuery().to_match("deprecationReason", 2)
+        ExcpectIntrospectionQuery(input_value_deprecation=True).to_match(
+            "deprecationReason", 3
+        )
+        ExcpectIntrospectionQuery(input_value_deprecation=False).to_match(
+            "deprecationReason", 2
+        )
+
+    def includes_is_deprecated_field_on_directives():
+        ExcpectIntrospectionQuery().to_match("isDeprecated", 2)
+        ExcpectIntrospectionQuery(experimental_directive_deprecation=True).to_match(
+            "isDeprecated", 3
+        )
+        ExcpectIntrospectionQuery(experimental_directive_deprecation=False).to_match(
+            "isDeprecated", 2
+        )
+
+    def includes_deprecation_reason_field_on_directives():
+        query = ExcpectIntrospectionQuery()
+        query.to_not_contain("directives(includeDeprecated: true) {")
+        query.to_match("deprecationReason", 2)
+
+        query = ExcpectIntrospectionQuery(experimental_directive_deprecation=True)
+        query.to_contain("directives(includeDeprecated: true) {")
+        query.to_match("deprecationReason", 3)
+
+        query = ExcpectIntrospectionQuery(experimental_directive_deprecation=False)
+        query.to_not_contain("directives(includeDeprecated: true) {")
+        query.to_match("deprecationReason", 2)
+
+    def includes_is_one_of_on_input_objects():
+        ExcpectIntrospectionQuery().to_not_match("isOneOf")
+        ExcpectIntrospectionQuery(one_of=True).to_match("isOneOf")
+        ExcpectIntrospectionQuery(one_of=False).to_not_match("isOneOf")
+
+    def includes_deprecated_input_field_and_args():
+        ExcpectIntrospectionQuery().to_match("includeDeprecated: true", 2)
+        ExcpectIntrospectionQuery(input_value_deprecation=True).to_match(
+            "includeDeprecated: true", 5
+        )
+        ExcpectIntrospectionQuery(input_value_deprecation=False).to_match(
+            "includeDeprecated: true", 2
+        )
+
+    def throws_error_if_type_depth_is_too_high():
+        with pytest.raises(
+            ValueError,
+            match="Please set type_depth to a reasonable value"
+            r" between 0 and 100; the default is 9\.",
+        ):
+            get_introspection_query(type_depth=101)

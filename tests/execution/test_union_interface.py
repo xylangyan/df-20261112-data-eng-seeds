@@ -1,0 +1,673 @@
+from __future__ import annotations
+
+from asyncio import sleep
+
+import pytest
+
+from graphql.execution import ExecutionResult, execute, execute_sync
+from graphql.language import parse
+from graphql.type import (
+    GraphQLBoolean,
+    GraphQLField,
+    GraphQLInterfaceType,
+    GraphQLList,
+    GraphQLObjectType,
+    GraphQLSchema,
+    GraphQLString,
+    GraphQLUnionType,
+)
+
+pytestmark = pytest.mark.anyio
+
+
+class Dog:
+    name: str
+    barks: bool
+    mother: Dog | None
+    father: Dog | None
+    progeny: list[Dog]
+
+    def __init__(self, name: str, barks: bool):
+        self.name = name
+        self.barks = barks
+        self.mother = None
+        self.father = None
+        self.progeny = []
+
+
+class Cat:
+    name: str
+    meows: bool
+    mother: Cat | None
+    father: Cat | None
+    progeny: list[Cat]
+
+    def __init__(self, name: str, meows: bool):
+        self.name = name
+        self.meows = meows
+        self.mother = None
+        self.father = None
+        self.progeny = []
+
+
+class Plant:
+    name: str
+
+    def __init__(self, name: str):
+        self.name = name
+
+
+class Person:
+    name: str
+    pets: list[Dog | Cat] | None
+    friends: list[Dog | Cat | Person] | None
+    responsibilities: list[Dog | Cat | Plant] | None
+
+    def __init__(
+        self,
+        name: str,
+        pets: list[Dog | Cat] | None = None,
+        friends: list[Dog | Cat | Person] | None = None,
+        responsibilities: list[Dog | Cat | Plant] | None = None,
+    ):
+        self.name = name
+        self.pets = pets
+        self.friends = friends
+        self.responsibilities = responsibilities
+
+
+NamedType = GraphQLInterfaceType("Named", {"name": GraphQLField(GraphQLString)})
+
+LifeType = GraphQLInterfaceType(
+    "Life",
+    lambda: {"progeny": GraphQLField(GraphQLList(LifeType))},  # type: ignore
+)
+
+MammalType = GraphQLInterfaceType(
+    "Mammal",
+    lambda: {
+        "progeny": GraphQLField(GraphQLList(MammalType)),  # type: ignore
+        "mother": GraphQLField(MammalType),  # type: ignore
+        "father": GraphQLField(MammalType),  # type: ignore
+    },
+    interfaces=[LifeType],
+)
+
+DogType = GraphQLObjectType(
+    "Dog",
+    lambda: {
+        "name": GraphQLField(GraphQLString),
+        "barks": GraphQLField(GraphQLBoolean),
+        "progeny": GraphQLField(GraphQLList(DogType)),  # type: ignore
+        "mother": GraphQLField(DogType),  # type: ignore
+        "father": GraphQLField(DogType),  # type: ignore
+    },
+    interfaces=[MammalType, LifeType, NamedType],
+    is_type_of=lambda value, _info: isinstance(value, Dog),
+)
+
+CatType = GraphQLObjectType(
+    "Cat",
+    lambda: {
+        "name": GraphQLField(GraphQLString),
+        "meows": GraphQLField(GraphQLBoolean),
+        "progeny": GraphQLField(GraphQLList(CatType)),  # type: ignore
+        "mother": GraphQLField(CatType),  # type: ignore
+        "father": GraphQLField(CatType),  # type: ignore
+    },
+    interfaces=[MammalType, LifeType, NamedType],
+    is_type_of=lambda value, _info: isinstance(value, Cat),
+)
+
+
+async def resolve_plant_type(_value, _info) -> bool:
+    raise RuntimeError("Not sure if this is a plant")
+
+
+PlantType = GraphQLObjectType(
+    "Plant",
+    lambda: {"name": GraphQLField(GraphQLString)},
+    interfaces=[NamedType],
+    is_type_of=resolve_plant_type,
+)
+
+
+def resolve_pet_type(value, _info, _type):
+    if isinstance(value, Dog):
+        return DogType.name
+    if isinstance(value, Cat):
+        return CatType.name
+
+    # Not reachable. All possible types have been considered.
+    pytest.fail("Unexpected pet type")  # pragma: no cover
+
+
+PetType = GraphQLUnionType("Pet", [DogType, CatType], resolve_type=resolve_pet_type)
+
+PetOrPlantType = GraphQLUnionType("PetOrPlantType", [PlantType, DogType, CatType])
+
+PersonType = GraphQLObjectType(
+    "Person",
+    lambda: {
+        "name": GraphQLField(GraphQLString),
+        "pets": GraphQLField(GraphQLList(PetType)),
+        "friends": GraphQLField(GraphQLList(NamedType)),
+        "responsibilities": GraphQLField(GraphQLList(PetOrPlantType)),
+        "progeny": GraphQLField(GraphQLList(PersonType)),  # type: ignore
+        "mother": GraphQLField(PersonType),  # type: ignore
+        "father": GraphQLField(PersonType),  # type: ignore
+    },
+    interfaces=[NamedType, MammalType, LifeType],
+    is_type_of=lambda value, _info: isinstance(value, Person),
+)
+
+schema = GraphQLSchema(PersonType, types=[PetType])
+
+garfield = Cat("Garfield", False)
+garfield.mother = Cat("Garfield's Mom", False)
+garfield.mother.progeny = [garfield]
+
+odie = Dog("Odie", True)
+odie.mother = Dog("Odie's Mom", True)
+odie.mother.progeny = [odie]
+
+fern = Plant("Fern")
+liz = Person("Liz", [], [])
+john = Person("John", [garfield, odie], [liz, odie], [garfield, fern])
+
+
+def describe_execute_union_and_intersection_types():
+    def can_introspect_on_union_and_intersection_types():
+        document = parse(
+            """
+            {
+              Named: __type(name: "Named") {
+                kind
+                name
+                fields { name }
+                interfaces { name }
+                possibleTypes { name }
+                enumValues { name }
+                inputFields { name }
+              }
+              Mammal: __type(name: "Mammal") {
+                kind
+                name
+                fields { name }
+                interfaces { name }
+                possibleTypes { name }
+                enumValues { name }
+                inputFields { name }
+              }
+              Pet: __type(name: "Pet") {
+                kind
+                name
+                fields { name }
+                interfaces { name }
+                possibleTypes { name }
+                enumValues { name }
+                inputFields { name }
+              }
+            }
+            """
+        )
+
+        assert execute_sync(schema=schema, document=document) == (
+            {
+                "Named": {
+                    "kind": "INTERFACE",
+                    "name": "Named",
+                    "fields": [{"name": "name"}],
+                    "interfaces": [],
+                    "possibleTypes": [
+                        {"name": "Dog"},
+                        {"name": "Cat"},
+                        {"name": "Person"},
+                        {"name": "Plant"},
+                    ],
+                    "enumValues": None,
+                    "inputFields": None,
+                },
+                "Mammal": {
+                    "kind": "INTERFACE",
+                    "name": "Mammal",
+                    "fields": [
+                        {"name": "progeny"},
+                        {"name": "mother"},
+                        {"name": "father"},
+                    ],
+                    "interfaces": [{"name": "Life"}],
+                    "possibleTypes": [
+                        {"name": "Dog"},
+                        {"name": "Cat"},
+                        {"name": "Person"},
+                    ],
+                    "enumValues": None,
+                    "inputFields": None,
+                },
+                "Pet": {
+                    "kind": "UNION",
+                    "name": "Pet",
+                    "fields": None,
+                    "interfaces": None,
+                    "possibleTypes": [{"name": "Dog"}, {"name": "Cat"}],
+                    "enumValues": None,
+                    "inputFields": None,
+                },
+            },
+            None,
+        )
+
+    def executes_using_union_types():
+        # NOTE: This is an *invalid* query, but it should be *executable*.
+        document = parse(
+            """
+            {
+              __typename
+              name
+              pets {
+                __typename
+                name
+                barks
+                meows
+              }
+            }
+            """
+        )
+
+        assert execute_sync(schema=schema, document=document, root_value=john) == (
+            {
+                "__typename": "Person",
+                "name": "John",
+                "pets": [
+                    {"__typename": "Cat", "name": "Garfield", "meows": False},
+                    {"__typename": "Dog", "name": "Odie", "barks": True},
+                ],
+            },
+            None,
+        )
+
+    def executes_union_types_with_inline_fragment():
+        # This is the valid version of the query in the above test.
+        document = parse(
+            """
+            {
+              __typename
+              name
+              pets {
+                __typename
+                ... on Dog {
+                  name
+                  barks
+                }
+                ... on Cat {
+                  name
+                  meows
+                }
+              }
+            }
+            """
+        )
+
+        assert execute_sync(schema=schema, document=document, root_value=john) == (
+            {
+                "__typename": "Person",
+                "name": "John",
+                "pets": [
+                    {"__typename": "Cat", "name": "Garfield", "meows": False},
+                    {"__typename": "Dog", "name": "Odie", "barks": True},
+                ],
+            },
+            None,
+        )
+
+    def executes_using_interface_types():
+        # NOTE: This is an *invalid* query, but it should be a *executable*.
+        document = parse(
+            """
+            {
+              __typename
+              name
+              friends {
+                __typename
+                name
+                barks
+                meows
+              }
+            }
+            """
+        )
+
+        assert execute_sync(schema=schema, document=document, root_value=john) == (
+            {
+                "__typename": "Person",
+                "name": "John",
+                "friends": [
+                    {"__typename": "Person", "name": "Liz"},
+                    {"__typename": "Dog", "name": "Odie", "barks": True},
+                ],
+            },
+            None,
+        )
+
+    def executes_interface_types_with_inline_fragment():
+        # This is the valid version of the query in the above test.
+        document = parse(
+            """
+            {
+              __typename
+              name
+              friends {
+                __typename
+                name
+                ... on Dog {
+                  barks
+                }
+                ... on Cat {
+                  meows
+                }
+
+                ... on Mammal {
+                  mother {
+                    __typename
+                    ... on Dog {
+                      name
+                      barks
+                    }
+                    ... on Cat {
+                      name
+                      meows
+                    }
+                  }
+                }
+              }
+            }
+            """
+        )
+
+        assert execute_sync(schema=schema, document=document, root_value=john) == (
+            {
+                "__typename": "Person",
+                "name": "John",
+                "friends": [
+                    {"__typename": "Person", "name": "Liz", "mother": None},
+                    {
+                        "__typename": "Dog",
+                        "name": "Odie",
+                        "barks": True,
+                        "mother": {
+                            "__typename": "Dog",
+                            "name": "Odie's Mom",
+                            "barks": True,
+                        },
+                    },
+                ],
+            },
+            None,
+        )
+
+    def executes_interface_types_with_named_fragments():
+        document = parse(
+            """
+            {
+              __typename
+              name
+              friends {
+                __typename
+                name
+                ...DogBarks
+                ...CatMeows
+              }
+            }
+
+            fragment  DogBarks on Dog {
+              barks
+            }
+
+            fragment  CatMeows on Cat {
+              meows
+            }
+            """
+        )
+
+        assert execute_sync(schema=schema, document=document, root_value=john) == (
+            {
+                "__typename": "Person",
+                "name": "John",
+                "friends": [
+                    {"__typename": "Person", "name": "Liz"},
+                    {"__typename": "Dog", "name": "Odie", "barks": True},
+                ],
+            },
+            None,
+        )
+
+    def allows_fragment_conditions_to_be_abstract_types():
+        document = parse(
+            """
+            {
+              __typename
+              name
+              pets {
+                ...PetFields,
+                ...on Mammal {
+                  mother {
+                    ...ProgenyFields
+                  }
+                }
+              }
+              friends { ...FriendFields }
+            }
+
+            fragment PetFields on Pet {
+              __typename
+              ... on Dog {
+                name
+                barks
+              }
+              ... on Cat {
+                name
+                meows
+              }
+            }
+
+            fragment FriendFields on Named {
+              __typename
+              name
+              ... on Dog {
+                barks
+              }
+              ... on Cat {
+                meows
+              }
+            }
+
+            fragment ProgenyFields on Life {
+              progeny {
+                __typename
+              }
+            }
+            """
+        )
+
+        assert execute_sync(schema=schema, document=document, root_value=john) == (
+            {
+                "__typename": "Person",
+                "name": "John",
+                "pets": [
+                    {
+                        "__typename": "Cat",
+                        "name": "Garfield",
+                        "meows": False,
+                        "mother": {"progeny": [{"__typename": "Cat"}]},
+                    },
+                    {
+                        "__typename": "Dog",
+                        "name": "Odie",
+                        "barks": True,
+                        "mother": {"progeny": [{"__typename": "Dog"}]},
+                    },
+                ],
+                "friends": [
+                    {"__typename": "Person", "name": "Liz"},
+                    {"__typename": "Dog", "name": "Odie", "barks": True},
+                ],
+            },
+            None,
+        )
+
+    def gets_execution_info_in_resolver():
+        encountered = {}
+
+        def resolve_type(_source, info, _type):
+            encountered["context"] = info.context
+            encountered["schema"] = info.schema
+            encountered["root_value"] = info.root_value
+            return PersonType2.name
+
+        NamedType2 = GraphQLInterfaceType(
+            "Named", {"name": GraphQLField(GraphQLString)}, resolve_type=resolve_type
+        )
+
+        PersonType2 = GraphQLObjectType(
+            "Person",
+            {
+                "name": GraphQLField(GraphQLString),
+                "friends": GraphQLField(GraphQLList(NamedType2)),
+            },
+            interfaces=[NamedType2],
+        )
+
+        schema2 = GraphQLSchema(PersonType2)
+        document = parse("{ name, friends { name } }")
+        root_value = Person("John", [], [liz])
+        context_value = {"authToken": "123abc"}
+
+        assert execute_sync(
+            schema=schema2,
+            document=document,
+            root_value=root_value,
+            context_value=context_value,
+        ) == (
+            {"name": "John", "friends": [{"name": "Liz"}]},
+            None,
+        )
+
+        assert encountered == {
+            "schema": schema2,
+            "root_value": root_value,
+            "context": context_value,
+        }
+
+    @pytest.mark.filterwarnings("error:.*was never awaited:RuntimeWarning")
+    async def handles_rejections_from_is_type_of_after_an_is_type_of_returns_true():
+        document = parse("""
+            {
+                responsibilities {
+                __typename
+                ... on Dog {
+                    name
+                    barks
+                }
+                ... on Cat {
+                    name
+                    meows
+                }
+                }
+            }
+            """)
+
+        root_value = Person("John", [], [liz], [garfield])
+        context_value = {"authToken": "123abc"}
+
+        result = execute(schema, document, root_value, context_value)
+        # the synchronous isTypeOf match keeps the result synchronous
+        assert isinstance(result, ExecutionResult)
+
+        assert result == (
+            {
+                "responsibilities": [
+                    {"__typename": "Cat", "name": "Garfield", "meows": False},
+                ],
+            },
+            None,
+        )
+
+        # give the pending isTypeOf rejection a chance to settle in the background
+        await sleep(0)
+        await sleep(0)
+
+    @pytest.mark.filterwarnings("error:.*was never awaited:RuntimeWarning")
+    async def handles_pending_is_type_of_rejections_when_a_later_one_throws_sync():
+        throwing_searchable_interface = GraphQLInterfaceType(
+            "ThrowingSearchable",
+            {"id": GraphQLField(GraphQLString)},
+        )
+
+        async def is_type_of_async_reject(_value, _info) -> bool:
+            raise RuntimeError("TypeAsyncReject_isTypeOf_rejected")
+
+        type_async_reject = GraphQLObjectType(
+            "TypeAsyncReject",
+            lambda: {
+                "id": GraphQLField(GraphQLString),
+                "nameAsyncReject": GraphQLField(GraphQLString),
+            },
+            interfaces=[throwing_searchable_interface],
+            is_type_of=is_type_of_async_reject,
+        )
+
+        def is_type_of_throwing(_value, _info) -> bool:
+            raise RuntimeError("TypeThrowing_isTypeOf_threw")
+
+        type_throwing = GraphQLObjectType(
+            "TypeThrowing",
+            lambda: {
+                "id": GraphQLField(GraphQLString),
+                "nameThrowing": GraphQLField(GraphQLString),
+            },
+            interfaces=[throwing_searchable_interface],
+            is_type_of=is_type_of_throwing,
+        )
+
+        schema_with_throwing_is_type_of = GraphQLSchema(
+            GraphQLObjectType(
+                "Query",
+                {
+                    "search": GraphQLField(
+                        throwing_searchable_interface,
+                        resolve=lambda *_args: {
+                            "id": "x",
+                            "nameThrowing": "Object X",
+                        },
+                    )
+                },
+            ),
+            types=[type_async_reject, type_throwing],
+        )
+
+        document = parse(
+            """
+            {
+              search {
+                __typename
+                id
+                ... on TypeThrowing {
+                  nameThrowing
+                }
+              }
+            }
+            """
+        )
+
+        result = execute(schema_with_throwing_is_type_of, document)
+        # the synchronously throwing isTypeOf keeps the result synchronous
+        assert isinstance(result, ExecutionResult)
+
+        assert result.data == {"search": None}
+        assert result.errors
+        assert result.errors[0].message == "TypeThrowing_isTypeOf_threw"
+
+        # give the pending isTypeOf rejection a chance to settle in the background
+        await sleep(0)
+        await sleep(0)
