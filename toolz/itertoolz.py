@@ -13,7 +13,8 @@ __all__ = ('remove', 'accumulate', 'groupby', 'merge_sorted', 'interleave',
            'first', 'second', 'nth', 'last', 'get', 'concat', 'concatv',
            'mapcat', 'cons', 'interpose', 'frequencies', 'reduceby', 'iterate',
            'sliding_window', 'partition', 'partition_all', 'count', 'pluck',
-           'join', 'tail', 'diff', 'topk', 'peek', 'peekn', 'random_sample')
+           'join', 'join_sorted', 'tail', 'diff', 'topk', 'peek', 'peekn',
+           'random_sample')
 
 
 def remove(predicate, seq):
@@ -924,6 +925,95 @@ def join(leftkey, leftseq, rightkey, rightseq,
             if key not in seen_keys:
                 for match in matches:
                     yield (match, right_default)
+
+
+def join_sorted(leftkey, leftseq, rightkey, rightseq,
+                left_default=no_default, right_default=no_default):
+    """ Join two sorted sequences on common attributes
+
+    This is a streaming operation.  Both sequences must be sorted by their
+    respective keys.  Only one key's group needs to fit in memory at a time.
+
+    >>> identity = lambda x: x
+    >>> list(join_sorted(identity, [1, 1, 2, 3],
+    ...                  identity, [1, 1, 2, 4]))
+    [(1, 1), (1, 1), (1, 1), (1, 1), (2, 2)]
+
+    Outer joins use the same ``left_default`` and ``right_default`` arguments
+    as :func:`join`.
+
+    >>> list(join_sorted(identity, [1, 2],
+    ...                  identity, [2, 3],
+    ...                  left_default=None, right_default=None))
+    [(1, None), (2, 2), (None, 3)]
+
+    A ``ValueError`` identifies the side whose input order moves backwards.
+
+    >>> list(join_sorted(identity, [2, 1], identity, [1, 2]))
+    Traceback (most recent call last):
+      ...
+    ValueError: left sequence is not sorted
+    """
+    if not callable(leftkey):
+        leftkey = getter(leftkey)
+    if not callable(rightkey):
+        rightkey = getter(rightkey)
+
+    def groups(seq, key, side, buffer_group):
+        has_previous_key = False
+        previous_key = None
+
+        for item_key, group in itertools.groupby(seq, key):
+            if has_previous_key and item_key < previous_key:
+                raise ValueError(f'{side} sequence is not sorted')
+            previous_key = item_key
+            has_previous_key = True
+            if buffer_group:
+                yield item_key, list(group)
+            else:
+                yield item_key, group
+
+    left_groups = groups(leftseq, leftkey, 'left', True)
+    right_groups = groups(rightseq, rightkey, 'right', False)
+
+    try:
+        left_key, left_group = next(left_groups)
+    except StopIteration:
+        left_key = left_group = None
+    try:
+        right_key, right_group = next(right_groups)
+    except StopIteration:
+        right_key = right_group = None
+
+    while left_group is not None and right_group is not None:
+        if left_key == right_key:
+            for right_item in right_group:
+                for left_item in left_group:
+                    yield (left_item, right_item)
+            left_key, left_group = next(left_groups, (None, None))
+            right_key, right_group = next(right_groups, (None, None))
+        elif left_key < right_key:
+            if right_default != no_default:
+                for left_item in left_group:
+                    yield (left_item, right_default)
+            left_key, left_group = next(left_groups, (None, None))
+        else:
+            if left_default != no_default:
+                for right_item in right_group:
+                    yield (left_default, right_item)
+            right_key, right_group = next(right_groups, (None, None))
+
+    if right_default != no_default:
+        while left_group is not None:
+            for left_item in left_group:
+                yield (left_item, right_default)
+            left_key, left_group = next(left_groups, (None, None))
+
+    if left_default != no_default:
+        while right_group is not None:
+            for right_item in right_group:
+                yield (left_default, right_item)
+            right_key, right_group = next(right_groups, (None, None))
 
 
 def diff(*seqs, **kwargs):

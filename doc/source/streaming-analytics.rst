@@ -234,6 +234,12 @@ The Toolz Join operation fully evaluates the *left* sequence and streams the
 *right* sequence through memory.  Thus, if streaming support is desired the
 larger of the two sequences should always occupy the right side of the join.
 
+When both sequences are already sorted by their join keys, ``join_sorted``
+streams both sides instead.  At most one key's group from either sequence is
+held in memory, and output is produced as soon as the next matching group is
+known.  ``join_sorted`` accepts the same ``left_default`` and ``right_default``
+arguments as ``join``.
+
 
 Algorithmic Details
 ^^^^^^^^^^^^^^^^^^^

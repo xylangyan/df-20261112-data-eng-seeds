@@ -1,4 +1,5 @@
 import itertools
+import pytest
 from itertools import starmap
 from toolz.utils import raises
 from functools import partial
@@ -13,7 +14,8 @@ from toolz.itertoolz import (remove, groupby, merge_sorted,
                              reduceby, iterate, accumulate,
                              sliding_window, count, partition,
                              partition_all, take_nth, pluck, join,
-                             diff, topk, peek, peekn, random_sample)
+                             join_sorted, diff, topk, peek, peekn,
+                             random_sample)
 from operator import add, mul
 
 
@@ -495,6 +497,74 @@ def test_outer_join():
     expected = {(2, 2), (1, None), (None, 3)}
 
     assert result == expected
+
+
+def test_join_sorted():
+    left = [(1, 'one'), (1, 'uno'), (2, 'two'), (2, 'dos')]
+    right = [(1, 'apple'), (1, 'orange'), (3, 'banana'), (3, 'coconut')]
+
+    result = list(join_sorted(first, left, first, right))
+    expected = [((1, 'one'), (1, 'apple')),
+                ((1, 'uno'), (1, 'apple')),
+                ((1, 'one'), (1, 'orange')),
+                ((1, 'uno'), (1, 'orange'))]
+
+    assert result == expected
+    assert result == list(join(first, left, first, right))
+
+
+def test_join_sorted_outer():
+    result = list(join_sorted(identity, [1, 2], identity, [2, 3],
+                              left_default=None, right_default=None))
+    assert result == [(1, None), (2, 2), (None, 3)]
+
+    result = list(join_sorted(identity, [1, 2], identity, [2, 3],
+                              left_default=None))
+    assert result == [(2, 2), (None, 3)]
+
+    result = list(join_sorted(identity, [1, 2], identity, [2, 3],
+                              right_default=None))
+    assert result == [(1, None), (2, 2)]
+
+
+def test_join_sorted_unsorted():
+    with pytest.raises(ValueError) as excinfo:
+        list(join_sorted(identity, [2, 1], identity, [1, 2]))
+    assert 'left' in str(excinfo.value)
+
+    with pytest.raises(ValueError) as excinfo:
+        list(join_sorted(identity, [1, 2], identity, [2, 1]))
+    assert 'right' in str(excinfo.value)
+
+
+class CountingIterator:
+    def __init__(self, seq):
+        self.it = iter(seq)
+        self.count = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.count += 1
+        return next(self.it)
+
+
+def test_join_sorted_is_lazy():
+    left = CountingIterator([1, 1, 2, 3])
+    right = CountingIterator([1, 1, 2, 3])
+    result = join_sorted(identity, left, identity, right)
+
+    assert next(result) == (1, 1)
+    assert left.count < 4
+    assert right.count < 4
+
+
+def test_join_sorted_curried():
+    from toolz.curried import join_sorted as cjoin_sorted
+
+    result = cjoin_sorted(identity)([1, 2])(identity)([2, 3])
+    assert list(result) == [(2, 2)]
 
 
 def test_diff():
