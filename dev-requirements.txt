@@ -1,0 +1,5 @@
+pytest
+mock;python_version<"3.3"
+pyopenssl
+git+https://github.com/betamaxpy/betamax
+trustme
