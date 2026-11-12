@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/schema#",
+  "$id": "https://raw.githubusercontent.com/OpenLineage/OpenLineage/main/integration/common/openlineage/common/schema/dbt-run-run-facet.json",
+  "$defs": {
+    "DbtRunRunFacet": {
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "invocation_id": {
+              "type": "string",
+              "format": "uuid",
+              "example": "e0c64ee8-2672-4c7a-92cc-2e27c2d4324f"
+            },
+            "project_name": {
+              "type": "string",
+              "example": "my_project"
+            },
+            "project_version": {
+              "type": "string",
+              "example": "0.20.1"
+            },
+            "profile_name": {
+              "type": "string",
+              "example": "default"
+            },
+            "dbt_runtime": {
+              "type": "string",
+              "example": "cloud"
+            },
+            "account_id": {
+              "type": "string",
+              "description": "dbt cloud account id",
+              "example": "1234567890"
+            },
+            "pre_parse": {
+              "type": "string",
+              "description": "dbt Core v2 only: how the `dbt parse` that dbt-ol runs before the command went. Node events take their inputs from its manifest; without it, they wait for the manifest dbt writes at the end of the run.",
+              "enum": ["succeeded", "failed", "timed_out", "skipped"],
+              "example": "succeeded"
+            },
+            "write_json": {
+              "type": "boolean",
+              "description": "dbt Core v2 only: whether dbt writes manifest.json and run_results.json at the end of the run.",
+              "example": true
+            }
+          },
+          "required": ["invocation_id"]
+        }
+      ],
+      "type": "object"
+    }
+  },
+  "type": "object",
+  "properties": {
+    "dbt_run": {
+      "$ref": "#/$defs/DbtRunRunFacet"
+    }
+  }
+}

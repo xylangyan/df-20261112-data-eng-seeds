@@ -1,0 +1,56 @@
+{
+  "eventType": "START",
+  "run": {
+    "facets": {}
+  },
+  "job": {
+    "namespace": "testPysparkWordCountWithCliArgs"
+  },
+  "inputs": [
+    {
+      "namespace": "file",
+      "name": "/test_data/data.txt",
+      "facets": {
+        "schema": {
+          "fields": [
+            {
+              "name": "value",
+              "type": "string"
+            }
+          ]
+        },
+        "dataSource": {
+          "name": "file",
+          "uri": "file"
+        }
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "namespace": "file",
+      "name": "/tmp/test_data/test_output",
+      "facets": {
+        "schema": {
+          "fields": [
+            {
+              "name": "value",
+              "type": "string"
+            },
+            {
+              "name": "count",
+              "type": "long"
+            }
+          ]
+        },
+        "dataSource": {
+          "name": "file",
+          "uri": "file"
+        },
+        "lifecycleStateChange": {
+          "lifecycleStateChange": "OVERWRITE"
+        }
+      }
+    }
+  ]
+}

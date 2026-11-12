@@ -1,0 +1,44 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+plugins {
+    id 'eclipse'
+    id 'jacoco'
+    id 'java'
+    id 'java-library'
+    id 'maven-publish'
+    id 'signing'
+    id "com.adarshr.test-logger" version "4.0.0"
+    id 'com.diffplug.spotless' version '7.0.2'
+    id "com.gradleup.shadow" version "9.6.1"
+    id "pmd"
+    id "io.freefair.lombok" version "9.8.2"
+}
+
+ext {
+    projectDescription = "GcpLineage OpenLineage transport library"
+}
+
+dependencies {
+    compileOnly('com.google.code.findbugs:jsr305:3.0.2')
+    implementation("com.google.cloud.datalineage:producerclient:1.1.1")
+
+    testImplementation("com.google.cloud.datalineage:producerclient:1.1.1")
+}
+
+shadowJar {
+    relocate 'datalineage.shaded', 'io.openlineage.client.transports.gcplineage.shaded.datalineage.shaded'
+    relocate 'com.google.cloud', 'io.openlineage.client.transports.gcplineage.shaded.com.google.cloud'
+    relocate 'com.google.api', 'io.openlineage.client.transports.gcplineage.shaded.com.google.api'
+    relocate 'com.google.auth', 'io.openlineage.client.transports.gcplineage.shaded.com.google.auth'
+    relocate 'com.google.protobuf', 'io.openlineage.client.transports.gcplineage.shaded.com.google.protobuf'
+
+    relocate 'META-INF/native/libdatalineage_shaded_io_grpc_netty_shaded_netty', 'META-INF/native/libio_openlineage_client_transports_gcplineage_io_grpc_netty_shaded_netty'
+    relocate 'META-INF/native/datalineage_shaded_io_grpc_netty_shaded_netty', 'META-INF/native/io_openlineage_client_transports_gcplineage_io_grpc_netty_shaded_netty'
+
+    mergeServiceFiles()
+}
+
+apply from: '../transports.build.gradle'

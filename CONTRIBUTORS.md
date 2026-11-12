@@ -1,0 +1,17 @@
+# Contributors to OpenLineage
+
+| Organization                         | Integration or Feature                                                                                             |
+|--------------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| [Astronomer](https://www.astronomer.io/) | Integrations, clients, spec, documentation, developer and user support, community management, talks                |
+| [Atlan](https://atlan.com/)          | Contributions to Airflow integration, Python client and documentation                                              |
+| [Datadog](https://www.datadoghq.com/) | Contributions to dbt integration                                                                                   |
+| [IBM](https://www.ibm.com/)          | Contributions to clients, spec, and documentation                                                        |
+| [oleander](https://oleander.dev)    | Contributions to integrations, clients, spec, documentation, and talks |
+
+For pointers on getting started as a contributor, see the [OpenLineage Contributing Guide](CONTRIBUTING.md).
+
+To add your organization to this table, open a [pull request](https://github.com/OpenLineage/OpenLineage/pulls).
+
+----
+SPDX-License-Identifier: Apache-2.0\
+Copyright 2018-2026 contributors to the OpenLineage project

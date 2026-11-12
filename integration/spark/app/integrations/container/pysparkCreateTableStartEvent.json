@@ -1,0 +1,9 @@
+{
+  "eventType": "START",
+  "job": {
+    "namespace": "testCreateTable",
+    "name": "${json-unit.regex}open_lineage_integration_create_table.*create_table_test"
+  },
+  "inputs": [],
+  "outputs": []
+}

@@ -1,0 +1,107 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+plugins {
+    id("java-library")
+    id("pmd")
+    id("com.diffplug.spotless")
+    id("io.freefair.lombok")
+    id("io.openlineage.common-config")
+    id("io.openlineage.scala-variants")
+    id("idea")
+    id("java-test-fixtures")
+}
+
+scalaVariants {
+    create("2.12")
+    create("2.13")
+}
+
+idea {
+    module {
+        testSources.from(sourceSets.testScala212.java.srcDirs, sourceSets.testScala213.java.srcDirs)
+    }
+}
+
+ext {
+    assertjVersion = "3.27.7"
+    deltaVersion = "1.1.0"
+    icebergVersion = "0.14.1"
+    jacksonVersion = "2.18.11"
+    junit5Version = "5.14.4"
+    mockitoVersion = "4.11.0"
+    micrometerVersion = "1.17.1"
+
+    sparkVersion = project.findProperty("spark32.spark.version")
+    scalaBinaryVersion = project.findProperty("scala.binary.version")
+    configurationName = scalaBinaryVersion.replace(".", "")
+}
+
+dependencies {
+    implementation(project(path: ":shared"))
+    implementation(project(path: ":shared", configuration: "scala${configurationName}RuntimeElements"))
+    implementation(project(path: ":spark3"))
+    implementation(project(path: ":spark3", configuration: "scala${configurationName}RuntimeElements"))
+
+    compileOnly("io.delta:delta-core_${scalaBinaryVersion}:${deltaVersion}")
+    compileOnly("org.apache.iceberg:iceberg-spark-runtime-3.2_${scalaBinaryVersion}:${icebergVersion}")
+    compileOnly("org.apache.spark:spark-sql_${scalaBinaryVersion}:${sparkVersion}")
+    compileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    // TODO: Remove this. Test Fixtures are not needed.
+    testFixturesApi(project(path: ":shared", configuration: "scala${configurationName}RuntimeElements"))
+    testFixturesApi("io.delta:delta-core_${scalaBinaryVersion}:${deltaVersion}")
+    testFixturesApi("org.apache.iceberg:iceberg-spark-runtime-3.2_${scalaBinaryVersion}:${icebergVersion}")
+    testFixturesApi("org.apache.spark:spark-sql_${scalaBinaryVersion}:${sparkVersion}")
+    testFixturesApi("org.assertj:assertj-core:${assertjVersion}")
+    testFixturesApi("org.junit.jupiter:junit-jupiter-api:${junit5Version}")
+    testFixturesApi("org.junit.jupiter:junit-jupiter:${junit5Version}")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testFixturesApi("org.mockito:mockito-core:${mockitoVersion}")
+    testFixturesApi("org.mockito:mockito-inline:${mockitoVersion}")
+    testFixturesApi("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    // Scala 2.12
+    scala212Implementation(project(path: ":shared", configuration: "scala212RuntimeElements"))
+    scala212Implementation(project(path: ":spark3", configuration: "scala212RuntimeElements"))
+
+    scala212CompileOnly("io.delta:delta-core_2.12:${deltaVersion}")
+    scala212CompileOnly("org.apache.iceberg:iceberg-spark-runtime-3.2_2.12:${icebergVersion}")
+    scala212CompileOnly("org.apache.spark:spark-sql_2.12:${sparkVersion}")
+    scala213CompileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    testScala212Implementation("io.delta:delta-core_2.12:${deltaVersion}")
+    testScala212Implementation("org.apache.iceberg:iceberg-spark-runtime-3.2_2.12:${icebergVersion}")
+    testScala212Implementation("io.micrometer:micrometer-core:${micrometerVersion}")
+    testScala212Implementation("org.apache.spark:spark-sql_2.12:${sparkVersion}")
+    testScala212Implementation("org.assertj:assertj-core:${assertjVersion}")
+    testScala212Implementation("org.junit.jupiter:junit-jupiter-api:${junit5Version}")
+    testScala212Implementation("org.junit.jupiter:junit-jupiter:${junit5Version}")
+    testScala212RuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testScala212Implementation("org.mockito:mockito-core:${mockitoVersion}")
+    testScala212Implementation("org.mockito:mockito-inline:${mockitoVersion}")
+    testScala212Implementation("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    // Scala 2.13
+    scala213Implementation(project(path: ":shared", configuration: "scala213RuntimeElements"))
+    scala213Implementation(project(path: ":spark3", configuration: "scala213RuntimeElements"))
+
+    scala213CompileOnly("io.delta:delta-core_2.13:${deltaVersion}")
+    scala213CompileOnly("org.apache.iceberg:iceberg-spark-runtime-3.2_2.13:${icebergVersion}")
+    scala213CompileOnly("org.apache.spark:spark-sql_2.13:${sparkVersion}")
+    scala213CompileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    testScala213Implementation("io.delta:delta-core_2.13:${deltaVersion}")
+    testScala213Implementation("org.apache.iceberg:iceberg-spark-runtime-3.2_2.13:${icebergVersion}")
+    testScala212Implementation("io.micrometer:micrometer-core:${micrometerVersion}")
+    testScala213Implementation("org.apache.spark:spark-sql_2.13:${sparkVersion}")
+    testScala213Implementation("org.assertj:assertj-core:${assertjVersion}")
+    testScala213Implementation("org.junit.jupiter:junit-jupiter-api:${junit5Version}")
+    testScala213Implementation("org.junit.jupiter:junit-jupiter:${junit5Version}")
+    testScala213RuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testScala213Implementation("org.mockito:mockito-core:${mockitoVersion}")
+    testScala213Implementation("org.mockito:mockito-inline:${mockitoVersion}")
+    testScala213Implementation("io.micrometer:micrometer-core:${micrometerVersion}")
+}

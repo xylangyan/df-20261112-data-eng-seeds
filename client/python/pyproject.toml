@@ -1,0 +1,205 @@
+[build-system]
+requires = ["uv_build>=0.9.4,<0.14.0"]
+build-backend = "uv_build"
+
+[project]
+name = "openlineage-python"
+version = "1.56.0"
+description = "OpenLineage Python Client"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = [
+  "openlineage",
+]
+authors = [{ name = "OpenLineage", email = "info@openlineage.io" }]
+requires-python = ">=3.10"
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "attrs>=20.0",
+  "python-dateutil>=2.8.2",
+  "pyyaml>=5.4",
+  "requests>=2.32.4",
+  "httpx2>=2.12.0",
+  "packaging>=21.0",
+]
+optional-dependencies.kafka = [
+  "confluent-kafka>=2.1.1",
+]
+optional-dependencies.msk-iam = [
+  "aws-msk-iam-sasl-signer-python>=1.0.1",
+  "confluent-kafka>=2.1.1",
+]
+optional-dependencies.datazone = [
+  "boto3>=1.34.134"
+]
+optional-dependencies.gcplineage = [
+  "google-cloud-datacatalog-lineage>=0.3.14"
+]
+optional-dependencies.fsspec = [
+  "fsspec>=2023.1.0"
+]
+optional-dependencies.test = [
+  "covdefaults>=2.3",
+  "pytest>=7.3.1",
+  "pytest-cov>=4.1",
+  "pytest-mock>=3.10",
+  "pyyaml>=5.4",
+  "uvicorn>=0.20.0",
+  "fastapi>=0.100.0",
+]
+
+optional-dependencies.docs = [
+  "sphinx>=7.0",
+  "beautifulsoup4>=4.12.0",
+  "sphinx-autodoc-typehints>=2.0.0",
+  "pydata-sphinx-theme>=0.13"
+]
+
+optional-dependencies.generator = [
+  "ruff",
+  "click",
+  "datamodel-code-generator==0.43.1"
+]
+optional-dependencies.dev = [
+  "mypy",
+  "types-PyYAML",
+  "types-python-dateutil",
+  "types-requests"
+]
+
+[dependency-groups]
+dev = [
+    "bump-my-version>=0.10.0",
+    "ruff>=0.12.2",
+]
+
+
+[tool.coverage]
+html.show_contexts = true
+html.skip_covered = false
+report.fail_under = 90
+run.parallel = true
+run.plugins = ["covdefaults"]
+run.omit = [
+    "tests/*",
+    "*/tests/*",
+    "test_*.py",
+    "*_test.py"
+]
+
+[tool.mypy]
+disable_error_code = "no-redef"
+warn_redundant_casts = true
+show_error_codes = true
+overrides = [
+  { ignore_missing_imports = true, module = [
+  "confluent_kafka.*",
+  "google.cloud.*",
+  "google.oauth2.*",
+] } ]
+strict = true
+pretty = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "src"
+exclude = [
+  "tests/.*",
+  ".*/tests/.*",
+]
+
+[project.scripts]
+ol-generate-code = "openlineage.client.generator.cli:main"
+
+[tool.uv.build-backend]
+module-name = "openlineage"
+namespace = true
+
+[tool.ruff]
+line-length = 110
+lint.select = [
+    "F",
+    "E",
+    "W",
+    "I001"
+]
+target-version = "py310"
+src = ["openlineage", "tests"]
+namespace-packages = ["openlineage/client"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: Integration tests requiring test server",
+    "unit: Unit tests"
+]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning"
+]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+    "--ignore=tests/integration/test_server/"
+]
+
+[tool.tox]
+legacy_tox_ini = """
+[tox]
+# tox 4.67.5 breaks under umask 002: https://github.com/tox-dev/tox/issues/4357
+requires = tox-uv, tox<4.67.5
+env_list = py310,py311,py312,py313,py314
+skip_missing_interpreters = true
+
+[testenv]
+description = run the unit tests with pytest under {basepython}
+package = wheel
+wheel_build_env = .pkg
+extras = kafka,msk-iam,test,generator,fsspec
+set_env =
+    COVERAGE_FILE = {toxworkdir}/.coverage.{envname}
+    COVERAGE_PROCESS_START = {toxinidir}/pyproject.toml
+    _COVERAGE_SRC = {envsitepackagesdir}/sphinx_argparse_cli
+commands =
+    pytest {tty:--color=yes} {posargs: \
+      --cov openlineage --cov {toxinidir}{/}tests \
+      --junitxml {toxworkdir}{/}junit.{envname}.xml \
+      --cov-config=pyproject.toml --no-cov-on-fail --cov-report term-missing:skip-covered --cov-context=test \
+      --cov-report html:{envtmpdir}{/}htmlcov --cov-report xml:{toxworkdir}{/}coverage.{envname}.xml \
+      tests}
+
+[testenv:dev]
+description = generate a DEV environment
+package = editable
+extras = kafka,msk-iam,test
+commands =
+    python -m pip list --format=columns
+    python -c 'import sys; print(sys.executable)'
+"""
+
+[tool.bumpversion]
+current_version = "1.56.0"
+commit = false
+tag = false
+parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)(?P<rc>.*)"
+serialize = [
+    "{major}.{minor}.{patch}{rc}",
+    "{major}.{minor}.{patch}"
+]
+
+
+[[tool.bumpversion.files]]
+filename = "src/openlineage/client/constants.py"
+search = "__version__ = \"{current_version}\""
+replace = "__version__ = \"{new_version}\""

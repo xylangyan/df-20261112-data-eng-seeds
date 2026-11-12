@@ -1,0 +1,32 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+include 'spark3'
+include 'spark31'
+include 'spark32'
+include 'spark33'
+include 'spark34'
+include 'spark35'
+include 'spark40'
+include 'shared'
+include 'test-commons'
+include 'app'
+include 'scala-fixtures'
+
+include 'snowflake'
+project(":snowflake").projectDir = file("./vendor/snowflake")
+
+include 'iceberg'
+project(":iceberg").projectDir = file("./vendor/iceberg")
+
+include 'gcp'
+project(":gcp").projectDir = file("./vendor/gcp")
+
+buildCache {
+    local {
+        directory = new File(rootDir, 'build-cache')
+    }
+}
+

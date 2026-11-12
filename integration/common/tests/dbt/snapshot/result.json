@@ -1,0 +1,175 @@
+[
+  {
+    "eventTime": "2023-04-16T21:37:18.150055Z",
+    "eventType": "START",
+    "inputs": [
+      {
+        "facets": {
+          "dataSource": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-0-1/DatasourceDatasetFacet.json#/$defs/DatasourceDatasetFacet",
+            "name": "postgres://POSTGRES_HOST:1234",
+            "uri": "postgres://POSTGRES_HOST:1234"
+          },
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [{ "description": "The primary key for this table", "name": "id" }]
+          }
+        },
+        "name": "postgres.postgres.my_second_dbt_model",
+        "namespace": "postgres://POSTGRES_HOST:1234"
+      }
+    ],
+    "job": {
+      "facets": {
+        "sql": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-1-0/SQLJobFacet.json#/$defs/SQLJobFacet",
+          "query": "\n\n\n\nselect * from \"postgres\".\"postgres\".\"my_second_dbt_model\"\n",
+          "dialect": "postgres"
+        }
+      },
+      "name": "postgres.postgres.snapshot_test.orders_snapshot.snapshot",
+      "namespace": "job-namespace"
+    },
+    "outputs": [
+      {
+        "facets": {
+          "dataSource": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-0-1/DatasourceDatasetFacet.json#/$defs/DatasourceDatasetFacet",
+            "name": "postgres://POSTGRES_HOST:1234",
+            "uri": "postgres://POSTGRES_HOST:1234"
+          },
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [{ "description": "Order id", "name": "id" }]
+          }
+        },
+        "name": "postgres.postgres.orders_snapshot",
+        "namespace": "postgres://POSTGRES_HOST:1234",
+        "outputFacets": {}
+      }
+    ],
+    "producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+    "run": {
+      "facets": {
+        "dbt_version": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://github.com/OpenLineage/OpenLineage/tree/main/integration/common/openlineage/schema/dbt-version-run-facet.json",
+          "version": "{{ any(result) }}"
+        },
+        "processing_engine": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-1-1/ProcessingEngineRunFacet.json#/$defs/ProcessingEngineRunFacet",
+          "name": "dbt",
+          "version": "{{ any(result) }}",
+          "openlineageAdapterVersion": "{{ any(result) }}"
+        },
+        "parent": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/ParentRunFacet.json#/$defs/ParentRunFacet",
+          "job": { "name": "dbt-job-name", "namespace": "dbt" },
+          "run": { "runId": "{{ any(result) }}" }
+        },
+        "dbt_run": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://github.com/OpenLineage/OpenLineage/tree/main/integration/common/openlineage/schema/dbt-run-run-facet.json",
+          "invocation_id": "69c7b548-c6fd-4a70-87b8-9f111378149b"
+        }
+      },
+      "runId": "{{ any(result) }}"
+    }
+  },
+  {
+    "eventTime": "2023-04-16T21:37:18.384583Z",
+    "eventType": "COMPLETE",
+    "inputs": [
+      {
+        "facets": {
+          "dataSource": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-0-1/DatasourceDatasetFacet.json#/$defs/DatasourceDatasetFacet",
+            "name": "postgres://POSTGRES_HOST:1234",
+            "uri": "postgres://POSTGRES_HOST:1234"
+          },
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [{ "description": "The primary key for this table", "name": "id" }]
+          }
+        },
+        "name": "postgres.postgres.my_second_dbt_model",
+        "namespace": "postgres://POSTGRES_HOST:1234"
+      }
+    ],
+    "job": {
+      "facets": {
+        "sql": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-1-0/SQLJobFacet.json#/$defs/SQLJobFacet",
+          "query": "\n\n\n\nselect * from \"postgres\".\"postgres\".\"my_second_dbt_model\"\n",
+          "dialect": "postgres"
+        },
+        "jobType": {
+          "jobType": "SNAPSHOT",
+          "integration": "DBT",
+          "processingType": "BATCH"
+        }
+      },
+      "name": "postgres.postgres.snapshot_test.orders_snapshot.snapshot",
+      "namespace": "job-namespace"
+    },
+    "outputs": [
+      {
+        "facets": {
+          "dataSource": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-0-1/DatasourceDatasetFacet.json#/$defs/DatasourceDatasetFacet",
+            "name": "postgres://POSTGRES_HOST:1234",
+            "uri": "postgres://POSTGRES_HOST:1234"
+          },
+          "schema": {
+            "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet",
+            "fields": [{ "description": "Order id", "name": "id" }]
+          }
+        },
+        "name": "postgres.postgres.orders_snapshot",
+        "namespace": "postgres://POSTGRES_HOST:1234",
+        "outputFacets": {}
+      }
+    ],
+    "producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+    "run": {
+      "facets": {
+        "dbt_version": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://github.com/OpenLineage/OpenLineage/tree/main/integration/common/openlineage/schema/dbt-version-run-facet.json",
+          "version": "{{ any(result) }}"
+        },
+        "processing_engine": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-1-1/ProcessingEngineRunFacet.json#/$defs/ProcessingEngineRunFacet",
+          "name": "dbt",
+          "version": "{{ any(result) }}",
+          "openlineageAdapterVersion": "{{ any(result) }}"
+        },
+        "parent": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-2-0/ParentRunFacet.json#/$defs/ParentRunFacet",
+          "job": { "name": "dbt-job-name", "namespace": "dbt" },
+          "run": { "runId": "{{ any(result) }}" }
+        },
+        "dbt_run": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage/tree/0.0.1/integration/dbt",
+          "_schemaURL": "https://github.com/OpenLineage/OpenLineage/tree/main/integration/common/openlineage/schema/dbt-run-run-facet.json",
+          "invocation_id": "69c7b548-c6fd-4a70-87b8-9f111378149b"
+        }
+      },
+      "runId": "{{ any(result) }}"
+    }
+  }
+]

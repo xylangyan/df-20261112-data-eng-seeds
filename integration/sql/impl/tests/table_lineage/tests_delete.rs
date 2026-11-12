@@ -1,0 +1,132 @@
+// Copyright 2018-2026 contributors to the OpenLineage project
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::test_utils::*;
+use openlineage_sql::TableLineage;
+
+#[test]
+fn delete_from() {
+    assert_eq!(
+        test_sql("DELETE FROM a.b WHERE x = 0",)
+            .unwrap()
+            .table_lineage,
+        TableLineage {
+            in_tables: vec![],
+            out_tables: tables(vec!["a.b"])
+        }
+    );
+}
+
+#[test]
+fn delete_without_from_bigquery() {
+    assert_eq!(
+        test_sql_dialect("DELETE \"project.dataset.table\" WHERE 1", "bigquery")
+            .unwrap()
+            .table_lineage
+            .out_tables
+            .first()
+            .unwrap()
+            .qualified_name(),
+        "project.dataset.table"
+    )
+}
+
+#[test]
+fn delete_from_using() {
+    assert_eq!(
+        test_sql(
+            "DELETE FROM a.b AS t
+                USING (
+                    SELECT col
+                    FROM b.c
+                    WHERE col = 'x'
+                ) AS duplicates
+                WHERE a.b.col = duplicates.col",
+        )
+        .unwrap()
+        .table_lineage,
+        TableLineage {
+            in_tables: tables(vec!["b.c"]),
+            out_tables: tables(vec!["a.b"])
+        }
+    );
+}
+
+#[test]
+fn delete_mysql_multiple_tables() {
+    let test_cases = vec![
+        (
+            "DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id",
+            vec!["t2"],
+            vec!["t1"],
+        ),
+        (
+            "DELETE target FROM foo AS target JOIN bar AS lookup ON target.id = lookup.id",
+            vec!["bar"],
+            vec!["foo"],
+        ),
+        (
+            "DELETE t1, t2 FROM t1 JOIN t2 ON t1.id = t2.id JOIN lookup ON t1.id = lookup.id",
+            vec!["lookup"],
+            vec!["t1", "t2"],
+        ),
+    ];
+
+    for (sql, in_tables, out_tables) in test_cases {
+        assert_eq!(
+            test_sql_dialect(sql, "mysql").unwrap().table_lineage,
+            TableLineage {
+                in_tables: tables(in_tables),
+                out_tables: tables(out_tables),
+            },
+            "Failed for SQL: {sql}"
+        );
+    }
+}
+
+#[test]
+fn delete_mysql_preserves_previous_inputs() {
+    assert_eq!(
+        test_multiple_sql_dialect(
+            vec![
+                "SELECT * FROM t1",
+                "DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id",
+            ],
+            "mysql",
+        )
+        .unwrap()
+        .table_lineage,
+        TableLineage {
+            in_tables: tables(vec!["t1", "t2"]),
+            out_tables: tables(vec!["t1"]),
+        }
+    );
+}
+
+#[test]
+fn delete_identifier_function() {
+    let test_cases = vec![
+        ("target", vec![table("target")]),
+        ("'target'", vec![table("target")]),
+        ("$target", vec![]),
+        (":target", vec![]),
+        ("?", vec![]),
+        (":myschema || '.' || :mytab", vec![]),
+    ];
+
+    let dialects = vec!["snowflake", "databricks", "mssql"];
+
+    for (out_table_id, out_tables) in &test_cases {
+        for dialect in &dialects {
+            let sql = format!("DELETE FROM identifier({out_table_id}) WHERE x = 1;",);
+            assert_eq!(
+                test_sql_dialect(&sql, dialect).unwrap().table_lineage,
+                TableLineage {
+                    in_tables: vec![],
+                    out_tables: out_tables.clone(),
+                },
+                "Failed for dialect: {dialect} with SQL: {sql}"
+            );
+        }
+    }
+}

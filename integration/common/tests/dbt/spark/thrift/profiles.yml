@@ -1,0 +1,10 @@
+spark:
+    target: dev
+    outputs:
+        dev:
+            type: spark
+            method: thrift
+            # no database
+            schema: default
+            host: localhost
+            port: 10000

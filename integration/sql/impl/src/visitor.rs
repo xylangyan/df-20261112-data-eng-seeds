@@ -1,0 +1,1182 @@
+// Copyright 2018-2026 contributors to the OpenLineage project
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::context::Context;
+use crate::lineage::*;
+
+use anyhow::{anyhow, Result};
+use sqlparser::ast::{
+    AccessExpr, AlterTableOperation, CopyIntoSnowflakeKind, CreateTableLikeKind, Expr, FromTable,
+    Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Ident, Join,
+    JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query, RenameTableNameKind, Select,
+    SelectItem, SetExpr, Statement, Subscript, Table, TableFactor, TableFunctionArgs, TableObject,
+    UpdateTableFromKind, Use, Value, ValueWithSpan, WindowSpec, WindowType, With,
+};
+use sqlparser::dialect::{
+    DatabricksDialect, MsSqlDialect, MySqlDialect, SQLiteDialect, SnowflakeDialect,
+};
+
+pub trait Visit {
+    fn visit(&self, context: &mut Context) -> Result<()>;
+}
+
+impl Visit for With {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        let size = self.cte_tables.len();
+        // Snowflake, SQL Server and SQLite let any CTE refer to itself, with or
+        // without RECURSIVE.
+        let dialect = context.dialect().as_base();
+        let recursive = self.recursive
+            || dialect.is::<SnowflakeDialect>()
+            || dialect.is::<MsSqlDialect>()
+            || dialect.is::<SQLiteDialect>();
+        for i in 0..size {
+            context.add_table_alias(
+                DbTableMeta::new_default_dialect("".to_string()),
+                vec![self.cte_tables[i].alias.name.clone()],
+            );
+            context.push_frame();
+            self.cte_tables[i].query.visit(context)?;
+            let frame = context.pop_frame();
+            if let Some(f) = frame {
+                let table = DbTableMeta::new(
+                    vec![self.cte_tables[i].alias.name.clone()],
+                    context.dialect(),
+                    context.default_schema().clone(),
+                    context.default_database().clone(),
+                );
+                context.collect_with_table(f, table);
+            }
+
+            if i == 0 {
+                context
+                    .collect_lower_nested_dependencies(self.cte_tables[i].alias.name.clone().value);
+            }
+
+            context.adjust_cte_dependencies(self.cte_tables[i].alias.name.clone().value, recursive);
+        }
+        Ok(())
+    }
+}
+
+impl Visit for TableFactor {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        match self {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
+                // Check if table name is provided using IDENTIFIER function,
+                // use it if found and valid, otherwise keep the current name
+                let effective_name = match resolve_effective_table_name(name, args, context) {
+                    Some(table_name) => table_name,
+                    None => return Ok(()), // Exit if couldn't parse identifier function
+                };
+
+                let table = DbTableMeta::new(
+                    convert_to_idents(&effective_name),
+                    context.dialect(),
+                    context.default_schema().clone(),
+                    context.default_database().clone(),
+                );
+                if let Some(alias) = alias {
+                    context.add_table_alias(table, vec![alias.name.clone()]);
+                }
+
+                if !context.is_main() {
+                    context.add_table_dependency(convert_to_idents(&effective_name));
+                }
+
+                if context.is_main() && !context.has_alias(effective_name.to_string()) {
+                    context.add_input(convert_to_idents(&effective_name));
+                }
+
+                if context.is_main() && context.has_alias(effective_name.to_string()) {
+                    context.mark_table_as_used(effective_name.to_string());
+                }
+
+                Ok(())
+            }
+            TableFactor::Pivot { table, alias, .. } => {
+                table.visit(context)?;
+                if let Some(ident) = get_table_name_from_table_factor(table, &*context) {
+                    if let Some(pivot_alias) = alias {
+                        context.add_table_alias(
+                            DbTableMeta::new(
+                                ident.clone(),
+                                context.dialect(),
+                                context.default_schema().clone(),
+                                context.default_database().clone(),
+                            ),
+                            vec![pivot_alias.clone().name],
+                        );
+                    }
+                }
+                Ok(())
+            }
+            TableFactor::Derived {
+                lateral: _,
+                subquery,
+                alias,
+                sample: _,
+            } => {
+                context.push_frame();
+                subquery.visit(context)?;
+                let frame = context.pop_frame().unwrap();
+
+                if let Some(alias) = alias {
+                    let table = DbTableMeta::new(
+                        vec![alias.clone().name],
+                        context.dialect(),
+                        context.default_schema().clone(),
+                        context.default_database().clone(),
+                    );
+                    context.collect_with_table(frame, table);
+                } else {
+                    context.collect(frame);
+                }
+
+                Ok(())
+            }
+            TableFactor::TableFunction { .. } => {
+                // https://docs.snowflake.com/en/sql-reference/functions-table
+                // We can skip them as we don't support extracting lineage from functions
+                Ok(())
+            }
+            TableFactor::Function { .. } => {
+                // https://github.com/apache/datafusion-sqlparser-rs/pull/1026/files#r1373705587
+                // This variant provides distinct functionality from TableFunction but can be
+                // treated the same here
+                Ok(())
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                table_with_joins.relation.visit(context)?;
+                for join in &table_with_joins.joins {
+                    join.visit(context)?;
+                }
+                Ok(())
+            }
+            TableFactor::UNNEST { array_exprs, .. } => {
+                // https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#unnest_operator
+                // BigQuery's `UNNEST(...)` (e.g. UNNEST(GENERATE_ARRAY(1, 1000)) AS n) is a
+                // row generator over an array expression, not a real table - so UNNEST itself
+                // contributes no input. But the array expression can still reference real
+                // tables (e.g. UNNEST(ARRAY(SELECT id FROM source_table))), so visit each one
+                // rather than discarding them outright.
+                for array_expr in array_exprs {
+                    array_expr.visit(context)?;
+                }
+                Ok(())
+            }
+            TableFactor::Unpivot { table, alias, .. } => {
+                // https://cloud.google.com/bigquery/docs/reference/standard-sql/query-syntax#unpivot_operator
+                // Same bug class as UNNEST above and #1358: this variant had no arm and fell
+                // through to the catch-all Err. Mirrors the Pivot arm above - the real table
+                // lineage lives in the wrapped `table`.
+                table.visit(context)?;
+                if let Some(ident) = get_table_name_from_table_factor(table, &*context) {
+                    if let Some(unpivot_alias) = alias {
+                        context.add_table_alias(
+                            DbTableMeta::new(
+                                ident.clone(),
+                                context.dialect(),
+                                context.default_schema().clone(),
+                                context.default_database().clone(),
+                            ),
+                            vec![unpivot_alias.clone().name],
+                        );
+                    }
+                }
+                Ok(())
+            }
+            TableFactor::UnpivotExpr { expression, .. } => expression.visit(context),
+            _ => Err(anyhow!(
+                "TableFactor other than table or subquery not implemented: {self}"
+            )),
+        }
+    }
+}
+
+/// Process expression in case where we want to extract lineage (for eg. in subqueries)
+/// This means most enum types are untouched, where in other contexts they'd be processed.
+impl Visit for Expr {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        match self {
+            Expr::Subquery(query) => {
+                query.visit(context)?;
+            }
+            Expr::InSubquery {
+                expr: _,
+                subquery,
+                negated: _,
+            } => {
+                subquery.visit(context)?;
+            }
+            Expr::BinaryOp { left, op: _, right } => {
+                left.visit(context)?;
+                right.visit(context)?;
+            }
+            Expr::UnaryOp { op: _, expr } => {
+                expr.visit(context)?;
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(expr) = operand {
+                    expr.visit(context)?;
+                }
+
+                for case_when in conditions {
+                    case_when.condition.visit(context)?;
+                    case_when.result.visit(context)?;
+                }
+
+                if let Some(expr) = else_result {
+                    expr.visit(context)?;
+                }
+            }
+            Expr::Identifier(id) => {
+                let context_set = context.column_context().is_some();
+                if context_set {
+                    let descendant = context.column_context().as_ref().unwrap().name.clone();
+                    context.add_column_ancestors(
+                        ColumnMeta::new(descendant, None),
+                        vec![ColumnMeta::new(
+                            id.value.clone(),
+                            context.table_context().clone(),
+                        )],
+                    );
+                }
+            }
+            Expr::CompoundIdentifier(ids) => {
+                let context_set = context.column_context().is_some();
+                if context_set {
+                    let descendant = context.column_context().as_ref().unwrap().name.clone();
+                    let ancestor = ids.last().unwrap().value.clone();
+                    let table = DbTableMeta::new(
+                        ids.iter().take(ids.len() - 1).cloned().collect(),
+                        context.dialect(),
+                        context.default_schema().clone(),
+                        context.default_database().clone(),
+                    );
+                    context.add_column_ancestors(
+                        ColumnMeta::new(descendant, None),
+                        vec![ColumnMeta::new(ancestor, Some(table))],
+                    );
+                }
+            }
+            Expr::Function(func) => func.visit(context)?,
+            Expr::IsFalse(expr)
+            | Expr::IsNotFalse(expr)
+            | Expr::IsTrue(expr)
+            | Expr::IsNotTrue(expr)
+            | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr)
+            | Expr::IsUnknown(expr)
+            | Expr::IsNotUnknown(expr)
+            | Expr::IsJson { expr, .. } => {
+                expr.visit(context)?;
+            }
+            Expr::AnyOp {
+                left,
+                compare_op: _,
+                right,
+                ..
+            }
+            | Expr::AllOp {
+                left,
+                compare_op: _,
+                right,
+            } => {
+                left.visit(context)?;
+                right.visit(context)?;
+            }
+            Expr::InList { expr, list, .. } => {
+                expr.visit(context)?;
+                for e in list {
+                    e.visit(context)?;
+                }
+            }
+            Expr::Between {
+                expr,
+                negated: _,
+                low,
+                high,
+            } => {
+                expr.visit(context)?;
+                low.visit(context)?;
+                high.visit(context)?;
+            }
+            Expr::Like {
+                negated: _,
+                expr,
+                pattern,
+                escape_char,
+                ..
+            }
+            | Expr::ILike {
+                negated: _,
+                expr,
+                pattern,
+                escape_char,
+                ..
+            }
+            | Expr::SimilarTo {
+                negated: _,
+                expr,
+                pattern,
+                escape_char,
+                ..
+            } => {
+                expr.visit(context)?;
+                pattern.visit(context)?;
+                if let Some(escape) = escape_char {
+                    escape.visit(context)?;
+                }
+            }
+            Expr::Cast { expr, .. } => {
+                expr.visit(context)?;
+            }
+            Expr::AtTimeZone { timestamp, .. } => {
+                timestamp.visit(context)?;
+            }
+            Expr::Extract {
+                field: _,
+                syntax: _,
+                expr,
+            } => {
+                expr.visit(context)?;
+            }
+            Expr::Position { expr, r#in } => {
+                expr.visit(context)?;
+                r#in.visit(context)?;
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                expr.visit(context)?;
+                if let Some(e) = substring_from {
+                    e.visit(context)?;
+                }
+                if let Some(e) = substring_for {
+                    e.visit(context)?;
+                }
+            }
+            Expr::Trim {
+                expr,
+                trim_where: _,
+                trim_what,
+                ..
+            } => {
+                expr.visit(context)?;
+                if let Some(e) = trim_what {
+                    e.visit(context)?;
+                }
+            }
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                expr.visit(context)?;
+                overlay_what.visit(context)?;
+                overlay_from.visit(context)?;
+                if let Some(e) = overlay_for {
+                    e.visit(context)?;
+                }
+            }
+            Expr::Collate { expr, .. } => {
+                expr.visit(context)?;
+            }
+            Expr::Nested(expr) => {
+                expr.visit(context)?;
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                root.visit(context)?;
+                for access_expr in access_chain {
+                    match access_expr {
+                        AccessExpr::Dot(expr) => expr.visit(context)?,
+                        AccessExpr::Subscript(subscript) => match subscript {
+                            Subscript::Index { index } => index.visit(context)?,
+                            Subscript::Slice {
+                                lower_bound,
+                                upper_bound,
+                                stride,
+                            } => {
+                                if let Some(lower) = lower_bound {
+                                    lower.visit(context)?;
+                                }
+                                if let Some(upper) = upper_bound {
+                                    upper.visit(context)?;
+                                }
+                                if let Some(stride_expr) = stride {
+                                    stride_expr.visit(context)?;
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+            Expr::Exists { subquery, .. } => {
+                subquery.visit(context)?;
+            }
+            Expr::GroupingSets(list) | Expr::Cube(list) | Expr::Rollup(list) => {
+                for exprs in list {
+                    for expr in exprs {
+                        expr.visit(context)?;
+                    }
+                }
+            }
+            Expr::Tuple(exprs) => {
+                for expr in exprs {
+                    expr.visit(context)?;
+                }
+            }
+            Expr::Array(array) => {
+                for e in &array.elem {
+                    e.visit(context)?;
+                }
+            }
+            Expr::JsonAccess { value, path: _ } => {
+                value.visit(context)?;
+            }
+            Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+                left.visit(context)?;
+                right.visit(context)?;
+            }
+            Expr::InUnnest {
+                expr, array_expr, ..
+            } => {
+                expr.visit(context)?;
+                array_expr.visit(context)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl Visit for Function {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        match &self.args {
+            FunctionArguments::None => {}
+            FunctionArguments::Subquery(query) => query.visit(context)?,
+            FunctionArguments::List(arguments) => {
+                for arg in &arguments.args {
+                    arg.visit(context)?;
+                }
+                for clause in &arguments.clauses {
+                    if let FunctionArgumentClause::Where(predicate) = clause {
+                        predicate.visit(context)?;
+                    }
+                }
+            }
+        }
+        if let Some(filter) = &self.filter {
+            filter.visit(context)?;
+        }
+        if let Some(spec) = &self.over {
+            spec.visit(context)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Visit for FunctionArg {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        match self {
+            FunctionArg::Named {
+                name: _,
+                arg,
+                operator: _,
+            }
+            | FunctionArg::ExprNamed {
+                name: _,
+                arg,
+                operator: _,
+            } => arg.visit(context),
+            FunctionArg::Unnamed(arg) => arg.visit(context),
+        }
+    }
+}
+
+impl Visit for FunctionArgExpr {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        match self {
+            FunctionArgExpr::Expr(expr) => expr.visit(context),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Visit for WindowType {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        match self {
+            WindowType::WindowSpec(spec) => spec.visit(context),
+            WindowType::NamedWindow(..) => Ok(()),
+        }
+    }
+}
+impl Visit for WindowSpec {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        for expr in &self.partition_by {
+            expr.visit(context)?;
+        }
+
+        for order in &self.order_by {
+            order.expr.visit(context)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Visit for Join {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        self.relation.visit(context)?;
+
+        let constraint = match &self.join_operator {
+            JoinOperator::Join(constraint)
+            | JoinOperator::Inner(constraint)
+            | JoinOperator::Left(constraint)
+            | JoinOperator::LeftOuter(constraint)
+            | JoinOperator::Right(constraint)
+            | JoinOperator::RightOuter(constraint)
+            | JoinOperator::FullOuter(constraint)
+            | JoinOperator::CrossJoin(constraint)
+            | JoinOperator::Semi(constraint)
+            | JoinOperator::LeftSemi(constraint)
+            | JoinOperator::RightSemi(constraint)
+            | JoinOperator::Anti(constraint)
+            | JoinOperator::LeftAnti(constraint)
+            | JoinOperator::RightAnti(constraint)
+            | JoinOperator::StraightJoin(constraint) => constraint,
+            JoinOperator::AsOf {
+                match_condition,
+                constraint,
+            } => {
+                match_condition.visit(context)?;
+                constraint
+            }
+            JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::ArrayJoin
+            | JoinOperator::LeftArrayJoin
+            | JoinOperator::InnerArrayJoin => return Ok(()),
+        };
+
+        if let JoinConstraint::On(expr) = constraint {
+            expr.visit(context)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Visit for Select {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        // If we're selecting from a single table, that table becomes the default
+        if self.from.len() == 1 {
+            let t = self.from.first().unwrap();
+            if let TableFactor::Table { name, alias, .. } = &t.relation {
+                let table = DbTableMeta::new(
+                    convert_to_idents(name),
+                    context.dialect(),
+                    context.default_schema().clone(),
+                    context.default_database().clone(),
+                );
+                if let Some(alias) = alias {
+                    context.add_table_alias(table.clone(), vec![alias.clone().name]);
+                }
+                context.set_table_context(Some(table));
+            }
+        }
+
+        context.push_frame();
+
+        for table in &self.from {
+            context.push_frame();
+            table.relation.visit(context)?;
+            let frame = context.pop_frame().unwrap();
+            context.collect_aliases(&frame);
+            context.collect(frame);
+
+            for join in &table.joins {
+                context.push_frame();
+                join.visit(context)?;
+                let frame = context.pop_frame().unwrap();
+                context.collect_aliases(&frame);
+                context.collect(frame);
+            }
+        }
+
+        let tables_frame = context.pop_frame().unwrap();
+        context.collect_aliases(&tables_frame);
+
+        for projection in &self.projection {
+            match projection {
+                SelectItem::UnnamedExpr(expr) => {
+                    match expr {
+                        Expr::Identifier(id) => context
+                            .set_column_context(Some(ColumnMeta::new(id.value.clone(), None))),
+                        Expr::CompoundIdentifier(ids) => context.set_column_context(Some(
+                            ColumnMeta::new(ids.last().unwrap().value.clone(), None),
+                        )),
+                        _ => context.set_unnamed_column_context(),
+                    };
+                    expr.visit(context)?;
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    context.set_column_context(Some(ColumnMeta::new(alias.value.clone(), None)));
+                    expr.visit(context)?;
+                }
+                _ => {}
+            }
+        }
+
+        context.set_column_context(None);
+
+        if let Some(selection) = &self.selection {
+            context.push_frame();
+            selection.visit(context)?;
+            let frame = context.pop_frame().unwrap();
+            context.collect_aliases(&frame);
+        }
+
+        if let Some(having) = &self.having {
+            context.push_frame();
+            having.visit(context)?;
+            let frame = context.pop_frame().unwrap();
+            context.collect_aliases(&frame);
+        }
+
+        if let Some(qualify) = &self.qualify {
+            context.push_frame();
+            qualify.visit(context)?;
+            let frame = context.pop_frame().unwrap();
+            context.collect_aliases(&frame);
+        }
+
+        if let Some(into) = &self.into {
+            // MySQL SELECT INTO assigns variables rather than creating tables.
+            if !context.dialect().as_base().is::<MySqlDialect>() {
+                for target in &into.targets {
+                    match target {
+                        Expr::Identifier(ident)
+                            if ident.quote_style.is_none() && ident.value.starts_with('@') => {}
+                        Expr::Identifier(ident) => context.add_output(vec![ident.clone()]),
+                        Expr::CompoundIdentifier(idents) => context.add_output(idents.clone()),
+                        Expr::Value(ValueWithSpan {
+                            value: Value::Placeholder(_),
+                            ..
+                        }) => {}
+                        _ => return Err(anyhow!("SELECT INTO target not implemented: {target}")),
+                    }
+                }
+            }
+        }
+
+        context.set_table_context(None);
+
+        context.coalesce(tables_frame);
+
+        Ok(())
+    }
+}
+
+impl Visit for SetExpr {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        match self {
+            SetExpr::Select(select) => select.visit(context),
+            SetExpr::Values(values) => {
+                for row in &values.rows {
+                    for expression in row.iter() {
+                        expression.visit(context)?;
+                    }
+                }
+                Ok(())
+            }
+            SetExpr::Insert(stmt) => stmt.visit(context),
+            SetExpr::Query(q) => q.visit(context),
+            SetExpr::SetOperation {
+                op: _,
+                set_quantifier: _,
+                left,
+                right,
+            } => {
+                left.visit(context)?;
+                right.visit(context)
+            }
+            SetExpr::Table(table) => table.visit(context),
+            SetExpr::Update(stmt) => stmt.visit(context),
+            SetExpr::Delete(stmt) => stmt.visit(context),
+            SetExpr::Merge(stmt) => stmt.visit(context),
+        }
+    }
+}
+
+impl Visit for Query {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        if !self.pipe_operators.is_empty() {
+            return Err(anyhow!("SQL pipe operators are not supported"));
+        }
+
+        context.push_frame();
+        if self.with.is_some() {
+            context.unset_frame_to_main_body();
+        }
+
+        if let Some(with) = &self.with {
+            with.visit(context)?
+        }
+        let with_frame = context.pop_frame().unwrap();
+
+        context.collect_aliases(&with_frame);
+
+        context.push_frame();
+        if self.with.is_some() {
+            context.set_frame_to_main_body();
+        }
+
+        self.body.visit(context)?;
+
+        if self.with.is_some() {
+            context.unset_frame_to_main_body();
+        }
+
+        let frame = context.pop_frame().unwrap();
+        context.collect(frame);
+
+        // Resolve CTEs
+        context.coalesce(with_frame);
+
+        Ok(())
+    }
+}
+
+impl Visit for Statement {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        context.push_frame();
+        match self {
+            Statement::Query(query) => query.visit(context)?,
+            Statement::Insert(insert) => {
+                if let Some(src) = &insert.source {
+                    src.visit(context)?;
+                }
+                match &insert.table {
+                    TableObject::TableName(name) => {
+                        context.add_output(convert_to_idents(name));
+                    }
+                    TableObject::TableFunction(func) => {
+                        func.visit(context)?;
+                    }
+                    TableObject::TableQuery(_) => {}
+                }
+            }
+            Statement::Merge(merge) => {
+                if let Some(table_name) = get_table_name_from_table_factor(&merge.table, &*context)
+                {
+                    context.add_output(table_name);
+                }
+                merge.source.visit(context)?;
+                merge.on.visit(context)?;
+            }
+            Statement::CreateTable(ct) => {
+                if let Some(query) = &ct.query {
+                    query.visit(context)?;
+                }
+                if let Some(like_table) = &ct.like {
+                    match like_table {
+                        CreateTableLikeKind::Parenthesized(ctl)
+                        | CreateTableLikeKind::Plain(ctl) => {
+                            context.add_input(convert_to_idents(&ctl.name))
+                        }
+                    };
+                }
+                if let Some(clone) = &ct.clone {
+                    context.add_input(convert_to_idents(clone));
+                }
+
+                context.add_output(convert_to_idents(&ct.name));
+            }
+            Statement::CreateView(cv) => {
+                cv.query.visit(context)?;
+                context.add_output(convert_to_idents(&cv.name));
+            }
+            Statement::CreateStage {
+                name, stage_params, ..
+            } => {
+                if stage_params.url.as_ref().is_some() {
+                    context.add_non_table_input(
+                        vec![Ident::new(stage_params.url.as_ref().unwrap().to_string())],
+                        true,
+                        true,
+                    );
+                }
+                context.add_non_table_output(convert_to_idents(name), false, true);
+            }
+            Statement::Update(update) => {
+                if let Some(name) =
+                    get_table_name_from_table_factor(&update.table.relation, &*context)
+                {
+                    context.add_output(name);
+                }
+
+                for join in &update.table.joins {
+                    join.visit(context)?;
+                }
+
+                if let Some(from) = &update.from {
+                    match from {
+                        UpdateTableFromKind::BeforeSet(tables)
+                        | UpdateTableFromKind::AfterSet(tables) => {
+                            for table_with_joins in tables {
+                                table_with_joins.relation.visit(context)?;
+                                for join in &table_with_joins.joins {
+                                    join.visit(context)?;
+                                }
+                            }
+                        }
+                    }
+                }
+                for assignment in &update.assignments {
+                    assignment.value.visit(context)?;
+                }
+                if let Some(expr) = &update.selection {
+                    expr.visit(context)?;
+                }
+            }
+            Statement::AlterTable(alter) => {
+                for operation in &alter.operations {
+                    match operation {
+                        AlterTableOperation::SwapWith { table_name } => {
+                            // both table names are inputs and outputs of the swap operation
+                            context.add_input(convert_to_idents(table_name));
+                            context.add_input(convert_to_idents(&alter.name));
+
+                            context.add_output(convert_to_idents(table_name));
+                            context.add_output(convert_to_idents(&alter.name));
+                        }
+                        AlterTableOperation::RenameTable { table_name } => {
+                            context.add_input(convert_to_idents(&alter.name));
+                            match table_name {
+                                RenameTableNameKind::As(new_name)
+                                | RenameTableNameKind::To(new_name) => {
+                                    context.add_output(convert_to_idents(new_name))
+                                }
+                            };
+                        }
+                        _ => context.add_output(convert_to_idents(&alter.name)),
+                    }
+                }
+            }
+            Statement::Delete(delete) => {
+                let tables = match &delete.from {
+                    FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                        tables
+                    }
+                };
+
+                if delete.tables.is_empty() {
+                    for table in tables {
+                        if let Some(output) =
+                            get_table_name_from_table_factor(&table.relation, &*context)
+                        {
+                            context.add_output(output);
+                        }
+                        for join in &table.joins {
+                            if let Some(output) =
+                                get_table_name_from_table_factor(&join.relation, &*context)
+                            {
+                                context.add_output(output);
+                            }
+                        }
+                    }
+                } else {
+                    let existing_inputs = context.inputs.clone();
+                    for table in tables {
+                        table.relation.visit(context)?;
+                        for join in &table.joins {
+                            join.visit(context)?;
+                        }
+                    }
+                    for table in &delete.tables {
+                        context.move_input_to_output(convert_to_idents(table));
+                    }
+                    context.inputs.extend(existing_inputs);
+                }
+
+                if let Some(using) = &delete.using {
+                    for table in using {
+                        table.relation.visit(context)?;
+                        for join in &table.joins {
+                            join.visit(context)?;
+                        }
+                    }
+                }
+
+                if let Some(expr) = &delete.selection {
+                    expr.visit(context)?;
+                }
+            }
+            Statement::Truncate(truncate) => {
+                for table in &truncate.table_names {
+                    context.add_output(convert_to_idents(&table.name))
+                }
+            }
+            Statement::Drop { names, .. } => {
+                for name in names {
+                    context.add_output(convert_to_idents(name))
+                }
+            }
+            Statement::CopyIntoSnowflake {
+                kind,
+                into,
+                from_obj,
+                from_query,
+                ..
+            } => match kind {
+                CopyIntoSnowflakeKind::Table => {
+                    context.add_output(convert_to_idents(into));
+                    if let Some(from_object) = from_obj {
+                        context.add_non_table_input(
+                            convert_copy_location_to_idents(from_object),
+                            true,
+                            true,
+                        );
+                    }
+                }
+                CopyIntoSnowflakeKind::Location => {
+                    context.add_non_table_output(convert_copy_location_to_idents(into), true, true);
+                    if let Some(from_object) = from_obj {
+                        context.add_input(convert_to_idents(from_object));
+                    }
+                    if let Some(query) = from_query {
+                        query.visit(context)?;
+                    }
+                }
+            },
+            Statement::Use(use_enum) => {
+                // We expect either one id (USE [...] foo;) or two ids (USE [...] foo.bar;)
+                let (first_id, second_id) = match use_enum {
+                    Use::Catalog(object_name)
+                    | Use::Schema(object_name)
+                    | Use::Database(object_name)
+                    | Use::Object(object_name) => extract_up_to_two_ident_values(object_name),
+                    _ => return Ok(()),
+                };
+
+                if first_id.is_none() && second_id.is_none() {
+                    return Ok(()); // Should never happen
+                }
+
+                // Two ids are present, set db and schema
+                if first_id.is_some() && second_id.is_some() {
+                    context.set_default_database(first_id.clone());
+                    context.set_default_schema(second_id.clone());
+                    return Ok(());
+                }
+
+                // One id is present, each dialect can work differently
+                match use_enum {
+                    Use::Catalog(_) => {
+                        context.set_default_database(first_id); // Databricks specific
+                    }
+                    Use::Schema(_) => {
+                        context.set_default_schema(first_id.clone()); // Snowflake specific
+                    }
+                    Use::Database(_) => {
+                        if context.dialect().as_base().is::<DatabricksDialect>() {
+                            // Databricks treats DATABASE as alias for SCHEMA
+                            context.set_default_schema(first_id);
+                        } else {
+                            context.set_default_database(first_id); // Snowflake specific
+                        }
+                    }
+                    Use::Object(_) => {
+                        if context.dialect().as_base().is::<DatabricksDialect>() {
+                            // Databricks treats single id with no keyword as SCHEMA
+                            context.set_default_schema(first_id);
+                        } else {
+                            context.set_default_database(first_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        let frame = context.pop_frame().unwrap();
+        let cte_deps = frame.cte_dependencies.clone();
+        let deps = frame.dependencies.clone();
+        context.collect_inputs(cte_deps, deps);
+        context.collect(frame);
+
+        Ok(())
+    }
+}
+
+impl Visit for Table {
+    fn visit(&self, context: &mut Context) -> Result<()> {
+        if let Some(name) = &self.table_name {
+            context.add_input(vec![Ident::new(name.to_string())])
+        }
+        Ok(())
+    }
+}
+
+// --- Utils ---
+
+fn get_table_name_from_table_factor(table: &TableFactor, context: &Context) -> Option<Vec<Ident>> {
+    if let TableFactor::Table { name, args, .. } = table {
+        resolve_effective_table_name(name, args, context)
+            .map(|table_name| convert_to_idents(&table_name))
+    } else {
+        None
+    }
+}
+
+fn resolve_effective_table_name(
+    name: &ObjectName,
+    args: &Option<TableFunctionArgs>,
+    context: &Context,
+) -> Option<ObjectName> {
+    if context.dialect().as_base().is::<DatabricksDialect>()
+        || context.dialect().as_base().is::<MsSqlDialect>()
+    {
+        let is_identifier_function = name
+            .0
+            .first()
+            .map(|part| match part {
+                ObjectNamePart::Function(_) => false,
+                ObjectNamePart::Identifier(ident) => ident.value.to_lowercase() == "identifier",
+            })
+            .unwrap_or(false);
+
+        if !is_identifier_function {
+            return Some(name.clone());
+        }
+        let args = args.as_ref()?; // Return None if there are no args
+        if args.args.len() != 1 {
+            return None; // Return None if the length is not 1, we do not support it yet
+        }
+        get_table_name_from_identifier_function_args(&args.args)
+    } else if context.dialect().as_base().is::<SnowflakeDialect>() {
+        name.0.first().and_then(|part| match part {
+            ObjectNamePart::Function(f) => {
+                if f.name.value.to_lowercase() == "identifier" {
+                    get_table_name_from_identifier_function_args(&f.args)
+                } else {
+                    Some(name.clone())
+                }
+            }
+            ObjectNamePart::Identifier(_) => Some(name.clone()),
+        })
+    } else {
+        Some(name.clone())
+    }
+}
+
+fn get_table_name_from_identifier_function_args(args: &[FunctionArg]) -> Option<ObjectName> {
+    let arg = args.first()?; // Return None if empty
+
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => match expr {
+            Expr::Identifier(ident) => Some(ObjectName::from(vec![ident.clone()])),
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(ident),
+                span: _,
+            }) => Some(ObjectName::from(vec![Ident::new(ident.to_string())])),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn convert_copy_location_to_idents(object_name: &ObjectName) -> Vec<Ident> {
+    let location = object_name.to_string();
+    if location.contains("gcs://") || location.contains("s3://") || location.contains("azure://") {
+        vec![Ident::new(location.replace(['\"', '\''], ""))]
+    } else {
+        convert_to_idents(object_name)
+    }
+}
+
+fn convert_to_idents(object_name: &ObjectName) -> Vec<Ident> {
+    object_name
+        .0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => ident.clone(),
+            ObjectNamePart::Function(f) => f.name.clone(),
+        })
+        .collect()
+}
+
+pub fn extract_up_to_two_ident_values(
+    object_name: &ObjectName,
+) -> (Option<String>, Option<String>) {
+    let idents = convert_to_idents(object_name);
+    let mut idents_iter = idents.iter();
+
+    let first_value = idents_iter.next().map(|ident| ident.value.clone());
+    let second_value = idents_iter.next().map(|ident| ident.value.clone());
+
+    (first_value, second_value)
+}
+
+#[test]
+fn test_extract_up_to_two_ident_values_one_ident() {
+    let object_name = ObjectName::from(vec![Ident::new("first")]);
+    assert_eq!(
+        extract_up_to_two_ident_values(&object_name),
+        (Some("first".to_string()), None)
+    );
+}
+
+#[test]
+fn test_extract_up_to_two_ident_values_one_ident_with_quotes() {
+    let object_name = ObjectName::from(vec![Ident::with_quote('`', "first")]);
+    assert_eq!(
+        extract_up_to_two_ident_values(&object_name),
+        (Some("first".to_string()), None)
+    );
+}
+
+#[test]
+fn test_extract_up_to_two_ident_values_two_idents() {
+    let object_name = ObjectName::from(vec![Ident::new("first"), Ident::with_quote('`', "second")]);
+    assert_eq!(
+        extract_up_to_two_ident_values(&object_name),
+        (Some("first".to_string()), Some("second".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_up_to_two_ident_values_three_idents() {
+    let object_name = ObjectName::from(vec![
+        Ident::new("first"),
+        Ident::with_quote('`', "second"),
+        Ident::new("third"),
+    ]);
+    assert_eq!(
+        extract_up_to_two_ident_values(&object_name),
+        (Some("first".to_string()), Some("second".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_up_to_two_ident_values_empty_idents() {
+    let object_name = ObjectName(vec![]);
+    assert_eq!(extract_up_to_two_ident_values(&object_name), (None, None));
+}

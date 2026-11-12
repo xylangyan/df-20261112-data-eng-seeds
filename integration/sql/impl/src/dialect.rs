@@ -1,0 +1,58 @@
+// Copyright 2018-2026 contributors to the OpenLineage project
+// SPDX-License-Identifier: Apache-2.0
+
+use sqlparser::dialect::{
+    AnsiDialect, BigQueryDialect, DatabricksDialect, Dialect, GenericDialect, HiveDialect,
+    MsSqlDialect, MySqlDialect, PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect,
+    SnowflakeDialect,
+};
+
+pub trait CanonicalDialect: Dialect {
+    fn canonical_name<'b>(&self, name: &'b str) -> Option<&'b str>;
+    fn as_base(&self) -> &dyn Dialect;
+}
+
+impl<T: Dialect> CanonicalDialect for T {
+    fn canonical_name<'b>(&self, name: &'b str) -> Option<&'b str> {
+        name.chars().next().map(|x| {
+            if self.is_delimited_identifier_start(x) {
+                let mut chars = name.chars();
+                chars.next();
+                chars.next_back();
+                chars.as_str()
+            } else {
+                name
+            }
+        })
+    }
+    fn as_base(&self) -> &dyn Dialect {
+        self
+    }
+}
+
+pub fn get_dialect(name: &str) -> &'static dyn CanonicalDialect {
+    match name {
+        "bigquery" => &BigQueryDialect,
+        "databricks" => &DatabricksDialect,
+        "snowflake" => &SnowflakeDialect,
+        "postgres" => &PostgreSqlDialect {},
+        "postgresql" => &PostgreSqlDialect {},
+        "redshift" => &RedshiftSqlDialect {},
+        "hive" => &HiveDialect {},
+        "mysql" => &MySqlDialect {},
+        "mssql" => &MsSqlDialect {},
+        "sqlserver" => &MsSqlDialect {},
+        "sqlite" => &SQLiteDialect {},
+        "ansi" => &AnsiDialect {},
+        "generic" => &GenericDialect,
+        _ => &GenericDialect,
+    }
+}
+
+pub fn get_generic_dialect(name: Option<String>) -> &'static dyn CanonicalDialect {
+    if let Some(d) = name {
+        get_dialect(d.as_str())
+    } else {
+        &GenericDialect
+    }
+}

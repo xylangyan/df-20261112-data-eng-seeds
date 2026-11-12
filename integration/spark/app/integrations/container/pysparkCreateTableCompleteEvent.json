@@ -1,0 +1,44 @@
+{
+  "eventType": "COMPLETE",
+  "job": {
+    "namespace": "testCreateTable",
+    "name": "${json-unit.regex}open_lineage_integration_create_table.*create_table_test"
+  },
+  "inputs": [],
+  "outputs": [
+    {
+      "namespace": "file",
+      "name": "/tmp/create_test/create_table_test",
+      "facets": {
+        "dataSource": {
+          "name": "file",
+          "uri": "file"
+        },
+        "schema": {
+          "fields": [
+            {
+              "name": "a",
+              "type": "string"
+            },
+            {
+              "name": "b",
+              "type": "string"
+            }
+          ]
+        },
+        "lifecycleStateChange": {
+          "lifecycleStateChange": "CREATE"
+        },
+        "symlinks": {
+          "identifiers": [
+            {
+              "namespace": "file:/tmp/create_test",
+              "name": "default.create_table_test",
+              "type": "TABLE"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

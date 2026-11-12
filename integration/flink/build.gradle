@@ -1,0 +1,282 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+import org.apache.tools.ant.filters.ReplaceTokens
+
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'pmd'
+    id 'signing'
+    id 'jacoco'
+    id "com.adarshr.test-logger"
+    id 'com.diffplug.spotless'
+    id 'com.github.johnrengelman.shadow'
+    id 'io.franzbecker.gradle-lombok'
+    id 'io.openlineage.common-config'
+    id 'io.github.gradle-nexus.publish-plugin' version '2.0.0'
+}
+
+group = "io.openlineage"
+
+archivesBaseName='openlineage-flink'
+
+ext {
+    flinkVersion = project.getProperty('flink.version')
+    flinkVersionShort = flinkVersion.substring(0,4)
+    isReleaseVersion = !version.endsWith('-SNAPSHOT')
+}
+
+dependencies {
+    implementation(project(path: ":shared"))
+    implementation(project(path: ":flink1"))
+    implementation(project(path: ":flink2"))
+    implementation(project(path: ":flink115"))
+    implementation(project(path: ":flink117"))
+    implementation(project(path: ":flink118"))
+}
+
+task sourceJar(type: Jar) {
+    archiveClassifier = 'sources'
+    from sourceSets.main.allJava
+}
+
+task javadocJar(type: Jar, dependsOn: javadoc) {
+    archiveClassifier = 'javadoc'
+    from javadoc.destinationDir
+}
+
+def commonTestConfiguration = {
+    classpath =  project.sourceSets.test.runtimeClasspath
+}
+
+test {
+    configure commonTestConfiguration
+    useJUnitPlatform {
+        excludeTags 'integration-test'
+    }
+}
+
+task shadowTestApps(type: Exec) {
+    if (project.getProperty('flink.version').toString().startsWith("1")) {
+        workingDir 'examples/flink1-test-apps'
+        commandLine 'bash', '-c', "pwd && ./gradlew clean shadowJar -Pflink.version=${flinkVersion} && mkdir -p ../../fixtures && ls -halt build/libs && cp build/libs/flink-examples-stateful-*.jar ../../fixtures && ls -la ../../fixtures"
+        doLast {
+            println "Copied stateful-*.jar to fixtures directory"
+        }
+    } else {
+        workingDir 'examples/flink2-test-apps'
+        commandLine 'bash', '-c', "pwd && ./gradlew clean shadowJar -Pflink.version=${flinkVersion} && mkdir -p ../../fixtures && ls -halt build/libs && cp build/libs/flink2-*.jar ../../fixtures && ls -la ../../fixtures"
+        doLast {
+            println "Copied flink2-*.jar to fixtures directory"
+        }
+    }
+}
+
+def integrationTestConfiguration = {
+    forkEvery 1
+    maxParallelForks 1
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = true
+    }
+    systemProperties = [
+            'flink.version': "${flinkVersion}",
+            'junit.platform.output.capture.stdout': 'true',
+            'junit.platform.output.capture.stderr': 'true',
+            '.flink.jar': "${archivesBaseName}-${project.version}.jar",
+    ]
+    classpath =  project.sourceSets.test.runtimeClasspath
+}
+
+
+task integrationTest(type: Test) {
+    configure integrationTestConfiguration
+    useJUnitPlatform {
+        includeTags "integration-test"
+    }
+}
+
+integrationTest.dependsOn(shadowJar, project.tasks.publishToMavenLocal, shadowTestApps)
+
+def reportsDir = "${buildDir}/reports"
+def coverageDir = "${reportsDir}/coverage"
+
+jacoco {
+    toolVersion = '0.8.12'
+    reportsDir = file(coverageDir)
+}
+
+jacocoTestReport {
+    reports {
+        xml {
+            enabled true
+        }
+        html {
+            enabled true
+            destination = file(coverageDir)
+        }
+    }
+}
+
+def validateReleaseVersionProperty = tasks.register("validateReleaseVersionProperty") {
+    group = "verification"
+    description = "Check if the isReleaseVersion property exists and is a boolean"
+    doLast {
+        if (project.hasProperty("isReleaseVersion")) {
+            if (project.property("isReleaseVersion") instanceof Boolean) {
+                logger.lifecycle("isReleaseVersion property exists and is a boolean")
+            } else {
+                throw new GradleException("isReleaseVersion property exists but is not a boolean")
+            }
+        } else {
+            throw new GradleException("isReleaseVersion property does not exist")
+        }
+    }
+}
+
+tasks.named("build").configure {
+    dependsOn(validateReleaseVersionProperty)
+}
+
+tasks.withType(GenerateModuleMetadata.class).configureEach {
+    enabled = false
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            groupId = 'io.openlineage'
+            artifactId = 'openlineage-flink'
+
+            from components.java
+
+            artifact sourceJar
+            artifact javadocJar
+
+            pom {
+                name = 'openlineage-flink'
+                description = 'OpenLineage integration with Flink'
+                url = 'https://github.com/OpenLineage/OpenLineage'
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'openlineage'
+                        name = 'OpenLineage Project'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:git://github.com/OpenLineage/OpenLineage.git'
+                    developerConnection = 'scm:git:ssh://github.com:OpenLineage/OpenLineage.git'
+                    url = 'https://github.com/OpenLineage/OpenLineage'
+                }
+                withXml {
+                    Node pomNode = asNode()
+                    pomNode.remove(pomNode.get("dependencies"))
+                }
+            }
+        }
+    }
+
+    processResources {
+        filter ReplaceTokens, tokens: [
+                "version": project.property("version")
+        ]
+    }
+}
+
+nexusPublishing {
+    repositories {
+        sonatype {
+            nexusUrl.set(uri("https://ossrh-staging-api.central.sonatype.com/service/local/"))
+            snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
+            username = System.getenv('RELEASE_USERNAME')
+            password = System.getenv('RELEASE_PASSWORD')
+        }
+    }
+}
+
+signing {
+    required { isReleaseVersion }
+    def signingKey = findProperty("signingKey")
+    def signingPassword = findProperty("signingPassword")
+    useInMemoryPgpKeys(signingKey, signingPassword)
+    sign publishing.publications.mavenJava
+}
+
+shadowJar {
+    minimize() {
+        exclude(project(path: ":shared"))
+        exclude(project(path: ":flink1"))
+        exclude(project(path: ":flink2"))
+        exclude(project(path: ":flink115"))
+        exclude(project(path: ":flink117"))
+        exclude(project(path: ":flink118"))
+    }
+    archiveClassifier = ''
+    // avoid conflict with any client version of that lib
+    relocate 'com.fasterxml.jackson', 'io.openlineage.flink.shaded.com.fasterxml.jackson'
+    relocate 'com.github.ok2c.hc5', 'io.openlineage.flink.shaded.com.github.ok2c.hc5'
+    relocate 'org.apache.httpcomponents.client5', 'io.openlineage.flink.shaded.org.apache.httpcomponents.client5'
+    relocate 'javassist', 'io.openlineage.flink.shaded.javassist'
+    relocate 'org.yaml', 'io.openlineage.flink.shaded.org.yaml'
+    relocate 'org.apache.hc', 'io.openlineage.flink.shaded.org.apache.hc'
+    relocate 'org.apache.commons.codec', 'io.openlineage.flink.shaded.org.apache.commons.codec'
+    relocate 'org.apache.commons.lang3', 'io.openlineage.flink.shaded.org.apache.commons.lang3'
+    relocate "org.HdrHistogram", "io.openlineage.flink.shaded.org.hdrhistogram"
+    relocate "org.LatencyUtils", "io.openlineage.flink.shaded.org.latencyutils"
+    // jackson-core 2.18+ ships FastDoubleParser as Java 21/22 multi-release classes that the
+    // shadow plugin's ASM cannot relocate; the Java 8 base classes remain and are fully functional.
+    exclude 'META-INF/versions/21/**'
+    exclude 'META-INF/versions/22/**'
+    dependencies {
+        exclude(dependency('org.slf4j::'))
+    }
+
+    archiveClassifier = ''
+    exclude 'org/apache/commons/logging/**'
+
+    manifest {
+        attributes(
+                "Premain-Class": 'io.openlineage.flink.OpenLineageFlinkJobListener',
+                "Agent-Class": 'io.openlineage.flink.OpenLineageFlinkJobListener',
+                'Created-By': "Gradle ${gradle.gradleVersion}",
+                'Built-By': System.getProperty('user.name'),
+                'Build-Jdk': System.getProperty('java.version'),
+                'Implementation-Title': project.name,
+                'Implementation-Version': project.version
+        )
+    }
+    zip64 true
+}
+
+assemble {
+    dependsOn shadowJar
+}
+
+spotlessJava {
+    dependsOn("compileJava", "compileTestJava")
+}
+
+task createVersionProperties(dependsOn: processResources) {
+    doLast {
+        File dir = new File("$buildDir/resources/main/io/openlineage/flink/client/")
+        dir.mkdirs()
+        new File("$buildDir/resources/main/io/openlineage/flink/client/version.properties").withWriter { w ->
+            Properties p = new Properties()
+            p['version'] = project.version.toString()
+            p.store w, null
+        }
+    }
+}
+
+classes {
+    dependsOn createVersionProperties
+}

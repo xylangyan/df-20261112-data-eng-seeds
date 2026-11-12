@@ -1,0 +1,46 @@
+{
+  "eventType": "START",
+  "job": {
+    "namespace": "generic-namespace",
+    "facets": {
+      "tags": {
+        "tags": [
+          {
+            "key": "spark",
+            "value": "true",
+            "source": "CONFIG"
+          },
+          {
+            "key": "key",
+            "value": "value",
+            "source": "CONFIG"
+          }
+        ]
+      }
+    }
+  },
+  "run": {
+    "facets": {
+      "parent": {
+        "job": {
+          "name": "generic_integration_test",
+          "namespace": "generic-namespace"
+        }
+      },
+      "tags": {
+        "tags": [
+          {
+            "key": "run",
+            "value": "true",
+            "source": "CONFIG"
+          },
+          {
+            "key": "set",
+            "value": "up",
+            "source": "SERVICE"
+          }
+        ]
+      }
+    }
+  }
+}

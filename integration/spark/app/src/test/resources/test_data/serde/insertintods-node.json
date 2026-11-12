@@ -1,0 +1,37 @@
+{
+  "logicalRelation":{
+    "relation":{
+      "tableName": "dataset.test",
+      "tableId": {
+          "dataset":"dataset",
+          "table":"test"
+      }
+    },
+    "output":[
+      {
+        "dataType":{},
+        "nullable":false,
+        "qualifier":[],
+        "deterministic":true,
+        "resolved":true
+      }
+    ],
+    "isStreaming":false,
+    "schema":[
+      {
+        "name":"name",
+        "nullable":false
+      }
+    ],
+    "resolved":true,
+    "attributeMap":{},
+    "traceEnabled":false,
+    "canonicalizedPlan":false
+  },
+  "overwrite":false,
+  "resolved":true,
+  "metrics":{},
+  "streaming":false,
+  "traceEnabled":false,
+  "canonicalizedPlan":false
+}

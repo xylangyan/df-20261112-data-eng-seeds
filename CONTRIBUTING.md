@@ -1,0 +1,121 @@
+# Contributing to OpenLineage
+
+This project welcomes contributors from any organization or background, provided they are
+willing to follow the simple processes outlined below, as well as adhere to the 
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Joining the community
+
+The community collaborates primarily through  `GitHub` and the instance messaging tool, `Slack`.
+There is also a mailing list.
+See how to join [here](https://github.com/OpenLineage/OpenLineage#community)
+
+## Reporting an Issue
+
+Please use the [issues][issues] section of the OpenLineage repository and search for a similar problem. If you don't find it, submit your bug, question, proposal or feature request.
+
+Use tags to indicate parts of the OpenLineage that your issue relates to.
+For example, in the case of bugs, please provide steps to reproduce it and tag your issue with `bug` and integration that has that bug, for example `integration/spark`.
+
+
+## Contributing to the project
+
+### Creating Pull Requests
+Before sending a Pull Request with significant changes, please use the [issue tracker][issues] to discuss the potential improvements you want to make.
+
+OpenLineage uses [GitHub's fork and pull model](https://help.github.com/articles/about-collaborative-development-models/)
+to create a contribution.
+
+Make sure to [sign-off](https://github.com/OpenLineage/OpenLineage/blob/main/why-the-dco.md) your work to say that the contributor has the rights to make the contribution and
+agrees with the [Developer Certificate of Origin (DCO)](why-the-dco.md).
+
+To ensure your pull request is accepted, follow these guidelines:
+
+* All changes should be accompanied by tests
+* Relevant documentation should be updated.
+* Do your best to have a [well-formed commit message](https://tbaggery.com/2008/04/19/a-note-about-git-commit-messages.html) for your change
+* Do your best to have a [well-formed pull request description](https://frontside.com/blog/2020-04-15-7-reasons-for-good-pull-request-descriptions) for your change
+* [Keep diffs small](https://kurtisnusbaum.medium.com/stacked-diffs-keeping-phabricator-diffs-small-d9964f4dcfa6) and self-contained
+* If your change relates to an issue, please [link it](https://help.github.com/articles/closing-issues-using-keywords) in your pull request description
+* Your pull request title should be of the form `component: name`, where `component` is the part of openlineage repo that your PR changes. For example: `flink: add Iceberg source visitor`
+* Review tags added by a bot after PR creation, they should indicate parts of the repository that your PR refers to
+* Changes to the core OpenLineage model or facets require prior discussion and must be versioned according to [SchemaVer](https://docs.snowplowanalytics.com/docs/pipeline-components-and-applications/iglu/common-architecture/schemaver)
+* License [header](https://github.com/OpenLineage/OpenLineage/tree/main/.github/header_templates.md) must be present in all files.
+
+### Branching
+
+* Choose _short_ and _descriptive_ branch names
+* Use dashes (`-`) to separate _words_ in branch names
+* Use _lowercase_ in branch names
+
+## Proposing changes
+
+Create an issue and tag it as `proposal`.
+
+In the description provide the following sections:
+ - Purpose (Why?): What is the use case this is for. 
+ - Proposed implementation (How?): Quick description of how do you propose to implement it. Are you proposing a new facet?
+
+This can be just a couple paragraphs to start with.
+
+Proposals that change OpenLineage specifications should be tagged as `spec`.
+Small changes to the spec, like adding a facet, only require opening an issue describing the new facet.
+Larger changes to the spec, changes to the core spec or new integrations require a longer form proposal following [this process](https://github.com/OpenLineage/OpenLineage/blob/main/proposals/336/PROPOSALS.md)
+
+## New Integrations
+New integrations should be added under the [./integrations](/integrations) folder. Each module
+should have its own build configuration (e.g., `build.gradle` for a Gradle project, `setup.py` for 
+python, etc.) with appropriate unit tests and integration tests (when possible).
+
+Adding a new integration requires updating the CI build configuration with a new workflow. Job
+definitions, orbs, parameters, etc. should be added to the
+[.circleci/continue_config.yml](`continue_config.yml`) file. Workflow definition files are added to
+the [.circleci/workflows](.circleci/workflows) directory. Each workflow file adheres to the CircleCI
+config.yml schema, including only the workflows subschema (see
+[https://circleci.com/docs/2.0/configuration-reference/#workflows](the CircleCI docs) for the schema
+specification). Each workflow must include a `workflow_complete` job that `requires` each terminal
+required step in the workflow (e.g., you might depend on `run-feature-integration-tests` as the
+final step in the workflow). Job names must be unique across all workflows, as ultimately the
+workflows are merged into a single config file. See existing workflows for examples.
+
+## First-Time Contributors
+
+If this is your first contribution to open source, you can [follow this tutorial][contributiontutorial] or check out [this video series][contributionvideos] to learn about the contribution workflow with GitHub.
+
+Look for tickets labeled ['good first issue'][goodfirstissues] and ['help wanted'][helpwantedissues]. These are a great starting point if you want to contribute. Don't hesitate to ask questions about the issue if you are not sure about the strategy to follow.
+
+
+[issues]: https://github.com/OpenLineage/OpenLineage/issues
+[contributiontutorial]: https://github.com/firstcontributions/first-contributions#first-contributions
+[contributionvideos]: https://egghead.io/courses/how-to-contribute-to-an-open-source-project-on-github
+[goodfirstissues]: https://github.com/OpenLineage/OpenLineage/labels/good%20first%20issue
+[helpwantedissues]: https://github.com/OpenLineage/OpenLineage/labels/help%20wanted
+
+## Running pre-commit hooks
+
+Before submitting your pull request, make sure to set up and run pre-commit hooks to ensure code quality and consistency. [Pre-commit](pre-commit.com) hooks are automated checks that run before each commit is made. These checks include code formatting, linting and JSON Schema specification validations. To set up the pre-commit hooks for this project, follow these steps:
+
+* Install prek: If you haven't already, install prek on your local machine by running `pip install prek` (or check [installation instructions](https://github.com/j178/prek?tab=readme-ov-file#installation) for your environment).
+
+* Set up hooks: Once prek is installed, navigate to the project's root directory and execute `prek install`. This command will set up the necessary hooks in your local repository.
+
+* Run prek: Now, every time you attempt to make a commit, the prek hooks will automatically run on the staged files. If any issues are detected, the commit process will be halted, allowing you to address the problems before making the commit. Some of the hooks might be configured to fix the issues automatically, in which case you just need to review the applied changes and commit. You can also run `prek run --all-files` to manually trigger the hooks for all files in the repository.
+
+## License header
+
+If contributing changes, additions or fixes, please include an [appropriate header](.github/header_templates.md) in any new files, e.g. for Java files:
+
+```
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0 
+*/
+```
+
+## Development
+
+To set up your local environment and start developing, check the [Development documentation](https://openlineage.io/docs/development/developing/).
+
+----
+SPDX-License-Identifier: Apache-2.0\
+Copyright 2018-2026 contributors to the OpenLineage project

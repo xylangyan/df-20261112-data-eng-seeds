@@ -1,0 +1,654 @@
+# Copyright 2018-2026 contributors to the OpenLineage project
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import base64
+import gzip
+import http.client as http_client
+import inspect
+import json
+import logging
+import threading
+import time
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote_plus, urljoin
+
+import attr
+import requests
+import urllib3.util
+from openlineage.client.serde import Serde
+from openlineage.client.transport.http_common import DEFAULT_RETRY_CONFIG
+from openlineage.client.transport.transport import Config, Transport
+from openlineage.client.utils import (
+    config_value_to_str,
+    config_values_to_str,
+    first_config_value,
+    get_only_specified_fields,
+    import_from_string,
+)
+from requests import Session
+from requests.adapters import HTTPAdapter
+
+if TYPE_CHECKING:
+    from openlineage.client.client import Event, OpenLineageClientOptions
+    from requests import Response
+
+
+log = logging.getLogger(__name__)
+
+
+class TokenProvider:
+    def __init__(self, config: dict[str, str]) -> None: ...
+
+    def get_bearer(self) -> str | None:
+        return None
+
+
+class HttpCompression(Enum):
+    GZIP = "gzip"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class ApiKeyTokenProvider(TokenProvider):
+    def __init__(self, config: dict[str, str]) -> None:
+        super().__init__(config)
+        api_key = first_config_value(config, "apiKey", "apikey", "api_key")
+        if api_key is None:
+            msg = "apiKey is required for HTTP Transport when auth type is `api_key`."
+            raise KeyError(msg)
+        self.api_key = config_value_to_str(api_key)
+
+    def get_bearer(self) -> str | None:
+        return f"Bearer {self.api_key}"
+
+
+class TokenEndpointTokenProvider(TokenProvider):
+    """Base class for TokenProviders that obtain a short-lived bearer token from a token endpoint.
+
+    The token is cached and fetched again ``tokenRefreshBuffer`` seconds before it expires. Subclasses
+    provide the token request form data via ``_get_token_request_data`` and, optionally, an Authorization
+    header via ``_get_token_request_authorization``.
+
+    Common configuration options:
+        {
+            "tokenEndpoint": "https://auth.example.com/token",
+            "tokenFields": ["access_token"],  # optional, JSON fields to search for the token, in order
+            "expiresInField": "expires_in",  # optional
+            "tokenRefreshBuffer": 120  # optional, defaults to 120 seconds
+        }
+    """
+
+    TOKEN_NAME = "token"
+    DEFAULT_TOKEN_FIELDS: tuple[str, ...] = ("access_token",)
+    TOKEN_REFRESH_BUFFER_SECONDS = 120  # Default: Refresh 120s before expiry
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        # Support multiple naming conventions for backwards compatibility
+        # Preferred: token_endpoint (from TOKEN_ENDPOINT env var), also supports tokenEndpoint
+        token_endpoint = config.get("token_endpoint") or config.get("tokenEndpoint")
+        if not token_endpoint:
+            msg = f"tokenEndpoint is required for {self.TOKEN_NAME} provider."
+            raise KeyError(msg)
+        self.token_endpoint: str = str(token_endpoint)
+
+        # Token field names to try (in order)
+        token_fields = config.get("tokenFields") or config.get("token_fields")
+        if token_fields:
+            self.token_fields = token_fields if isinstance(token_fields, list) else [token_fields]
+        else:
+            self.token_fields = list(self.DEFAULT_TOKEN_FIELDS)
+
+        # Expiration field name
+        self.expires_in_field = config.get("expiresInField") or config.get("expires_in_field") or "expires_in"
+
+        # Token refresh buffer (seconds before expiry to refresh)
+        token_refresh_buffer = config.get("tokenRefreshBuffer") or config.get("token_refresh_buffer")
+        if token_refresh_buffer:
+            self.token_refresh_buffer = int(token_refresh_buffer)
+        else:
+            self.token_refresh_buffer = self.TOKEN_REFRESH_BUFFER_SECONDS
+
+        # Token cache
+        self._cached_token: str | None = None
+        self._token_expiry: float | None = None
+        self._lock = threading.Lock()
+
+    def _get_token_request_data(self) -> dict[str, str]:
+        """Return URL-encoded form data sent to the token endpoint."""
+        raise NotImplementedError
+
+    def _get_token_request_authorization(self) -> str | None:
+        """Return the Authorization header sent to the token endpoint, if any."""
+        return None
+
+    def get_bearer(self) -> str | None:
+        """Get the bearer token, fetching a new one if needed."""
+        with self._lock:
+            if self._is_token_valid():
+                return f"Bearer {self._cached_token}"
+
+            try:
+                self._fetch_token()
+                return f"Bearer {self._cached_token}" if self._cached_token else None
+            except Exception as e:
+                log.error("Failed to fetch %s: %s", self.TOKEN_NAME, e)
+                raise
+
+    def _is_token_valid(self) -> bool:
+        """Check if the cached token is still valid."""
+        if not self._cached_token or not self._token_expiry:
+            return False
+        # Refresh if within buffer time of expiry
+        return self._get_current_time() < (self._token_expiry - self.token_refresh_buffer)
+
+    def _get_current_time(self) -> float:
+        """Get current time in seconds. Can be overridden for testing."""
+        return time.time()
+
+    def _fetch_token(self) -> None:
+        """Fetch a new token from the token endpoint."""
+        try:
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            authorization = self._get_token_request_authorization()
+            if authorization:
+                headers["Authorization"] = authorization
+
+            response = requests.post(
+                self.token_endpoint,
+                data=self._get_token_request_data(),
+                headers=headers,
+                timeout=10,
+            )
+            response.raise_for_status()
+
+            response_json = response.json()
+
+            # Try to find token in response using configured field names
+            token = self._extract_token_from_response(response_json)
+            if not token:
+                msg = f"Token not found in response. Tried fields: {self.token_fields}"
+                raise ValueError(msg)
+
+            self._cached_token = token
+
+            # Try to get expiration from response
+            expires_in = self._extract_expires_in(response_json)
+
+            if expires_in:
+                self._token_expiry = self._get_current_time() + expires_in
+            else:
+                # Try to extract expiration from JWT payload
+                self._token_expiry = self._extract_expiry_from_jwt(token)
+                if not self._token_expiry:
+                    log.warning(
+                        "%s endpoint returned no expiry information, so the token cannot be cached "
+                        "and a new one is requested for every event. Set expiresInField if the "
+                        "response names it differently.",
+                        self.TOKEN_NAME,
+                    )
+
+            log.debug("Successfully fetched %s, expires at: %s", self.TOKEN_NAME, self._token_expiry)
+
+        except Exception as e:
+            msg = f"Failed to fetch {self.TOKEN_NAME} from {self.token_endpoint}: {e}"
+            raise RuntimeError(msg) from e
+
+    def _extract_token_from_response(self, response_json: dict[str, Any]) -> str | None:
+        """Extract token from response JSON using configured field names."""
+        for field in self.token_fields:
+            # Try exact match first
+            if field in response_json:
+                value = response_json[field]
+                return str(value) if value is not None else None
+
+            # Try case-insensitive match
+            for key in response_json:
+                if key.lower() == field.lower():
+                    value = response_json[key]
+                    return str(value) if value is not None else None
+
+        return None
+
+    def _extract_expires_in(self, response_json: dict[str, Any]) -> int | None:
+        """Extract expiration time from response JSON."""
+        # Try exact match
+        if self.expires_in_field in response_json:
+            return int(response_json[self.expires_in_field])
+
+        # Try case-insensitive match and handle camelCase/snake_case variations
+        for key in response_json:
+            if key.lower() == self.expires_in_field.lower():
+                return int(response_json[key])
+            # Handle camelCase to snake_case (e.g., expiresIn -> expires_in)
+            if key.lower().replace("_", "") == self.expires_in_field.lower().replace("_", ""):
+                return int(response_json[key])
+
+        return None
+
+    def _extract_expiry_from_jwt(self, token: str) -> float | None:
+        """Extract expiration time from JWT payload's 'exp' claim."""
+        try:
+            # JWT format: header.payload.signature
+            parts = token.split(".")
+            if len(parts) != 3:
+                return None
+
+            # Decode payload (add padding if needed)
+            payload = parts[1]
+            padding = 4 - len(payload) % 4
+            if padding != 4:
+                payload += "=" * padding
+
+            decoded = base64.urlsafe_b64decode(payload)
+            payload_json = json.loads(decoded)
+
+            if "exp" in payload_json:
+                return float(payload_json["exp"])
+
+        except Exception as e:
+            log.debug("Failed to extract expiry from JWT: %s", e)
+
+        return None
+
+
+class JwtTokenProvider(TokenEndpointTokenProvider):
+    """TokenProvider that exchanges an API key for a JWT token via a POST endpoint.
+
+    Sends the API key and OAuth parameters as URL-encoded form data.
+
+    The provider automatically tries multiple common JSON field names for the token:
+    the configured token_fields (default ["token", "access_token"]). This ensures
+    compatibility with various OAuth providers.
+
+    The provider caches tokens and automatically refreshes them before expiry. By default,
+    tokens are refreshed 120 seconds before they expire. This can be configured using the
+    tokenRefreshBuffer parameter.
+
+    Configuration example:
+        {
+            "type": "jwt",
+            "apiKey": "your-api-key",
+            "tokenEndpoint": "https://auth.example.com/token",
+            "tokenFields": ["token", "access_token"],  # optional
+            "expiresInField": "expires_in",  # optional
+            "grantType": "urn:ietf:params:oauth:grant-type:jwt-bearer",  # optional
+            "responseType": "token",  # optional
+            "tokenRefreshBuffer": 120  # optional, defaults to 120 seconds
+        }
+
+    For IBM Cloud IAM, use these settings:
+        {
+            "type": "jwt",
+            "apiKey": "your-ibm-api-key",
+            "tokenEndpoint": "https://iam.cloud.ibm.com/identity/token",
+            "grantType": "urn:ibm:params:oauth:grant-type:apikey",
+            "responseType": "cloud_iam"
+        }
+    """
+
+    TOKEN_NAME = "JWT token"
+    DEFAULT_TOKEN_FIELDS = ("token", "access_token")
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        api_key = first_config_value(config, "apiKey", "apikey", "api_key")
+        if api_key is None:
+            msg = "apiKey is required for JWT token provider."
+            raise KeyError(msg)
+        super().__init__(config)
+        self.api_key = config_value_to_str(api_key)
+
+        # OAuth parameters
+        self.grant_type = (
+            config.get("grantType")
+            or config.get("grant_type")
+            or "urn:ietf:params:oauth:grant-type:jwt-bearer"
+        )
+        self.response_type = config.get("responseType") or config.get("response_type") or "token"
+
+    def _get_token_request_data(self) -> dict[str, str]:
+        return {
+            "grant_type": self.grant_type,
+            "response_type": self.response_type,
+            "apikey": self.api_key,
+        }
+
+
+class OAuth2ClientCredentialsTokenProvider(TokenEndpointTokenProvider):
+    """TokenProvider that obtains an access token with the OAuth 2.0 client credentials grant (RFC 6749, 4.4).
+
+    The client credentials are sent in the Authorization header (``client_secret_basic``, the default) or
+    in the request body (``client_secret_post``). The access token is cached and fetched again before it
+    expires, as the client credentials grant does not issue refresh tokens.
+
+    Configuration example:
+        {
+            "type": "oauth2",
+            "clientId": "your-client-id",
+            "clientSecret": "your-client-secret",
+            "tokenEndpoint": "https://auth.example.com/token",
+            "scope": "openid",  # optional
+            "clientAuthMethod": "client_secret_basic",  # optional, or "client_secret_post"
+            "tokenRefreshBuffer": 120  # optional, defaults to 120 seconds
+        }
+    """
+
+    TOKEN_NAME = "OAuth2 access token"
+    CLIENT_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        client_id = first_config_value(config, "clientId", "client_id")
+        if client_id is None:
+            msg = "clientId is required for OAuth2 access token provider."
+            raise KeyError(msg)
+        client_secret = first_config_value(config, "clientSecret", "client_secret")
+        if client_secret is None:
+            msg = "clientSecret is required for OAuth2 access token provider."
+            raise KeyError(msg)
+        super().__init__(config)
+        self.client_id = config_value_to_str(client_id)
+        self.client_secret = config_value_to_str(client_secret)
+        self.scope = config.get("scope")
+        self.client_auth_method = str(
+            config.get("clientAuthMethod") or config.get("client_auth_method") or self.CLIENT_AUTH_METHODS[0]
+        )
+        if self.client_auth_method not in self.CLIENT_AUTH_METHODS:
+            msg = (
+                f"clientAuthMethod must be one of {self.CLIENT_AUTH_METHODS}, got {self.client_auth_method}."
+            )
+            raise ValueError(msg)
+
+    def _get_token_request_data(self) -> dict[str, str]:
+        data = {"grant_type": "client_credentials"}
+        if self.scope:
+            data["scope"] = str(self.scope)
+        if self.client_auth_method == "client_secret_post":
+            data["client_id"] = self.client_id
+            data["client_secret"] = self.client_secret
+        return data
+
+    def _get_token_request_authorization(self) -> str | None:
+        if self.client_auth_method == "client_secret_post":
+            return None
+        # Client credentials are form-urlencoded before being encoded, as required by RFC 6749, 2.3.1
+        credentials = f"{quote_plus(self.client_id)}:{quote_plus(self.client_secret)}"
+        return "Basic " + base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+
+
+def create_token_provider(auth: dict[str, str]) -> TokenProvider:
+    if "type" not in auth:
+        log.debug("No auth type specified, fallback to default TokenProvider")
+        return TokenProvider({})
+
+    if auth["type"] == "api_key":
+        log.debug("Using ApiKeyTokenProvider")
+        return ApiKeyTokenProvider(auth)
+
+    if auth["type"] == "jwt":
+        log.debug("Using JwtTokenProvider")
+        return JwtTokenProvider(auth)
+
+    if auth["type"] == "oauth2":
+        log.debug("Using OAuth2ClientCredentialsTokenProvider")
+        return OAuth2ClientCredentialsTokenProvider(auth)
+
+    of_type: str = auth["type"]
+    subclass = import_from_string(of_type)
+
+    if not inspect.isclass(subclass):
+        raise TypeError(f"Expected token provider {subclass} to be a class")
+    if not issubclass(subclass, TokenProvider):
+        raise TypeError(f"{subclass} is not a subclass of TokenProvider")
+
+    log.debug("Using %s as token provider", subclass)
+    return subclass(auth)
+
+
+def get_session() -> Session:
+    from requests import Session
+
+    return Session()
+
+
+@attr.define
+class HttpSslContextConfig:
+    """SSL context configuration for the HTTP transport.
+
+    Provides parity with the Java client's ``sslContext`` config section,
+    letting the Python client verify the server against a custom CA bundle
+    and authenticate itself with a client certificate (mutual TLS).
+
+    ``ca_cert_path`` maps to ``requests`` ``verify`` (a CA bundle path).
+    ``client_cert_path`` / ``client_key_path`` map to ``requests`` ``cert``.
+    """
+
+    ca_cert_path: str | None = None
+    client_cert_path: str | None = None
+    client_key_path: str | None = None
+
+    def __attrs_post_init__(self) -> None:
+        if self.client_key_path and not self.client_cert_path:
+            msg = (
+                "`clientKeyPath` requires `clientCertPath` to be set: "
+                "a client key without a client certificate cannot be used."
+            )
+            raise ValueError(msg)
+
+    @classmethod
+    def from_dict(cls, params: dict[str, Any]) -> HttpSslContextConfig:
+        # Accept camelCase (matching the Java client), snake_case, and lowercased keys
+        # (the environment-variable loader lowercases keys, e.g. `cacertpath`).
+        # The key-without-cert validation runs in __attrs_post_init__.
+        return cls(
+            ca_cert_path=params.get("caCertPath", params.get("ca_cert_path", params.get("cacertpath"))),
+            client_cert_path=params.get(
+                "clientCertPath", params.get("client_cert_path", params.get("clientcertpath"))
+            ),
+            client_key_path=params.get(
+                "clientKeyPath", params.get("client_key_path", params.get("clientkeypath"))
+            ),
+        )
+
+    def as_requests_cert(self) -> str | tuple[str, str] | None:
+        """Return the value for ``requests`` ``cert``: a (cert, key) tuple, a
+        single combined cert/key file path, or None when no client cert is set."""
+        if not self.client_cert_path:
+            return None
+        if self.client_key_path:
+            return (self.client_cert_path, self.client_key_path)
+        return self.client_cert_path
+
+
+@attr.define
+class HttpConfig(Config):
+    url: str
+    endpoint: str = "api/v1/lineage"
+    timeout: float = 5.0
+    # check TLS certificates
+    verify: bool = True
+    auth: TokenProvider = attr.field(factory=lambda: TokenProvider({}))
+    compression: HttpCompression | None = None
+    # not set by TransportFactory
+    session: Session | None = None
+    # not set by TransportFactory
+    adapter: HTTPAdapter | None = None
+    # custom headers support
+    custom_headers: dict[str, str] = attr.field(factory=dict, converter=config_values_to_str)
+    # retry settings
+    retry: dict[str, Any] = attr.field(default=DEFAULT_RETRY_CONFIG)
+    # custom SSL context (CA bundle / client certificate) for parity with the Java client
+    ssl_context: HttpSslContextConfig | None = None
+
+    @classmethod
+    def from_dict(cls, params: dict[str, Any]) -> HttpConfig:
+        if "url" not in params:
+            msg = "`url` key not passed to HttpConfig"
+            raise RuntimeError(msg)
+        specified_dict = get_only_specified_fields(cls, params)
+        specified_dict["auth"] = create_token_provider(specified_dict.get("auth", {}))
+        ssl_context = params.get("sslContext", params.get("ssl_context", params.get("sslcontext")))
+        if isinstance(ssl_context, dict):
+            specified_dict["ssl_context"] = HttpSslContextConfig.from_dict(ssl_context)
+        elif isinstance(ssl_context, HttpSslContextConfig):
+            specified_dict["ssl_context"] = ssl_context
+        elif ssl_context is not None:
+            msg = (
+                '`sslContext` must be a mapping (e.g. `{"caCertPath": ...}`) '
+                f"or `HttpSslContextConfig`, got {type(ssl_context).__name__}."
+            )
+            raise ValueError(msg)
+        compression = specified_dict.get("compression")
+        if compression:
+            specified_dict["compression"] = HttpCompression(compression)
+
+        # Merge retry config with defaults to preserve unspecified values
+        if "retry" in specified_dict:
+            specified_dict["retry"] = {**DEFAULT_RETRY_CONFIG, **specified_dict["retry"]}
+
+        return cls(**specified_dict)
+
+    @classmethod
+    def from_options(
+        cls,
+        url: str,
+        options: OpenLineageClientOptions,
+        session: Session | None,
+    ) -> HttpConfig:
+        return cls(
+            url=url,
+            timeout=options.timeout,
+            verify=options.verify,
+            auth=ApiKeyTokenProvider({"api_key": options.api_key}) if options.api_key else TokenProvider({}),
+            session=session,
+            adapter=options.adapter,
+        )
+
+
+class HttpTransport(Transport):
+    kind = "http"
+    config_class = HttpConfig
+
+    def __init__(self, config: HttpConfig) -> None:
+        url = config.url.strip()
+        self.config = config
+
+        log.debug(
+            "Constructing OpenLineage transport that will send events "
+            "to HTTP endpoint `%s` using the following config: %s",
+            urljoin(url, config.endpoint),
+            config,
+        )
+        try:
+            from urllib3.util import parse_url
+
+            parsed = parse_url(url)
+        except Exception as e:  # noqa: BLE001
+            msg = f"Need valid url for OpenLineageClient, passed {url}. Exception: {e}"
+            raise ValueError(msg) from None
+        else:
+            if not (parsed.scheme and parsed.netloc):
+                msg = f"Need valid url for OpenLineageClient, passed {url}"
+                raise ValueError(msg)
+        self.url = url
+        self.endpoint = config.endpoint
+        self.timeout = config.timeout
+        self.verify: bool | str = config.verify
+        self.ssl_context = config.ssl_context
+        if self.ssl_context and self.ssl_context.ca_cert_path:
+            # A custom CA bundle takes precedence over the boolean verify flag.
+            self.verify = self.ssl_context.ca_cert_path
+        self.cert: str | tuple[str, str] | None = (
+            self.ssl_context.as_requests_cert() if self.ssl_context else None
+        )
+        self.compression = config.compression
+        self._session: Session | None = None
+        self.session = config.session
+
+    def emit(self, event: Event) -> Response:
+        # If anyone overrides debuglevel manually, we can potentially leak secrets to logs.
+        # Override this setting to make sure it does not happen.
+        prev_debuglevel = http_client.HTTPConnection.debuglevel
+        http_client.HTTPConnection.debuglevel = 0
+        try:
+            body, headers = self._prepare_request(Serde.to_json(event))
+
+            post_kwargs: dict[str, Any] = {
+                "url": urljoin(self.url, self.endpoint),
+                "data": body,
+                "headers": headers,
+                "timeout": self.timeout,
+                "verify": self.verify,
+            }
+            if self.cert is not None:
+                # Only pass ``cert`` when a client certificate is configured,
+                # so the default call signature stays unchanged.
+                post_kwargs["cert"] = self.cert
+                # Never follow redirects with a client certificate: the
+                # certificate would be presented to the redirect target,
+                # an endpoint it was not issued for.
+                post_kwargs["allow_redirects"] = False
+            resp = self.session.post(**post_kwargs)
+            resp.close()
+            if self.cert is not None and resp.is_redirect:
+                msg = (
+                    "Refusing to follow redirect while a client certificate "
+                    "is configured: authenticating against the redirect "
+                    "target was not requested."
+                )
+                raise RuntimeError(msg)
+            resp.raise_for_status()
+            return resp
+        finally:
+            http_client.HTTPConnection.debuglevel = prev_debuglevel
+
+    @property
+    def session(self) -> Session:
+        if not self._session:
+            self._session = Session()
+            self._prepare_session(self._session)
+        return self._session
+
+    @session.setter
+    def session(self, value: Session | None) -> None:
+        if value:
+            self._prepare_session(value)
+        self._session = value
+
+    def close(self, timeout: float = -1) -> bool:
+        if self._session:
+            self._session.close()
+            self._session = None
+        return True
+
+    def _auth_headers(self, token_provider: TokenProvider) -> dict:  # type: ignore[type-arg]
+        bearer = token_provider.get_bearer()
+        if bearer:
+            return {"Authorization": bearer}
+        return {}
+
+    def _prepare_session(self, session: Session) -> None:
+        if self.config.adapter:
+            session.mount(self.url, self.config.adapter)
+        else:
+            session.mount(self.url, self._prepare_adapter())
+
+    def _prepare_adapter(self) -> HTTPAdapter:
+        retry = urllib3.util.Retry(**self.config.retry)
+        return HTTPAdapter(max_retries=retry)
+
+    def _prepare_request(self, event_str: str) -> tuple[bytes | str, dict[str, str]]:
+        headers = {
+            "Content-Type": "application/json",
+            **self._auth_headers(self.config.auth),
+            **self.config.custom_headers,
+        }
+        if self.compression == HttpCompression.GZIP:
+            headers["Content-Encoding"] = "gzip"
+            # levels higher than 3 are twice as slow:
+            # https://github.com/python/cpython/issues/91349#issuecomment-2737161048
+            return gzip.compress(event_str.encode("utf-8"), compresslevel=3), headers
+
+        return event_str, headers

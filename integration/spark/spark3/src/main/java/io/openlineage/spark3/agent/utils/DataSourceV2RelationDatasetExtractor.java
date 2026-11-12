@@ -1,0 +1,337 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark3.agent.utils;
+
+import static io.openlineage.spark.agent.util.SqlUtils.generateSchemaFromSqlMeta;
+
+import io.openlineage.client.OpenLineage;
+import io.openlineage.client.dataset.DatasetCompositeFacetsBuilder;
+import io.openlineage.client.utils.DatasetIdentifier;
+import io.openlineage.spark.agent.lifecycle.plan.catalog.CatalogUtils;
+import io.openlineage.spark.agent.lifecycle.plan.catalog.RelationHandler;
+import io.openlineage.spark.agent.lifecycle.plan.catalog.UnsupportedCatalogException;
+import io.openlineage.spark.agent.util.DatabricksUtils;
+import io.openlineage.spark.agent.util.PlanUtils;
+import io.openlineage.spark.api.DatasetFactory;
+import io.openlineage.spark.api.OpenLineageContext;
+import io.openlineage.sql.OpenLineageSql;
+import io.openlineage.sql.SqlMeta;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.spark.SparkContext;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.TableCatalog;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
+import org.jetbrains.annotations.NotNull;
+
+@Slf4j
+public class DataSourceV2RelationDatasetExtractor {
+
+  public static <D extends OpenLineage.Dataset> List<D> extract(
+      DatasetFactory<D> datasetFactory,
+      OpenLineageContext context,
+      DataSourceV2Relation relation,
+      boolean includeVersionFacet) {
+    return extract(
+        datasetFactory,
+        context,
+        relation,
+        datasetFactory.createCompositeFacetBuilder(),
+        includeVersionFacet);
+  }
+
+  public static <D extends OpenLineage.Dataset> List<D> extractIncludingVersionFacet(
+      DatasetFactory<D> datasetFactory, OpenLineageContext context, DataSourceV2Relation relation) {
+    return extract(
+        datasetFactory, context, relation, datasetFactory.createCompositeFacetBuilder(), true);
+  }
+
+  public static <D extends OpenLineage.Dataset> List<D> extractIncludingVersionFacet(
+      DatasetFactory<D> datasetFactory,
+      OpenLineageContext context,
+      DataSourceV2Relation relation,
+      DatasetCompositeFacetsBuilder datasetFacetsBuilder) {
+    return extract(datasetFactory, context, relation, datasetFacetsBuilder, true);
+  }
+
+  public static <D extends OpenLineage.Dataset> List<D> extract(
+      DatasetFactory<D> datasetFactory,
+      OpenLineageContext context,
+      DataSourceV2Relation relation,
+      DatasetCompositeFacetsBuilder datasetFacetsBuilder,
+      boolean includeVersionFacet) {
+    OpenLineage openLineage = context.getOpenLineage();
+    if (ExtensionDataSourceV2Utils.hasQueryExtensionLineage(relation)) {
+      return getQueryDatasets(datasetFactory, relation);
+    }
+    List<DatasetIdentifier> di = getDatasetIdentifierExtended(context, relation);
+    return di.stream()
+        .map(
+            identifier -> {
+              if (ExtensionDataSourceV2Utils.hasExtensionLineage(relation)) {
+                ExtensionDataSourceV2Utils.loadBuilder(openLineage, datasetFacetsBuilder, relation);
+              } else {
+                if (includeVersionFacet) {
+                  DatasetVersionDatasetFacetUtils.extractVersionFromDataSourceV2Relation(
+                          context, relation)
+                      .ifPresent(s -> datasetFactory.buildVersionFacets(datasetFacetsBuilder, s));
+                }
+
+                facetSource(context, relation)
+                    .ifPresent(
+                        catalog -> {
+                          Map<String, String> tableProperties = relation.table().properties();
+                          try {
+                            CatalogUtils.addStorageAndCatalogFacets(
+                                context, catalog, tableProperties, datasetFacetsBuilder);
+                          } catch (Exception | NoSuchMethodError | NoClassDefFoundError e) {
+                            log.warn(
+                                "Could not add catalog facets of table {}",
+                                identifier.getName(),
+                                e);
+                          }
+                        });
+              }
+              datasetFacetsBuilder
+                  .getFacets()
+                  .schema(PlanUtils.schemaFacet(openLineage, relation.schema()))
+                  .dataSource(PlanUtils.datasourceFacet(openLineage, identifier.getNamespace()));
+
+              return datasetFactory
+                  .sparkDatasetBuilder(datasetFacetsBuilder)
+                  .dataset(identifier)
+                  .build();
+            })
+        .collect(Collectors.toList());
+  }
+
+  private static <D extends OpenLineage.Dataset> @NotNull List<D> getQueryDatasets(
+      DatasetFactory<D> datasetFactory, DataSourceV2Relation relation) {
+    String namespace = relation.table().properties().get("openlineage.dataset.namespace");
+    String query = relation.table().properties().get("openlineage.dataset.query");
+    Optional<SqlMeta> optionalSqlMeta =
+        OpenLineageSql.parse(Collections.singletonList(query), namespace);
+    return optionalSqlMeta
+        .map(
+            sqm -> {
+              if (sqm.columnLineage().isEmpty()) {
+                int numberOfTables = sqm.inTables().size();
+                return sqm.inTables().stream()
+                    .map(
+                        dbtm -> {
+                          DatasetIdentifier di =
+                              new DatasetIdentifier(dbtm.qualifiedName(), namespace);
+
+                          if (numberOfTables > 1) {
+                            return datasetFactory.sparkDatasetBuilder().dataset(di).build();
+                          }
+
+                          return datasetFactory
+                              .sparkDatasetBuilder()
+                              .dataset(di)
+                              .schema(relation.schema())
+                              .build();
+                        })
+                    .collect(Collectors.toList());
+              }
+              return sqm.inTables().stream()
+                  .map(
+                      dbtm -> {
+                        DatasetIdentifier di =
+                            new DatasetIdentifier(dbtm.qualifiedName(), namespace);
+                        return datasetFactory
+                            .sparkDatasetBuilder()
+                            .dataset(di)
+                            .schema(generateSchemaFromSqlMeta(dbtm, relation.schema(), sqm))
+                            .build();
+                      })
+                  .collect(Collectors.toList());
+            })
+        .orElse(Collections.emptyList());
+  }
+
+  public static Optional<DatasetIdentifier> getDatasetIdentifier(
+      OpenLineageContext context, DataSourceV2Relation relation) {
+
+    if (relation.identifier() == null || relation.identifier().isEmpty()) {
+      // Since identifier is null, short circuit and check if we can get the dataset identifier
+      // from the relation itself.
+      return getDatasetIdentifierFromRelation(context, relation);
+    }
+    return Optional.of(relation)
+        .filter(r -> r.identifier() != null)
+        .filter(r -> r.identifier().isDefined())
+        .filter(r -> r.catalog() != null)
+        .filter(r -> r.catalog().isDefined())
+        .filter(r -> r.catalog().get() instanceof TableCatalog)
+        .flatMap(
+            r ->
+                PlanUtils3.getDatasetIdentifier(
+                    context,
+                    (TableCatalog) r.catalog().get(),
+                    r.identifier().get(),
+                    r.table().properties()));
+  }
+
+  public static List<DatasetIdentifier> getDatasetIdentifierExtended(
+      OpenLineageContext context, DataSourceV2Relation relation) {
+    // Check if the dataset has extension lineage
+    if (ExtensionDataSourceV2Utils.hasExtensionLineage(relation)) {
+      return Collections.singletonList(ExtensionDataSourceV2Utils.getDatasetIdentifier(relation));
+    }
+
+    if (ExtensionDataSourceV2Utils.hasQueryExtensionLineage(relation)) {
+      String namespace = relation.table().properties().get("openlineage.dataset.namespace");
+      Optional<SqlMeta> sqlMeta =
+          OpenLineageSql.parse(
+              Collections.singletonList(
+                  relation.table().properties().get("openlineage.dataset.query")),
+              namespace);
+      return sqlMeta
+          .map(
+              meta ->
+                  meta.inTables().stream()
+                      .map(dbtm -> new DatasetIdentifier(dbtm.qualifiedName(), namespace))
+                      .collect(Collectors.toList()))
+          .orElse(Collections.emptyList());
+    }
+
+    // Check if the relation identifier is empty
+    if (relation.identifier().isEmpty()) {
+      log.warn("Couldn't find identifier for dataset in plan {}", relation);
+      return getDatasetIdentifier(context, relation)
+          .map(Collections::singletonList)
+          .orElse(Collections.emptyList());
+    }
+
+    // Check if the catalog is present and is an instance of TableCatalog
+    if (relation.catalog().isEmpty() || !(relation.catalog().get() instanceof TableCatalog)) {
+      log.warn("Couldn't find catalog for dataset in plan {}", relation);
+      return getDatasetIdentifierFromRelation(context, relation)
+          .map(Collections::singletonList)
+          .orElse(Collections.emptyList());
+    }
+
+    Identifier identifier = relation.identifier().get();
+    TableCatalog tableCatalog = (TableCatalog) relation.catalog().get();
+    Map<String, String> tableProperties = relation.table().properties();
+
+    Optional<DatasetIdentifier> datasetIdentifier =
+        resolveDatasetIdentifier(context, tableCatalog, identifier, tableProperties);
+    if (datasetIdentifier.isPresent()) {
+      return Collections.singletonList(datasetIdentifier.get());
+    }
+
+    // The catalog may be one no CatalogHandler supports - Iceberg's rewrite actions, for example,
+    // read and write through SparkCachedTableCatalog (default_cache_iceberg) or, on Spark 4.1 with
+    // Iceberg 1.11+, SparkRewriteTableCatalog (default_rewrite_catalog). Fall back to resolving
+    // the dataset from the relation, which still carries the underlying table. Gated on the
+    // catalog being unsupported so that catalogs which do have a handler keep their existing
+    // fallback - the Unity Catalog one below - unchanged: that path names a table after the catalog
+    // it was handed, which is right for a real Unity Catalog and wrong for Iceberg's rewrite
+    // catalogs, whose identifier is the table cache key.
+    if (!CatalogUtils.getCatalogHandler(context, tableCatalog).isPresent()) {
+      Optional<DatasetIdentifier> relationIdentifier =
+          getDatasetIdentifierFromRelation(context, relation);
+      if (relationIdentifier.isPresent()) {
+        return Collections.singletonList(relationIdentifier.get());
+      }
+    }
+
+    return unityCatalogIdentifier(context, tableCatalog, identifier)
+        .map(Collections::singletonList)
+        .orElse(Collections.emptyList());
+  }
+
+  private static Optional<DatasetIdentifier> resolveDatasetIdentifier(
+      OpenLineageContext context,
+      TableCatalog tableCatalog,
+      Identifier identifier,
+      Map<String, String> tableProperties) {
+    try {
+      return PlanUtils3.getDatasetIdentifier(context, tableCatalog, identifier, tableProperties);
+    } catch (Exception | NoSuchMethodError | NoClassDefFoundError e) {
+      log.warn("Could not resolve dataset identifier of table {}", identifier, e);
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Unity Catalog managed tables may have no resolvable storage location. Fall back to the
+   * qualified {@code catalog.schema.table} name in the {@code unity-catalog} namespace, matching
+   * {@code CreateReplaceOutputDatasetBuilder}.
+   */
+  private static Optional<DatasetIdentifier> unityCatalogIdentifier(
+      OpenLineageContext context, TableCatalog tableCatalog, Identifier identifier) {
+    boolean unityCatalogEnabled =
+        context
+            .getSparkContext()
+            .map(SparkContext::getConf)
+            .map(DatabricksUtils::isDatabricksUnityCatalogEnabled)
+            .orElse(false);
+
+    if (!unityCatalogEnabled) {
+      return Optional.empty();
+    }
+
+    String name = DatabricksUtils.qualifiedUnityCatalogTableName(tableCatalog, identifier);
+    log.warn(
+        "Could not resolve the location of Unity Catalog table {}, falling back to its qualified name",
+        name);
+    return Optional.of(
+        new DatasetIdentifier(name, DatabricksUtils.UNITY_CATALOG_SYMLINK_NAMESPACE));
+  }
+
+  /**
+   * The catalog to resolve storage and catalog facets against. Normally the relation's own, but
+   * when no {@link io.openlineage.spark.agent.lifecycle.plan.catalog.CatalogHandler} supports that
+   * catalog - Iceberg's rewrite actions write through {@code SparkCachedTableCatalog} or, on Spark
+   * 4.1 with Iceberg 1.11+, {@code SparkRewriteTableCatalog} - facets looked up against it come
+   * back empty. Fall back to the catalog that owns the table, the same one {@link
+   * #getDatasetIdentifierExtended} resolves the identifier through, so a compaction event carries
+   * the same facets as a regular write to the table.
+   */
+  private static Optional<TableCatalog> facetSource(
+      OpenLineageContext context, DataSourceV2Relation relation) {
+    if (relation.catalog().isDefined() && relation.catalog().get() instanceof TableCatalog) {
+      TableCatalog tableCatalog = (TableCatalog) relation.catalog().get();
+      if (CatalogUtils.getCatalogHandler(context, tableCatalog).isPresent()) {
+        return Optional.of(tableCatalog);
+      }
+    }
+
+    try {
+      return CatalogUtils.getOwningCatalogFromRelation(context, relation)
+          .map(RelationHandler.OwningCatalog::getCatalog);
+    } catch (Exception | LinkageError e) {
+      log.warn("Could not resolve the catalog owning relation {}", relation.simpleString(5), e);
+      return Optional.empty();
+    }
+  }
+
+  private static Optional<DatasetIdentifier> getDatasetIdentifierFromRelation(
+      OpenLineageContext context, DataSourceV2Relation relation) {
+    try {
+      return (Optional.of(CatalogUtils.getDatasetIdentifierFromRelation(context, relation)));
+    } catch (UnsupportedCatalogException ex) {
+      log.warn(String.format("Catalog %s is unsupported", ex.getMessage()));
+      // update this if change the exception thrown in catalogutils
+      return Optional.empty();
+    } catch (Exception | LinkageError e) {
+      // Relation handlers reach into the underlying table's own API - Iceberg's, for example - so a
+      // version mismatch surfaces here as a linkage error. Callers of this method treat an
+      // unresolvable relation as "no dataset", and one relation must not take the whole plan's
+      // lineage down with it: InputFieldsCollector calls getDatasetIdentifierExtended directly,
+      // outside any PlanUtils#safeApply.
+      log.warn("Could not resolve dataset from relation {}", relation.simpleString(5), e);
+      return Optional.empty();
+    }
+  }
+}

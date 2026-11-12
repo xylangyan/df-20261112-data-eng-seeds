@@ -1,0 +1,37 @@
+{
+  "producer": {
+    "root_doc_url": "https://github.com/OpenLineage/OpenLineage/tree/main/spec",
+    "produced_facets": [
+      "ol:core:CatalogDatasetFacet.json",
+      "ol:core:ColumnLineageDatasetFacet.json",
+      "ol:core:HierarchyDatasetFacet.json",
+      "ol:core:DataQualityAssertionsDatasetFacet.json",
+      "ol:core:DataQualityMetricsInputDatasetFacet.json",
+      "ol:core:DatasetTypeDatasetFacet.json",
+      "ol:core:DatasetVersionDatasetFacet.json",
+      "ol:core:DatasourceDatasetFacet.json",
+      "ol:core:DocumentationDatasetFacet.json",
+      "ol:core:DocumentationJobFacet.json",
+      "ol:core:EnvironmentVariablesRunFacet.json",
+      "ol:core:ErrorMessageRunFacet.json",
+      "ol:core:ExternalQueryRunFacet.json",
+      "ol:core:ExtractionErrorRunFacet.json",
+      "ol:core:InputStatisticsInputDatasetFacet.json",
+      "ol:core:JobTypeJobFacet.json",
+      "ol:core:LifecycleStateChangeDatasetFacet.json",
+      "ol:core:LineageFacet.json",
+      "ol:core:NominalTimeRunFacet.json",
+      "ol:core:OutputStatisticsOutputDatasetFacet.json",
+      "ol:core:OwnershipDatasetFacet.json",
+      "ol:core:OwnershipJobFacet.json",
+      "ol:core:ParentRunFacet.json",
+      "ol:core:ProcessingEngineRunFacet.json",
+      "ol:core:SQLJobFacet.json",
+      "ol:core:SchemaDatasetFacet.json",
+      "ol:core:SourceCodeJobFacet.json",
+      "ol:core:SourceCodeLocationJobFacet.json",
+      "ol:core:StorageDatasetFacet.json",
+      "ol:core:SymlinksDatasetFacet.json"
+    ]
+  }
+}

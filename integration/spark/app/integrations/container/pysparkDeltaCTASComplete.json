@@ -1,0 +1,45 @@
+{
+  "eventType": "COMPLETE",
+  "inputs": [],
+  "job": {
+    "name": "delta_integration_test.atomic_create_table_as_select.default_tbl",
+    "namespace": "delta-namespace"
+  },
+  "outputs": [
+    {
+      "facets": {
+        "dataSource": {
+          "name": "file",
+          "uri": "file"
+        },
+        "schema": {
+          "fields": [
+            {
+              "name": "a",
+              "type": "long"
+            },
+            {
+              "name": "b",
+              "type": "long"
+            }
+          ]
+        },
+        "symlinks": {
+          "identifiers": [
+            {
+              "namespace": "file:/tmp/delta",
+              "name": "default.tbl",
+              "type": "TABLE"
+            }
+          ]
+        },
+        "lifecycleStateChange": {
+          "lifecycleStateChange": "CREATE"
+        }
+      },
+      "name": "/tmp/delta/tbl",
+      "namespace": "file"
+    }
+  ],
+  "run": {}
+}

@@ -1,0 +1,191 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark.agent.util;
+
+import io.openlineage.client.OpenLineage;
+import io.openlineage.client.utils.DatasetIdentifier;
+import io.openlineage.client.utils.FabricWarehouseUtils;
+import io.openlineage.client.utils.jdbc.JdbcDatasetUtils;
+import io.openlineage.spark.api.DatasetFactory;
+import io.openlineage.sql.ColumnLineage;
+import io.openlineage.sql.ColumnMeta;
+import io.openlineage.sql.DbTableMeta;
+import io.openlineage.sql.ExtractionError;
+import io.openlineage.sql.OpenLineageSql;
+import io.openlineage.sql.SqlMeta;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions;
+import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions$;
+import org.apache.spark.sql.execution.datasources.jdbc.JDBCRelation;
+import org.apache.spark.sql.types.StructType;
+
+@Slf4j
+public class JdbcSparkUtils {
+
+  public static <D extends OpenLineage.Dataset> List<D> getDatasets(
+      DatasetFactory<D> datasetFactory, SqlMeta meta, JDBCRelation relation) {
+
+    StructType schema = relation.schema();
+    JDBCOptions jdbcOptions = relation.jdbcOptions();
+
+    return SqlUtils.createDatasets(
+        datasetFactory, meta, schema, table -> getDatasetIdentifier(jdbcOptions, table));
+  }
+
+  /**
+   * Builds the dataset identifier of a table referenced by a JDBC relation. Input datasets and
+   * column-level lineage inputs must both be named through this method, so that column lineage
+   * input fields point to the same datasets as the inputs of the event.
+   *
+   * @param jdbcOptions options of the JDBC relation
+   * @param table table extracted from the relation's query
+   * @return dataset identifier, before namespace resolution
+   */
+  public static DatasetIdentifier getDatasetIdentifier(JDBCOptions jdbcOptions, DbTableMeta table) {
+    DatasetIdentifier identifier =
+        JdbcDatasetUtils.getDatasetIdentifier(
+            jdbcOptions.url(), table.qualifiedName(), jdbcOptions.asConnectionProperties());
+    // Microsoft's Spark connector for Fabric passes the user's options (such as the warehouse ID)
+    // through to the JDBC read, so they can be read here
+    return FabricWarehouseUtils.withOneLakeLocation(
+        identifier,
+        queryWarehouse(jdbcOptions),
+        option(jdbcOptions, FabricWarehouseUtils.WORKSPACE_ID_OPTION),
+        option(jdbcOptions, FabricWarehouseUtils.DATAWAREHOUSE_ID_OPTION));
+  }
+
+  // The warehouse a query runs in, which the DatawarehouseId option belongs to: the connector's
+  // database_name option, or else the database in the JDBC URL. A query can also read tables from
+  // other warehouses in the workspace, and those tables must not get this warehouse's location.
+  private static Optional<String> queryWarehouse(JDBCOptions jdbcOptions) {
+    Optional<String> databaseName = option(jdbcOptions, FabricWarehouseUtils.DATABASE_NAME_OPTION);
+    if (databaseName.isPresent()) {
+      return databaseName;
+    }
+    return JdbcDatasetUtils.getDatabase(jdbcOptions.url(), jdbcOptions.asConnectionProperties());
+  }
+
+  private static Optional<String> option(JDBCOptions jdbcOptions, String key) {
+    // parameters() ignores upper and lower case in option names
+    return ScalaConversionUtils.asJavaOptional(jdbcOptions.parameters().get(key));
+  }
+
+  public static Optional<SqlMeta> extractQueryFromSpark(JDBCRelation relation) {
+    Optional<String> dbtable =
+        ScalaConversionUtils.asJavaOptional(
+            relation.jdbcOptions().parameters().get(JDBCOptions$.MODULE$.JDBC_TABLE_NAME()));
+
+    // Anything that is valid in a FROM clause of a SQL query can be used in dbtable.
+    // It could be a subquery in parentheses, an alias or even multiple tables with a join.
+    // Examples of valid dbtable:
+    // `(SELECT col1, col2 FROM table_name WHERE some='filter')`
+    // `table_name AS t`
+    // `table_name t JOIN another_table a ON t.id = a.t_id`
+    // `table_name`
+    // `schema_name.table_name`
+    // https://spark.apache.org/docs/3.5.6/sql-data-sources-jdbc.html#data-source-option
+    if (dbtable.isPresent() && dbtableIsJustATableName(dbtable.get())) {
+      DbTableMeta origin = new DbTableMeta(null, null, dbtable.get());
+      return Optional.of(
+          new SqlMeta(
+              Collections.singletonList(origin),
+              Collections.emptyList(),
+              Arrays.stream(relation.schema().fields())
+                  .map(
+                      field ->
+                          new ColumnLineage(
+                              new ColumnMeta(null, field.name()),
+                              Collections.singletonList(new ColumnMeta(origin, field.name()))))
+                  .collect(Collectors.toList()),
+              Collections.emptyList()));
+    }
+
+    String dialect = extractDialectFromJdbcUrl(relation.jdbcOptions().url());
+    Optional<SqlMeta> sqlMeta =
+        dbtable
+            .map(fromClause -> parseDbtable(fromClause, dialect))
+            .orElseGet(() -> parse(queryStringFromJdbcOptions(relation.jdbcOptions()), dialect));
+
+    if (!sqlMeta.isPresent()) { // missing JNI library
+      return sqlMeta;
+    }
+    if (!sqlMeta.get().errors().isEmpty()) { // error return nothing
+      log.error(
+          String.format(
+              "error while parsing query: %s",
+              sqlMeta.get().errors().stream()
+                  .map(ExtractionError::toString)
+                  .collect(Collectors.joining(","))));
+      return Optional.empty();
+    }
+    if (sqlMeta.get().inTables().isEmpty()) {
+      log.error("no tables defined in query, this should not happen");
+      return Optional.empty();
+    }
+    return sqlMeta;
+  }
+
+  /**
+   * Parses {@code dbtable} as {@code select * from <dbtable>}. That has no column lineage, so a
+   * single subquery like {@code (SELECT ...) t} is parsed on its own instead: the text between its
+   * first {@code (} and last {@code )}. A dbtable that only starts with a subquery is told apart by
+   * the parser: that text then fails to parse, e.g. for {@code (SELECT ...) a JOIN (SELECT ...) b
+   * ON ...}, or reads fewer tables than the whole dbtable, e.g. for {@code (SELECT ...) a JOIN b ON
+   * ...}. Leaving quoting and comments to the parser keeps every dialect's lexical rules.
+   */
+  private static Optional<SqlMeta> parseDbtable(String dbtable, String dialect) {
+    Optional<SqlMeta> wholeTable = parse("select * from " + dbtable, dialect);
+    if (!wholeTable.isPresent() || !dbtableIsASubquery(dbtable)) {
+      return wholeTable;
+    }
+    List<DbTableMeta> tables = wholeTable.get().inTables();
+    Optional<SqlMeta> subquery =
+        parse(unwrapParentheses(dbtable), dialect)
+            .filter(meta -> meta.errors().isEmpty() && meta.inTables().containsAll(tables));
+    return subquery.isPresent() ? subquery : wholeTable;
+  }
+
+  private static Optional<SqlMeta> parse(String query, String dialect) {
+    return OpenLineageSql.parse(Collections.singletonList(query), dialect);
+  }
+
+  public static String queryStringFromJdbcOptions(JDBCOptions options) {
+    return unwrapParentheses(options.tableOrQuery());
+  }
+
+  /** Returns the text between the first {@code (} and the last {@code )}. */
+  private static String unwrapParentheses(String sql) {
+    return sql.substring(0, sql.lastIndexOf(")")).replaceFirst("\\(", "");
+  }
+
+  private static boolean dbtableIsASubquery(String dbtable) {
+    return dbtable.startsWith("(");
+  }
+
+  private static boolean dbtableIsJustATableName(String dbtable) {
+    // If there are no whitespaces between characters, we can assume this is a table name
+    // in form of `table_name` or `schema_name.table_name`
+    return !dbtable.matches("(?s).*\\S\\s+\\S.*");
+  }
+
+  private static String extractDialectFromJdbcUrl(String jdbcUrl) {
+    Pattern pattern = Pattern.compile("^jdbc:([^:]+):.*");
+    Matcher matcher = pattern.matcher(jdbcUrl);
+
+    if (matcher.find()) {
+      return matcher.group(1);
+    } else {
+      return null;
+    }
+  }
+}

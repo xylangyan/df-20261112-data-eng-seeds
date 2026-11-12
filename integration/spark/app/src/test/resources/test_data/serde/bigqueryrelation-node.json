@@ -1,0 +1,39 @@
+{
+  "relation":{
+    "tableId": {
+      "dataset":"dataset",
+      "table":"test"
+    },
+    "tableName":"dataset.test"
+  },
+  "output":[
+    {
+      "name":"name",
+      "dataType":{
+        "ordering":{}
+      },
+      "nullable":false,
+      "metadata":{
+        "map":{}
+      },
+      "qualifier":[],
+      "origin":{},
+      "deterministic":true,
+      "resolved":true
+    }
+  ],
+  "isStreaming":false,
+  "schema":[
+    {
+      "name": "name",
+      "nullable": false
+    }
+  ],
+  "allAttributes":{
+    "attrs":[]
+  },
+  "resolved":true,
+  "attributeMap":{},
+  "traceEnabled":false,
+  "canonicalizedPlan":false
+}

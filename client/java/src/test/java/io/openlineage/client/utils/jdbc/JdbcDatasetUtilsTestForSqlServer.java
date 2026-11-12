@@ -1,0 +1,209 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.client.utils.jdbc;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.Properties;
+import org.junit.jupiter.api.Test;
+
+@SuppressWarnings("PMD.AvoidUsingHardCodedIP")
+class JdbcDatasetUtilsTestForSqlServer {
+  @Test
+  void testGetDatasetIdentifierWithHost() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://test-host.com", "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://test-host.com")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithIPv4() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://192.168.1.1", "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://192.168.1.1")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithCredentials() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;user=fred;password=sec%40ret",
+                "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithDatabase() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;database=MYTESTDB", "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "MYTESTDB.schema.table1");
+
+    Properties props = new Properties();
+    props.setProperty("database", "MYTESTDB");
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname", "schema.table1", props))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "MYTESTDB.schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithDatabaseName() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;databaseName=MYTESTDB",
+                "schema.table1",
+                new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "MYTESTDB.schema.table1");
+
+    Properties props = new Properties();
+    props.setProperty("databaseName", "MYTESTDB");
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname", "schema.table1", props))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "MYTESTDB.schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithPort() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname:1433", "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname:1433")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithPortNumber() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;portNumber=1433", "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname:1433")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+
+    Properties props = new Properties();
+    props.setProperty("portNumber", "1433");
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname", "schema.table1", props))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname:1433")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithInstance() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname\\someinstance", "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname/someinstance")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithInstanceName() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;instanceName=someinstance",
+                "schema.table1",
+                new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname/someinstance")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+
+    Properties props = new Properties();
+    props.setProperty("instanceName", "someinstance");
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname", "schema.table1", props))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname/someinstance")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithServerName() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://;serverName=someserver", "schema.table1", new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://someserver")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+
+    Properties props = new Properties();
+    props.setProperty("serverName", "someserver");
+    assertThat(JdbcDatasetUtils.getDatasetIdentifier("jdbc:sqlserver://", "schema.table1", props))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://someserver")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithServerNameIPv6() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://;serverName=3ffe:8311:eeee:f70f:0:5eae:10.203.31.9",
+                "schema.table1",
+                new Properties()))
+        .hasFieldOrPropertyWithValue(
+            "namespace", "sqlserver://[3ffe:8311:eeee:f70f:0:5eae:10.203.31.9]")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+
+    Properties props = new Properties();
+    props.setProperty("serverName", "3ffe:8311:eeee:f70f:0:5eae:10.203.31.9");
+    assertThat(JdbcDatasetUtils.getDatasetIdentifier("jdbc:sqlserver://", "schema.table1", props))
+        .hasFieldOrPropertyWithValue(
+            "namespace", "sqlserver://[3ffe:8311:eeee:f70f:0:5eae:10.203.31.9]")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithExtraProperties() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;integratedSecurity=true;applicationName=MyApp;",
+                "schema.table1",
+                new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "schema.table1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithUppercaseUrl() {
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jDBC:SQLSERVER://TEST.HOST.COM\\MYINSTANCE;DATABASENAME=MYDB",
+                "SCHEMA.TABLE1",
+                new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://test.host.com/MYINSTANCE")
+        .hasFieldOrPropertyWithValue("name", "MYDB.SCHEMA.TABLE1");
+  }
+
+  @Test
+  void testGetDatasetIdentifierWithFullyQualifiedName() {
+    // the table already names its database, so the URL's one is not prepended
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;databaseName=MYTESTDB",
+                "MYTESTDB.dbo.table1",
+                new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "MYTESTDB.dbo.table1");
+
+    // a table of another database keeps its own database
+    assertThat(
+            JdbcDatasetUtils.getDatasetIdentifier(
+                "jdbc:sqlserver://hostname;databaseName=MYTESTDB",
+                "OTHERDB.dbo.table1",
+                new Properties()))
+        .hasFieldOrPropertyWithValue("namespace", "sqlserver://hostname")
+        .hasFieldOrPropertyWithValue("name", "OTHERDB.dbo.table1");
+  }
+}

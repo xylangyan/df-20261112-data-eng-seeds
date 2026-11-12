@@ -1,0 +1,24 @@
+transport:
+  type: http
+  url: http://localhost:1010
+  endpoint: api/v1/lineage
+  auth:
+    type: api_key
+    apiKey: random_token
+jobName:
+  appendDatasetName: false
+facets:
+  spark:
+    logicalPlan:
+      disabled: true
+  spark_unknown:
+    disabled: false
+# The debug facet is disabled implicitly
+#  debug:
+#    disabled: true
+incorrectEntry:
+  shouldNotFail: true
+job:
+  tags: [ key:value, tag2 ]
+run:
+  tags: [ something:will:be:missing, overwrite:thisisoverwritten ]

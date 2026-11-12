@@ -1,0 +1,62 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark.agent.util;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.Arrays;
+import java.util.Optional;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.spark.SparkConf;
+import org.apache.spark.SparkContext;
+import org.jspecify.annotations.NonNull;
+
+public class SparkConfUtils {
+  private static final String metastoreUriKey = "spark.sql.hive.metastore.uris";
+  private static final String metastoreHadoopUriKey = "hive.metastore.uris";
+
+  public static Optional<String> findSparkConfigKey(SparkConf conf, String... names) {
+    return Arrays.stream(names)
+        .map(conf::getOption)
+        .map(ScalaConversionUtils::asJavaOptional)
+        .filter(Optional::isPresent)
+        .findFirst()
+        .flatMap(opt -> opt);
+  }
+
+  public static Optional<String> findHadoopConfigKey(Configuration conf, String name) {
+    String opt = conf.get(name);
+    return Optional.ofNullable(opt);
+  }
+
+  public static Optional<URI> getMetastoreUri(SparkContext context) {
+    return getMetastoreUris(context)
+        .map(
+            key -> {
+              if (key.contains(",")) {
+                return Arrays.stream(key.split(",")).findFirst().get();
+              }
+              return key;
+            })
+        .map(
+            uri -> {
+              try {
+                return new URI(uri);
+              } catch (URISyntaxException e) {
+                return null;
+              }
+            });
+  }
+
+  public static @NonNull Optional<String> getMetastoreUris(SparkContext context) {
+    Optional<String> metastoreUris =
+        findSparkConfigKey(context.getConf(), metastoreUriKey, metastoreHadoopUriKey);
+    if (!metastoreUris.isPresent()) {
+      metastoreUris = findHadoopConfigKey(context.hadoopConfiguration(), metastoreHadoopUriKey);
+    }
+    return metastoreUris;
+  }
+}

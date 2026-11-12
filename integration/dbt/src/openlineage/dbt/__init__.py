@@ -1,0 +1,531 @@
+#!/usr/bin/env python
+#
+# Copyright 2018-2026 contributors to the OpenLineage project
+# SPDX-License-Identifier: Apache-2.0
+
+import logging
+import logging.config
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+from openlineage.client.client import OpenLineageClient
+from openlineage.client.event_v2 import Job, Run, RunEvent, RunState
+from openlineage.client.facet_v2 import job_type_job
+from openlineage.client.uuid import generate_new_uuid
+from openlineage.common.provider.dbt import (
+    DbtLocalArtifactProcessor,
+    ParentRunMetadata,
+    UnsupportedDbtCommand,
+)
+from openlineage.common.provider.dbt.live_events import DbtLiveProcessor
+from openlineage.common.provider.dbt.otel_processor import DbtOtelProcessor, run_dbt_untouched
+from openlineage.common.provider.dbt.structured_logs import DbtStructuredLogsProcessor
+from openlineage.common.provider.dbt.utils import (
+    CONSUME_STRUCTURED_LOGS_COMMAND_OPTION,
+    HANDLED_COMMANDS,
+    OL_SKIP_PARSE_ENV,
+    OL_SKIP_PARSE_OPTION,
+    OPENLINEAGE_DBT_JOB_NAME_OPTION,
+    PRODUCER,
+    __version__,
+    detect_dbt_engine,
+    get_dbt_command,
+    get_dbt_project_dir,
+    get_parent_run_metadata,
+    is_truthy,
+)
+from openlineage.common.utils import (
+    has_command_line_option,
+    parse_multiple_args,
+    parse_single_arg,
+    remove_command_line_option,
+)
+from tqdm import tqdm
+
+JOB_TYPE_FACET = job_type_job.JobTypeJobFacet(
+    jobType="JOB",
+    integration="DBT",
+    processingType="BATCH",
+    producer=PRODUCER,
+)
+
+
+def dbt_run_event(
+    state: RunState,
+    job_name: str,
+    job_namespace: str,
+    run_id: str | None = None,
+    parent: ParentRunMetadata | None = None,
+) -> RunEvent:
+    return RunEvent(
+        eventType=state,
+        eventTime=datetime.now(timezone.utc).isoformat(),
+        run=Run(
+            runId=run_id or str(generate_new_uuid()),
+            facets={"parent": parent.to_openlineage()} if parent else {},
+        ),
+        job=Job(
+            namespace=parent.job_namespace if parent else job_namespace,
+            name=job_name,
+            facets={"jobType": JOB_TYPE_FACET},
+        ),
+        producer=PRODUCER,
+    )
+
+
+def dbt_run_event_start(
+    job_name: str, job_namespace: str, parent_run_metadata: ParentRunMetadata
+) -> RunEvent:
+    return dbt_run_event(
+        state=RunState.START,
+        job_name=job_name,
+        job_namespace=job_namespace,
+        parent=parent_run_metadata,
+    )
+
+
+def dbt_run_event_end(
+    run_id: str,
+    job_namespace: str,
+    job_name: str,
+    parent_run_metadata: ParentRunMetadata | None,
+) -> RunEvent:
+    return dbt_run_event(
+        state=RunState.COMPLETE,
+        job_namespace=job_namespace,
+        job_name=job_name,
+        run_id=run_id,
+        parent=parent_run_metadata,
+    )
+
+
+def dbt_run_event_failed(
+    run_id: str,
+    job_namespace: str,
+    job_name: str,
+    parent_run_metadata: ParentRunMetadata | None,
+) -> RunEvent:
+    return dbt_run_event(
+        state=RunState.FAIL,
+        job_namespace=job_namespace,
+        job_name=job_name,
+        run_id=run_id,
+        parent=parent_run_metadata,
+    )
+
+
+def set_up_logger():
+    """
+    Set up the logger for the OpenLineage dbt wrapper.
+    """
+    log_format = "[%(asctime)s] [%(levelname)s] [%(name)s:%(lineno)d] - %(message)s"
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "format": log_format,
+                }
+            },
+            "handlers": {
+                "console": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "default",
+                    "stream": sys.stdout,
+                },
+            },
+            "loggers": {
+                "openlineage": {
+                    "handlers": ["console"],
+                    "level": os.getenv("OPENLINEAGE_DBT_LOGGING", "INFO").upper(),
+                    "propagate": True,
+                },
+            },
+        }
+    )
+    logger = logging.getLogger("openlineage.dbt")
+    custom_logging_level = os.getenv("OPENLINEAGE_CLIENT_LOGGING", None)
+    if custom_logging_level:
+        logger.setLevel(custom_logging_level)
+    return logger
+
+
+def main():
+    """Select the project and dispatch to artifact, structured-log, or OpenTelemetry processing."""
+    logger = set_up_logger()
+
+    logger.info("Running OpenLineage dbt wrapper version %s", __version__)
+
+    args = sys.argv[1:]
+    target = parse_single_arg(args, ["-t", "--target"])
+    profile_name = parse_single_arg(args, ["--profile"])
+    model_selector = parse_single_arg(args, ["--selector"])
+    target_path = parse_single_arg(args, ["--target-path"])
+    openlineage_job_name = parse_single_arg(args, [OPENLINEAGE_DBT_JOB_NAME_OPTION])
+    models = parse_multiple_args(args, ["-m", "-s", "--model", "--models", "--select"])
+
+    if openlineage_job_name:
+        args = remove_command_line_option(args, OPENLINEAGE_DBT_JOB_NAME_OPTION, remove_value=True)
+    else:
+        openlineage_job_name = os.getenv("OPENLINEAGE_DBT_JOB_NAME")
+
+    # dbt-ol options and not dbt options
+    consume_structured_logs_option = has_command_line_option(args, CONSUME_STRUCTURED_LOGS_COMMAND_OPTION)
+    skip_parse = has_command_line_option(args, OL_SKIP_PARSE_OPTION) or is_truthy(
+        os.getenv(OL_SKIP_PARSE_ENV)
+    )
+    args = remove_command_line_option(args, OL_SKIP_PARSE_OPTION)
+
+    # `send-events` re-emits the last run's artifacts without running dbt.
+    send_events = args[:1] == ["send-events"] or args[1:2] == ["send-events"]
+    if not send_events:
+        dbt_command_line = ["dbt", *remove_command_line_option(args, CONSUME_STRUCTURED_LOGS_COMMAND_OPTION)]
+        if get_dbt_command(dbt_command_line) not in HANDLED_COMMANDS:
+            # Commands like init, deps or debug may run outside a project, and on any engine they produce no
+            # lineage: the engine isn't detected and the project isn't read.
+            logger.info("This dbt command produces no lineage; running it without OpenLineage events")
+            return run_dbt_untouched(dbt_command_line, logger)
+    engine = detect_dbt_engine() if not send_events else (1, None)
+    project_dir = get_dbt_project_dir(args, engine=engine)
+    if not send_events:
+        dbt_major_version, dbt_version = engine
+        if dbt_major_version >= 2:
+            # dbt Core v2 always reports live from its OpenTelemetry output.
+            return consume_otel(
+                args=remove_command_line_option(args, CONSUME_STRUCTURED_LOGS_COMMAND_OPTION),
+                target=target,
+                target_path=target_path,
+                project_dir=project_dir,
+                profile_name=profile_name,
+                model_selector=model_selector,
+                models=models,
+                openlineage_job_name=openlineage_job_name,
+                skip_parse=skip_parse,
+                dbt_version=dbt_version,
+            )
+    if skip_parse:
+        logger.warning("%s only applies to dbt Core v2; ignoring it", OL_SKIP_PARSE_OPTION)
+
+    if consume_structured_logs_option:
+        return consume_structured_logs(
+            args=args,
+            target=target,
+            target_path=target_path,
+            project_dir=project_dir,
+            profile_name=profile_name,
+            model_selector=model_selector,
+            models=models,
+            openlineage_job_name=openlineage_job_name,
+        )
+    else:
+        return consume_local_artifacts(
+            args=args,
+            target=target,
+            target_path=target_path,
+            project_dir=project_dir,
+            profile_name=profile_name,
+            model_selector=model_selector,
+            models=models,
+            openlineage_job_name=openlineage_job_name,
+        )
+
+
+def consume_structured_logs(
+    args: list[str],
+    target: str,
+    target_path: str | None,
+    project_dir: str,
+    profile_name: str,
+    model_selector: str,
+    models: list[str],
+    openlineage_job_name: str | None = None,
+):
+    """Run dbt and emit live lineage from structured logs for the selected project."""
+    logger = logging.getLogger("openlineage.dbt")
+    logger.info(
+        "This wrapper is using --consume-structured-logs: will send OpenLineage "
+        "events while the models are executing."
+    )
+    job_namespace = os.environ.get("OPENLINEAGE_NAMESPACE", "dbt")
+    dbt_command_line = remove_command_line_option(args, CONSUME_STRUCTURED_LOGS_COMMAND_OPTION)
+    if not dbt_command_line or dbt_command_line[0] != "dbt":
+        dbt_command_line = ["dbt"] + dbt_command_line
+    processor = DbtStructuredLogsProcessor(
+        project_dir=project_dir,
+        dbt_command_line=dbt_command_line,
+        producer=PRODUCER,
+        target=target,
+        target_path=target_path,
+        job_namespace=job_namespace,
+        openlineage_job_name=openlineage_job_name,
+        profile_name=profile_name,
+        logger=logger,
+        models=models,
+        selector=model_selector,
+    )
+    logger.info("dbt-ol will read logs from %s", processor.dbt_log_file_path)
+    return emit_live_events(processor, logger, project_dir)
+
+
+def consume_otel(
+    args: list[str],
+    target: str,
+    target_path: str | None,
+    project_dir: str,
+    profile_name: str,
+    model_selector: str,
+    models: list[str],
+    openlineage_job_name: str | None = None,
+    skip_parse: bool = False,
+    dbt_version: str | None = None,
+):
+    """Run dbt Core v2 and emit live lineage from its OpenTelemetry output."""
+    logger = logging.getLogger("openlineage.dbt")
+    logger.info(
+        "dbt Core %s detected: will send OpenLineage events while the models are executing.",
+        dbt_version or "v2",
+    )
+    dbt_command_line = ["dbt", *args]
+    try:
+        processor = DbtOtelProcessor(
+            project_dir=project_dir,
+            dbt_command_line=dbt_command_line,
+            producer=PRODUCER,
+            target=target,
+            target_path=target_path,
+            job_namespace=os.environ.get("OPENLINEAGE_NAMESPACE", "dbt"),
+            openlineage_job_name=openlineage_job_name,
+            profile_name=profile_name,
+            logger=logger,
+            models=models,
+            selector=model_selector,
+            skip_parse=skip_parse,
+            dbt_version=dbt_version,
+        )
+    except Exception:
+        # A missing or unreadable dbt_project.yml, or one without a profile, must not keep dbt from running.
+        logger.exception("OpenLineage could not read the dbt project; running dbt without OpenLineage events")
+        return run_dbt_untouched(dbt_command_line, logger)
+    try:
+        return emit_live_events(processor, logger, project_dir)
+    except KeyboardInterrupt:
+        # A second Ctrl-C: dbt was killed, and the runs still open get no final event.
+        logger.warning("dbt-ol stopped without waiting for dbt to exit")
+        return 128 + signal.SIGINT
+
+
+def emit_live_events(processor: DbtLiveProcessor, logger: logging.Logger, project_dir: str = "./") -> int:
+    """Run dbt through the processor, emit each event as it comes, and return dbt's exit code."""
+    client = OpenLineageClient(source_code_location_dir=project_dir)
+    emitted_events = 0
+    events = processor.parse()
+    try:
+        for event in events:
+            try:
+                client.emit(event)
+                emitted_events += 1
+                if emitted_events % 50 == 0:
+                    logger.debug("Processed %d events", emitted_events)
+            except Exception as e:
+                logger.warning(
+                    "OpenLineage client failed to emit event %s runId %s. Exception: %s",
+                    event.eventType.value,
+                    event.run.runId,
+                    e,
+                    exc_info=True,
+                )
+    except UnsupportedDbtCommand as e:
+        logger.error(e)
+    except Exception:
+        logger.exception(
+            "OpenLineage failed to process dbt execution. This does not make dbt execution "
+            "fail, however, data might not end up in your configured lineage backend."
+        )
+    finally:
+        try:
+            # Runs the processor's cleanup now, also when an interrupt arrives while an event is being sent.
+            events.close()
+        finally:
+            # Will wait for async events to be sent if async config is enabled
+            logger.debug("Waiting for events to be sent.")
+            client.close(timeout=30)
+
+    logger.info("Emitted %d OpenLineage events", emitted_events)
+    return_code = processor.dbt_command_return_code
+    if return_code is None:
+        logger.warning("dbt was not executed by OpenLineage, running it without emitting OpenLineage events.")
+        return_code = run_dbt_untouched(processor.dbt_command_line, logger)
+    logger.info("Underlying dbt execution returned %d", return_code)
+    return return_code
+
+
+def consume_local_artifacts(
+    args: list[str],
+    target: str,
+    target_path: str | None,
+    project_dir: str,
+    profile_name: str,
+    model_selector: str,
+    models: list[str],
+    openlineage_job_name: str | None = None,
+):
+    """Emit saved artifact lineage, running dbt first unless send-events was requested."""
+    logger = logging.getLogger("openlineage.dbt")
+    logger.info("This wrapper will send OpenLineage events at the end of dbt execution.")
+    job_namespace = os.environ.get("OPENLINEAGE_NAMESPACE", "dbt")
+    # We can get this if we have been orchestrated by an external system like airflow.
+    # get_parent_run_metadata() reads OPENLINEAGE_CONTEXT first and only then the legacy
+    # OPENLINEAGE_PARENT_ID, so it must not be gated on the legacy variable being set.
+    parent_run_metadata = get_parent_run_metadata()
+    client = OpenLineageClient(source_code_location_dir=project_dir)
+
+    processor = DbtLocalArtifactProcessor(
+        producer=PRODUCER,
+        target=target,
+        target_path=target_path,
+        job_namespace=job_namespace,
+        project_dir=project_dir,
+        profile_name=profile_name,
+        logger=logger,
+        models=models,
+        selector=model_selector,
+        openlineage_job_name=openlineage_job_name,
+    )
+
+    # Always emit "wrapping event" around dbt run. This indicates start of dbt execution, since
+    # both the start and complete events for dbt models won't get emitted until end of execution.
+    start_event = dbt_run_event_start(
+        job_name=processor.job_name,
+        job_namespace=job_namespace,
+        parent_run_metadata=parent_run_metadata,
+    )
+
+    # Carry the root parent through to per-node events so backends can stitch the full
+    # orchestrator → dbt-run → node chain. Without this, child events get root=None.
+    # All three root fields must be present together; partial data falls back to the
+    # immediate parent to avoid mixing fields from different runs/jobs.
+    if parent_run_metadata:
+        root_all_present = (
+            parent_run_metadata.root_parent_run_id
+            and parent_run_metadata.root_parent_job_name
+            and parent_run_metadata.root_parent_job_namespace
+        )
+        if root_all_present:
+            root_parent_run_id = parent_run_metadata.root_parent_run_id
+            root_parent_job_name = parent_run_metadata.root_parent_job_name
+            root_parent_job_namespace = parent_run_metadata.root_parent_job_namespace
+        else:
+            root_parent_run_id = parent_run_metadata.run_id
+            root_parent_job_name = parent_run_metadata.job_name
+            root_parent_job_namespace = parent_run_metadata.job_namespace
+    else:
+        root_parent_run_id = start_event.run.runId
+        root_parent_job_name = start_event.job.name
+        root_parent_job_namespace = start_event.job.namespace
+
+    dbt_run_metadata = ParentRunMetadata(
+        run_id=start_event.run.runId,
+        job_name=start_event.job.name,
+        job_namespace=start_event.job.namespace,
+        root_parent_run_id=root_parent_run_id,
+        root_parent_job_name=root_parent_job_name,
+        root_parent_job_namespace=root_parent_job_namespace,
+    )
+    # Set parent run metadata to use it as parent run facet
+    processor.dbt_run_metadata = dbt_run_metadata
+
+    pre_run_time = time.time()
+    # Execute dbt in external process
+
+    force_send_events = (len(args) > 0 and args[0] == "send-events") or (
+        len(args) > 1 and args[1] == "send-events"
+    )
+    if not force_send_events:
+        with subprocess.Popen(["dbt"] + args, stdout=sys.stdout, stderr=sys.stderr) as process:
+            return_code = process.wait()
+    else:
+        logger.warning("Sending events for the last run without running the job")
+        return_code = 0
+
+    # If run_result has modification time before dbt command
+    # or does not exist, do not emit dbt events.
+    try:
+        if os.stat(processor.run_result_path).st_mtime < pre_run_time and not force_send_events:
+            logger.info(
+                "OpenLineage events not emitted: run_result file (%s) was not modified by dbt",
+                processor.run_result_path,
+            )
+            return return_code
+    except FileNotFoundError:
+        logger.info(
+            "OpenLineage events not emitted: did not find run_result file (%s)", processor.run_result_path
+        )
+        return return_code
+
+    try:
+        events = processor.parse().events()
+    except UnsupportedDbtCommand as e:
+        # log exception message
+        logger.info(e)
+        events = []
+
+    if return_code == 0:
+        terminal_event = dbt_run_event_end(
+            run_id=dbt_run_metadata.run_id,
+            job_namespace=dbt_run_metadata.job_namespace,
+            job_name=dbt_run_metadata.job_name,
+            parent_run_metadata=parent_run_metadata,
+        )
+    else:
+        terminal_event = dbt_run_event_failed(
+            run_id=dbt_run_metadata.run_id,
+            job_namespace=dbt_run_metadata.job_namespace,
+            job_name=dbt_run_metadata.job_name,
+            parent_run_metadata=parent_run_metadata,
+        )
+
+    if events:
+        # Pass some run facets from extracted dbt events to wrapping start and stop events
+        event = events[0]
+        if "dbt_version" in event.run.facets:
+            start_event.run.facets["dbt_version"] = event.run.facets["dbt_version"]  # type: ignore[index]
+            terminal_event.run.facets["dbt_version"] = event.run.facets["dbt_version"]  # type: ignore[index]
+
+        if "processing_engine" in event.run.facets:
+            start_event.run.facets["processing_engine"] = event.run.facets["processing_engine"]  # type: ignore[index]
+            terminal_event.run.facets["processing_engine"] = event.run.facets["processing_engine"]  # type: ignore[index]
+
+        if "dbt_run" in event.run.facets:
+            start_event.run.facets["dbt_run"] = event.run.facets["dbt_run"]  # type: ignore[index]
+            terminal_event.run.facets["dbt_run"] = event.run.facets["dbt_run"]  # type: ignore[index]
+
+    emitted_events = 0
+    all_events = [start_event, *events, terminal_event]
+    for event in tqdm(
+        all_events,
+        desc="Emitting OpenLineage events",
+    ):
+        try:
+            client.emit(event)
+            emitted_events += 1
+        except Exception as e:
+            logger.warning(
+                "OpenLineage client failed to emit event %s runId %s. Exception: %s",
+                event.eventType.value,
+                event.run.runId,
+                e,
+                exc_info=True,
+            )
+    client.close(timeout=30)
+    logger.info("Emitted %d OpenLineage events", emitted_events)
+    logger.info("Underlying dbt execution returned %d", return_code)
+    return return_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

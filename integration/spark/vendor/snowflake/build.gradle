@@ -1,0 +1,73 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+plugins {
+    id("java-library")
+    id("com.diffplug.spotless")
+    id("io.freefair.lombok")
+    id("io.openlineage.common-config")
+}
+
+ext {
+    assertjVersion = '3.27.7'
+    junit5Version = '5.14.4'
+    snowflakeVersion = '2.13.0'
+    mockitoVersion = '4.11.0'
+    lombokVersion = '1.18.30'
+    micrometerVersion = '1.17.1'
+
+    snowflakeLookup = [
+            '2.4.8': '2.9.3',
+            '3.1.3': '2.11.0',
+            '3.2.4': '2.11.0',
+            '3.3.4': '2.11.0',
+            '3.4.4': '2.15.0'
+    ]
+
+    sparkProp = project.findProperty('spark.version').toString()
+    // because snowflake doesn't have a 3.5.0 connector yet
+    spark = (sparkProp == "3.5.6" || sparkProp.toString().startsWith("4")) ? "3.4.4" : sparkProp
+
+    series = spark.substring(0, 3)
+    scala = project.findProperty('scala.binary.version').toString()
+    scalaFmt = scala.replace(".", "")
+
+    snowflakeVersion = snowflakeLookup[spark]
+
+    activeRuntimeElementsConfiguration = "scala${scalaFmt}RuntimeElements"
+}
+
+dependencies {
+    implementation(project(path: ":shared"))
+    implementation(project(path: ":shared", configuration: activeRuntimeElementsConfiguration))
+    implementation("io.openlineage:openlineage-sql-java:${project.version}")
+
+    compileOnly("org.apache.spark:spark-sql_${scala}:${spark}")
+
+    compileOnly("net.snowflake:spark-snowflake_${scala}:${snowflakeVersion}-spark_${series}") {
+        exclude group: "com.google.guava:guava"
+        exclude group: "org.apache.spark:spark-core_${scala}"
+        exclude group: "org.apache.spark:spark-sql_${scala}"
+        exclude group: "org.apache.spark:spark-catalyst_${scala}"
+    }
+
+    testImplementation(project(path: ":spark3"))
+    testImplementation(platform("org.junit:junit-bom:${junit5Version}"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testImplementation("org.junit.jupiter:junit-jupiter-params")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation("io.micrometer:micrometer-core:${micrometerVersion}")
+    testImplementation("org.assertj:assertj-core:${assertjVersion}")
+    testImplementation("org.mockito:mockito-core:${mockitoVersion}")
+    testImplementation("org.mockito:mockito-inline:${mockitoVersion}")
+    testImplementation("org.mockito:mockito-junit-jupiter:${mockitoVersion}")
+    testImplementation("org.apache.spark:spark-sql_${scala}:${spark}")
+    testImplementation("net.snowflake:spark-snowflake_${scala}:${snowflakeVersion}-spark_${series}") {
+        exclude group: "com.google.guava:guava"
+        exclude group: "org.apache.spark:spark-core_${scala}"
+        exclude group: "org.apache.spark:spark-sql_${scala}"
+        exclude group: "org.apache.spark:spark-catalyst_${scala}"
+    }
+}

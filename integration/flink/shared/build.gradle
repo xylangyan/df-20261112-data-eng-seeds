@@ -1,0 +1,154 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+import io.franzbecker.gradle.lombok.task.DelombokTask
+
+plugins {
+    id 'java-library'
+    id 'jacoco'
+    id 'pmd'
+    id 'com.adarshr.test-logger'
+    id 'com.diffplug.spotless'
+    id 'com.github.johnrengelman.shadow'
+    id 'io.franzbecker.gradle-lombok'
+    id 'io.openlineage.common-config'
+    id "com.google.protobuf" version "0.10.0"
+}
+
+configurations {
+    lombok
+}
+
+group 'io.openlineage.flink'
+
+task sourceJar(type: Jar) {
+    archiveClassifier = 'sources'
+    from sourceSets.main.allJava
+}
+
+task javadocJar(type: Jar, dependsOn: javadoc) {
+    archiveClassifier = 'javadoc'
+    from javadoc.destinationDir
+}
+
+task delombok(type: DelombokTask, dependsOn: compileJava) {
+    ext.outputDir = file("$buildDir/delombok")
+    outputs.dir(outputDir)
+    sourceSets.main.java.srcDirs.each {
+        if (it.name =~ "/proto/") {
+            inputs.dir(it)
+        }
+        args(it, "-d", outputDir)
+    }
+    doFirst {
+        outputDir.deleteDir()
+    }
+}
+
+javadoc {
+    dependsOn delombok
+    source = delombok.outputDir
+    options.tags = [ "apiNote" ]
+}
+
+def commonTestConfiguration = {
+    classpath =  project.sourceSets.test.runtimeClasspath
+}
+
+test {
+    configure commonTestConfiguration
+    useJUnitPlatform {
+        excludeTags 'integration-test'
+    }
+}
+
+ext {
+    flinkVersion = project.getProperty('flink.shared.version')
+    flinkVersionShort = flinkVersion.substring(0,4)
+    assertjVersion = '3.27.7'
+    junit5Version = '5.14.4'
+    lombokVersion = '1.18.48'
+    mockitoVersion = '5.2.0'
+    testcontainersVersion = '1.21.4'
+    isReleaseVersion = !version.endsWith('SNAPSHOT')
+    icebergVersion = "1.3.0"
+    micrometerVersion = "1.17.2"
+
+    versionsMap = [
+            "1.15": ["cassandra": "1.15.4", "kafka": flinkVersion, "jdbc": "1.15.4", "iceberg": "1.3.0", "alternativeShort": "1.15"],
+            "1.16": ["cassandra": "3.0.0-1.16", "kafka": flinkVersion, "jdbc": "1.16.3", "iceberg": "1.3.0", "alternativeShort": "1.16"],
+            "1.17": ["cassandra": "3.1.0-1.17", "kafka": flinkVersion, "jdbc": "3.1.1-1.17", "iceberg": "1.3.0", "alternativeShort": "1.17"],
+            "1.18": ["cassandra": "3.1.0-1.17", "kafka": "3.0.2-1.18", "jdbc": "3.1.2-1.18", "iceberg": "1.5.0", "alternativeShort": "1.18"],
+            "1.19": ["cassandra": "3.1.0-1.17", "kafka": "3.0.2-1.18", "jdbc": "3.1.2-1.18", "iceberg": "1.5.0", "alternativeShort": "1.18"]
+    ]
+
+    versions = versionsMap[flinkVersionShort]
+}
+
+dependencies {
+    api "io.openlineage:openlineage-java:${project.version}"
+    api "io.openlineage:openlineage-sql-java:${project.version}"
+
+    compileOnly "io.micrometer:micrometer-core:${micrometerVersion}"
+    compileOnly "org.projectlombok:lombok:${lombokVersion}"
+    compileOnly "org.apache.flink:flink-java:$flinkVersion"
+    compileOnly "org.apache.flink:flink-streaming-java:$flinkVersion"
+    compileOnly "org.apache.flink:flink-runtime-web:$flinkVersion"
+    compileOnly "org.apache.flink:flink-table-common:$flinkVersion"
+    compileOnly "org.apache.flink:flink-connector-base:$flinkVersion"
+    compileOnly "org.apache.flink:flink-connector-kafka:${versions.kafka}"
+    compileOnly "org.apache.flink:flink-connector-cassandra_2.12:${versions.cassandra}"
+    compileOnly "org.apache.flink:flink-avro:$flinkVersion"
+    compileOnly "org.apache.flink:flink-avro-confluent-registry:$flinkVersion"
+    compileOnly "org.apache.iceberg:iceberg-flink-runtime-${versions.alternativeShort}:${versions.iceberg}"
+    compileOnly "org.apache.flink:flink-connector-jdbc:${versions.jdbc}"
+    compileOnly "com.google.protobuf:protobuf-java:3.25.3"
+
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+
+    implementation 'org.javassist:javassist:3.33.0-GA'
+    implementation 'org.apache.httpcomponents.client5:httpclient5:5.6.5'
+
+    testImplementation "org.apache.flink:flink-java:$flinkVersion"
+    testImplementation "org.apache.flink:flink-streaming-java:$flinkVersion"
+    testImplementation "org.apache.flink:flink-runtime-web:$flinkVersion"
+    testImplementation "org.apache.flink:flink-connector-base:$flinkVersion"
+    testImplementation "org.apache.flink:flink-connector-kafka:${versions.kafka}"
+    testImplementation "org.apache.flink:flink-connector-cassandra_2.12:${versions.cassandra}"
+    testImplementation "org.apache.flink:flink-connector-jdbc:${versions.jdbc}"
+    testImplementation "org.apache.flink:flink-table-common:$flinkVersion"
+    testImplementation "org.apache.flink:flink-avro:$flinkVersion"
+    testImplementation "org.apache.flink:flink-avro-confluent-registry:$flinkVersion"
+    testImplementation "org.apache.iceberg:iceberg-flink-runtime-${versions.alternativeShort}:${versions.iceberg}"
+    testImplementation platform('org.junit:junit-bom:5.14.4')
+    testImplementation 'org.hamcrest:hamcrest-library:2.2'
+    testImplementation "org.testcontainers:mockserver:${testcontainersVersion}"
+    testImplementation "org.testcontainers:junit-jupiter:${testcontainersVersion}"
+    testImplementation 'org.mock-server:mockserver-client-java:5.15.0'
+    testImplementation group: 'org.awaitility', name: 'awaitility', version: '4.3.0'
+    testImplementation 'com.github.tomakehurst:wiremock:3.0.1'
+    testImplementation 'org.apache.logging.log4j:log4j-slf4j-impl:2.26.1'
+    testImplementation "io.micrometer:micrometer-core:${micrometerVersion}"
+
+    testImplementation "org.assertj:assertj-core:${assertjVersion}"
+    testImplementation "org.junit.jupiter:junit-jupiter:${junit5Version}"
+    testImplementation "org.junit.jupiter:junit-jupiter-params:${junit5Version}"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    testImplementation "org.mockito:mockito-core:${mockitoVersion}"
+    testImplementation "org.mockito:mockito-inline:${mockitoVersion}"
+    testImplementation "org.mockito:mockito-junit-jupiter:${mockitoVersion}"
+    testImplementation "org.projectlombok:lombok:${lombokVersion}"
+    testImplementation "com.google.protobuf:protobuf-java:3.25.3"
+    testImplementation("org.slf4j:slf4j-api:2.0.20")
+    testImplementation("org.slf4j:slf4j-simple:2.0.20")
+
+    testAnnotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:3.25.3"
+    }
+}

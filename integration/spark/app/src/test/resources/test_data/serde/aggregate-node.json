@@ -1,0 +1,19 @@
+{
+  "groupingExpressions": [],
+  "aggregateExpressions": [],
+  "allAttributes": {
+    "attrs": [
+      {
+        "name": "name",
+        "nullable": false,
+        "qualifier": [],
+        "deterministic": true,
+        "resolved": true
+      }
+    ]
+  },
+  "resolved": true,
+  "traceEnabled": false,
+  "streaming": false,
+  "canonicalizedPlan": false
+}

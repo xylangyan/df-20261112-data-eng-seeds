@@ -1,0 +1,164 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+import org.apache.tools.ant.filters.*
+
+
+plugins {
+    id 'java'
+    id 'java-library'
+    id 'signing'
+    id 'maven-publish'
+    id "com.github.johnrengelman.shadow" version "7.1.2"
+    id 'com.diffplug.spotless' version '6.11.0'
+    id 'io.github.gradle-nexus.publish-plugin' version '2.0.0'
+}
+
+group = "io.openlineage"
+
+repositories {
+    mavenLocal()
+    maven {
+        url = uri('https://repo.maven.apache.org/maven2/')
+    }
+    mavenCentral()
+}
+
+ext {
+    isReleaseVersion = !version.endsWith('SNAPSHOT')
+}
+
+dependencies {
+    implementation 'org.apache.commons:commons-lang3:3.18.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.9.0'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.9.0'
+}
+
+compileJava {
+    options.incremental = true
+    options.compilerArgs << '-parameters'
+    options.encoding = "UTF-8"
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+task sourceJar(type: Jar) {
+    archiveClassifier='sources'
+    from sourceSets.main.allJava
+}
+
+task javadocJar(type: Jar, dependsOn: javadoc) {
+    archiveClassifier='javadoc'
+    from javadoc.destinationDir
+}
+
+task getDependencies(type: Copy) {
+    from sourceSets.main.runtimeClasspath
+    exclude "**/*.dylib"
+    into 'build/dependencies'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = true
+    }
+    systemProperties = [
+        'junit.platform.output.capture.stdout': 'true',
+        'junit.platform.output.capture.stderr': 'true',
+    ]
+}
+
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            groupId = 'io.openlineage'
+            artifactId = 'openlineage-sql-java'
+
+            from components.java
+
+            artifact sourceJar
+            artifact javadocJar
+
+            pom {
+                name = 'openlineage-sql-java'
+                description = 'Java bindings to OpenLineage SQL parser'
+                url = 'https://github.com/OpenLineage/OpenLineage'
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'openlineage'
+                        name = 'OpenLineage Project'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:git://github.com/OpenLineage/OpenLineage.git'
+                    developerConnection = 'scm:git:ssh://github.com:OpenLineage/OpenLineage.git'
+                    url = 'https://github.com/OpenLineage/OpenLineage'
+                }
+            }
+        }
+    }
+}
+
+nexusPublishing {
+    repositories {
+        sonatype {
+            nexusUrl.set(uri("https://ossrh-staging-api.central.sonatype.com/service/local/"))
+            snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
+            username = System.getenv('RELEASE_USERNAME')
+            password = System.getenv('RELEASE_PASSWORD')
+        }
+    }
+}
+
+signing {
+    required { isReleaseVersion }
+    def signingKey = findProperty("signingKey")
+    def signingPassword = findProperty("signingPassword")
+    useInMemoryPgpKeys(signingKey, signingPassword)
+    sign publishing.publications.mavenJava
+}
+
+spotless {
+    def disallowWildcardImports = {
+        String text = it
+        def regex = ~/import .*\.\*;/
+        def m = regex.matcher(text)
+        if (m.find()) {
+            throw new AssertionError("Wildcard imports disallowed - ${m.findAll()}")
+        }
+    }
+    java {
+        googleJavaFormat()
+        removeUnusedImports()
+        custom 'disallowWildcardImports', disallowWildcardImports
+    }
+}
+
+shadowJar {
+    archiveClassifier = ''
+    manifest {
+        attributes(
+                'Created-By': "Gradle ${gradle.gradleVersion}",
+                'Built-By': System.getProperty('user.name'),
+                'Build-Jdk': System.getProperty('java.version'),
+                'Implementation-Title': project.name,
+                'Implementation-Version': project.version
+        )
+    }
+    zip64 true
+}
+
+assemble.dependsOn {
+    shadowJar
+}

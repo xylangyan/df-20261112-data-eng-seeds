@@ -1,0 +1,433 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark3.agent.lifecycle.plan.column;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.openlineage.client.dataset.namespace.resolver.DatasetNamespaceCombinedResolver;
+import io.openlineage.client.utils.DatasetIdentifier;
+import io.openlineage.spark.agent.lifecycle.SparkOpenLineageExtensionVisitorWrapper;
+import io.openlineage.spark.agent.lifecycle.plan.column.ColumnLevelLineageBuilder;
+import io.openlineage.spark.agent.lifecycle.plan.column.ColumnLevelLineageContext;
+import io.openlineage.spark.agent.util.JdbcSparkUtils;
+import io.openlineage.spark.agent.util.ScalaConversionUtils;
+import io.openlineage.spark.api.OpenLineageContext;
+import io.openlineage.spark.api.SparkOpenLineageConfig;
+import io.openlineage.spark3.agent.utils.DataSourceV2RelationDatasetExtractor;
+import io.openlineage.sql.ColumnLineage;
+import io.openlineage.sql.DbTableMeta;
+import io.openlineage.sql.SqlMeta;
+import java.net.URI;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Optional;
+import java.util.Properties;
+import lombok.SneakyThrows;
+import org.apache.hadoop.fs.Path;
+import org.apache.spark.scheduler.SparkListenerEvent;
+import org.apache.spark.sql.catalyst.catalog.CatalogTable;
+import org.apache.spark.sql.catalyst.catalog.HiveTableRelation;
+import org.apache.spark.sql.catalyst.expressions.AttributeReference;
+import org.apache.spark.sql.catalyst.expressions.ExprId;
+import org.apache.spark.sql.catalyst.expressions.NamedExpression;
+import org.apache.spark.sql.catalyst.plans.logical.CreateTableAsSelect;
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.Project;
+import org.apache.spark.sql.catalyst.plans.logical.ReplaceTableAsSelect;
+import org.apache.spark.sql.execution.datasources.HadoopFsRelation;
+import org.apache.spark.sql.execution.datasources.LogicalRelation;
+import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions;
+import org.apache.spark.sql.execution.datasources.jdbc.JDBCRelation;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation;
+import org.apache.spark.sql.sources.BaseRelation;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import scala.Option;
+import scala.collection.immutable.Seq;
+
+@SuppressWarnings("PMD.AvoidDuplicateLiterals")
+class InputFieldsCollectorTest {
+
+  private static final String FILE = "file";
+  private static final String SOME_NAME = "some-name";
+  ColumnLevelLineageBuilder builder = mock(ColumnLevelLineageBuilder.class);
+  ColumnLevelLineageContext context = mock(ColumnLevelLineageContext.class);
+  OpenLineageContext openLineageContext = mock(OpenLineageContext.class);
+  SparkOpenLineageExtensionVisitorWrapper wrapper =
+      mock(SparkOpenLineageExtensionVisitorWrapper.class);
+  SparkListenerEvent event = mock(SparkListenerEvent.class);
+  NamedExpression expression = mock(NamedExpression.class);
+  ExprId exprId = mock(ExprId.class);
+  DatasetIdentifier di = mock(DatasetIdentifier.class);
+  AttributeReference attributeReference = mock(AttributeReference.class);
+
+  @BeforeEach
+  void setup() {
+    when(context.getBuilder()).thenReturn(builder);
+    when(context.getOlContext()).thenReturn(openLineageContext);
+    when(context.getEvent()).thenReturn(event);
+    when(attributeReference.exprId()).thenReturn(exprId);
+    when(attributeReference.name()).thenReturn(SOME_NAME);
+    when(openLineageContext.getSparkExtensionVisitorWrapper()).thenReturn(wrapper);
+  }
+
+  @Test
+  void collectWhenGrandChildNodeIsDataSourceV2Relation() {
+    DataSourceV2Relation relation = mock(DataSourceV2Relation.class);
+    LogicalPlan plan = createPlanWithGrandChild(relation);
+
+    when(relation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+
+    try (MockedStatic mocked = mockStatic(DataSourceV2RelationDatasetExtractor.class)) {
+      when(DataSourceV2RelationDatasetExtractor.getDatasetIdentifierExtended(
+              context.getOlContext(), relation))
+          .thenReturn(Collections.singletonList(di));
+      InputFieldsCollector.collect(context, plan);
+    }
+    verify(builder, times(1)).addInput(exprId, di, SOME_NAME);
+  }
+
+  @Test
+  void collectFromQueryWhenCreateTableAsSelectHasNoChildren() {
+    DataSourceV2Relation relation = mockRelationWithOutput();
+    CreateTableAsSelect ctas = mock(CreateTableAsSelect.class);
+    when(ctas.children()).thenReturn(ScalaConversionUtils.asScalaSeqEmpty());
+    when(ctas.query()).thenReturn(relation);
+
+    collectWithDatasetIdentifier(ctas, relation);
+
+    verify(builder, times(1)).addInput(exprId, di, SOME_NAME);
+  }
+
+  @Test
+  void collectFromQueryWhenReplaceTableAsSelectHasNoChildren() {
+    DataSourceV2Relation relation = mockRelationWithOutput();
+    ReplaceTableAsSelect rtas = mock(ReplaceTableAsSelect.class);
+    when(rtas.children()).thenReturn(ScalaConversionUtils.asScalaSeqEmpty());
+    when(rtas.query()).thenReturn(relation);
+
+    collectWithDatasetIdentifier(rtas, relation);
+
+    verify(builder, times(1)).addInput(exprId, di, SOME_NAME);
+  }
+
+  private DataSourceV2Relation mockRelationWithOutput() {
+    DataSourceV2Relation relation = mock(DataSourceV2Relation.class);
+    when(relation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+    when(relation.children()).thenReturn(ScalaConversionUtils.asScalaSeqEmpty());
+    return relation;
+  }
+
+  private void collectWithDatasetIdentifier(LogicalPlan plan, DataSourceV2Relation relation) {
+    try (MockedStatic mocked = mockStatic(DataSourceV2RelationDatasetExtractor.class)) {
+      when(DataSourceV2RelationDatasetExtractor.getDatasetIdentifierExtended(
+              context.getOlContext(), relation))
+          .thenReturn(Collections.singletonList(di));
+      InputFieldsCollector.collect(context, plan);
+    }
+  }
+
+  @Test
+  void collectWhenGrandChildNodeIsDataSourceV2ScanRelation() {
+    DataSourceV2ScanRelation scanRelation = mock(DataSourceV2ScanRelation.class);
+    DataSourceV2Relation relation = mock(DataSourceV2Relation.class);
+    when(scanRelation.relation()).thenReturn(relation);
+
+    LogicalPlan plan = createPlanWithGrandChild(scanRelation);
+
+    when(scanRelation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+
+    try (MockedStatic mocked = mockStatic(DataSourceV2RelationDatasetExtractor.class)) {
+      when(DataSourceV2RelationDatasetExtractor.getDatasetIdentifierExtended(
+              context.getOlContext(), relation))
+          .thenReturn(Collections.singletonList(di));
+      InputFieldsCollector.collect(context, plan);
+    }
+    verify(builder, times(1)).addInput(exprId, di, SOME_NAME);
+  }
+
+  @Test
+  @SneakyThrows
+  void collectWhenGrandChildNodeIsHiveTableRelation() {
+    HiveTableRelation relation = mock(HiveTableRelation.class);
+    CatalogTable catalogTable = mock(CatalogTable.class);
+    URI uri = new URI("file:/tmp");
+    when(relation.tableMeta()).thenReturn(catalogTable);
+    when(catalogTable.location()).thenReturn(uri);
+
+    LogicalPlan plan = createPlanWithGrandChild(relation);
+
+    when(relation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+
+    InputFieldsCollector.collect(context, plan);
+    verify(builder, times(1)).addInput(exprId, new DatasetIdentifier("/tmp", FILE), SOME_NAME);
+  }
+
+  @Test
+  @SneakyThrows
+  void collectWhenGrandChildNodeIsLogicalRelation() {
+    LogicalRelation relation = mock(LogicalRelation.class);
+    CatalogTable catalogTable = mock(CatalogTable.class);
+    URI uri = new URI("file:/tmp");
+    when(relation.catalogTable()).thenReturn(Option.apply(catalogTable));
+    when(catalogTable.location()).thenReturn(uri);
+
+    LogicalPlan plan = createPlanWithGrandChild(relation);
+
+    when(relation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+
+    InputFieldsCollector.collect(context, plan);
+    verify(builder, times(1)).addInput(exprId, new DatasetIdentifier("/tmp", FILE), SOME_NAME);
+  }
+
+  @Test
+  @SneakyThrows
+  void collectWhenGrandChildNodeIsLogicalRelationAndCatalogTableNotDefined() {
+    LogicalRelation relation = mock(LogicalRelation.class);
+    when(relation.catalogTable()).thenReturn(Option.empty());
+
+    LogicalPlan plan = createPlanWithGrandChild(relation);
+
+    when(relation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+
+    InputFieldsCollector.collect(context, plan);
+    verify(builder, times(0)).addInput(any(), any(), any());
+  }
+
+  @Test
+  @SneakyThrows
+  void collectWhenGrandChildNodeIsLogicalRelationAndLocationIsEmpty() {
+    LogicalRelation relation = mock(LogicalRelation.class);
+    CatalogTable catalogTable = mock(CatalogTable.class);
+    when(relation.catalogTable()).thenReturn(Option.apply(catalogTable));
+    when(catalogTable.location()).thenReturn(null);
+
+    LogicalPlan plan = createPlanWithGrandChild(relation);
+
+    when(relation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+
+    InputFieldsCollector.collect(context, plan);
+    verify(builder, times(0)).addInput(any(), any(), any());
+  }
+
+  @Test
+  @SneakyThrows
+  void collectWhenGrandChildNodeIsHadoopRelation() {
+    LogicalRelation logicalRelation = mock(LogicalRelation.class);
+    when(logicalRelation.catalogTable()).thenReturn(Option.empty());
+    HadoopFsRelation relation = mock(HadoopFsRelation.class, RETURNS_DEEP_STUBS);
+    when(logicalRelation.relation()).thenReturn(relation);
+
+    Path p = new Path("abfss://tmp@storage.dfs.core.windows.net/path");
+    Seq<Path> expected_path_seq = ScalaConversionUtils.fromList(Collections.singletonList(p));
+
+    when(relation.location().rootPaths()).thenReturn(expected_path_seq);
+
+    LogicalPlan plan = createPlanWithGrandChild(logicalRelation);
+
+    when(logicalRelation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+
+    InputFieldsCollector.collect(context, plan);
+    verify(builder, times(1))
+        .addInput(
+            exprId,
+            new DatasetIdentifier("path", "abfss://tmp@storage.dfs.core.windows.net"),
+            SOME_NAME);
+  }
+
+  @Test
+  void collectWhenGrandChildNodeIsLineageRelation() {
+    LogicalRelation plan = mock(LogicalRelation.class);
+    BaseRelation grandChild = mock(BaseRelation.class);
+    when(plan.relation()).thenReturn(grandChild);
+    when(plan.catalogTable()).thenReturn(Option.empty());
+
+    when(wrapper.isDefinedAt(grandChild)).thenReturn(true);
+    when(wrapper.getLineageDatasetIdentifier(grandChild, event.getClass().getName()))
+        .thenReturn(di);
+    when(plan.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+    InputFieldsCollector.collect(context, plan);
+
+    verify(builder, times(1)).addInput(exprId, di, SOME_NAME);
+  }
+
+  private LogicalRelation createJdbcLogicalRelation(JDBCRelation jdbcRelation) {
+    LogicalRelation logicalRelation = mock(LogicalRelation.class);
+    when(logicalRelation.catalogTable()).thenReturn(Option.empty());
+    when(logicalRelation.relation()).thenReturn(jdbcRelation);
+    when(logicalRelation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(attributeReference))
+                .asScala()
+                .toSeq());
+    return logicalRelation;
+  }
+
+  private JDBCRelation createMockJdbcRelation() {
+    JDBCRelation jdbcRelation = mock(JDBCRelation.class);
+    JDBCOptions jdbcOptions = mock(JDBCOptions.class);
+    when(jdbcRelation.jdbcOptions()).thenReturn(jdbcOptions);
+    when(jdbcOptions.url()).thenReturn("jdbc:postgresql://localhost:5432/test");
+    when(jdbcOptions.asConnectionProperties()).thenReturn(new Properties());
+    return jdbcRelation;
+  }
+
+  /**
+   * Regression test for https://github.com/OpenLineage/OpenLineage/issues/4314.
+   *
+   * <p>When reading from JDBC with a column alias (e.g. {@code SELECT name AS namex FROM
+   * source_table}), Spark's output attributes carry the alias name {@code "namex"}. Before the fix,
+   * {@code extractInternalInputs()} iterated those attributes and added {@code "namex"} as a
+   * phantom input field. After the fix the call is skipped for JDBC nodes that already have SQL
+   * column lineage, so only the original column name {@code "name"} is recorded (by
+   * JdbcColumnLineageVisitor/SqlCollector).
+   */
+  @Test
+  void jdbcAliasColumnShouldNotAppearAsPhantomInputField() {
+    JDBCRelation jdbcRelation = createMockJdbcRelation();
+
+    // Spark exposes the alias "namex" as the output attribute, not the original column "name"
+    AttributeReference aliasedAttr = mock(AttributeReference.class);
+    when(aliasedAttr.exprId()).thenReturn(ExprId.apply(100));
+    when(aliasedAttr.name()).thenReturn("namex");
+
+    LogicalRelation logicalRelation = mock(LogicalRelation.class);
+    when(logicalRelation.catalogTable()).thenReturn(Option.empty());
+    when(logicalRelation.relation()).thenReturn(jdbcRelation);
+    when(logicalRelation.output())
+        .thenReturn(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(aliasedAttr))
+                .asScala()
+                .toSeq());
+
+    SqlMeta sqlMeta = mock(SqlMeta.class);
+    ColumnLineage columnLineage = mock(ColumnLineage.class);
+    when(sqlMeta.columnLineage()).thenReturn(Collections.singletonList(columnLineage));
+    when(sqlMeta.inTables())
+        .thenReturn(Collections.singletonList(new DbTableMeta(null, null, "source_table")));
+
+    when(context.getNamespaceResolver())
+        .thenReturn(new DatasetNamespaceCombinedResolver(new SparkOpenLineageConfig()));
+    when(openLineageContext.getOpenLineageConfig()).thenReturn(new SparkOpenLineageConfig());
+
+    LogicalPlan plan = createPlanWithGrandChild(logicalRelation);
+
+    try (MockedStatic<JdbcSparkUtils> mockedJdbcUtils = mockStatic(JdbcSparkUtils.class)) {
+      mockedJdbcUtils
+          .when(() -> JdbcSparkUtils.extractQueryFromSpark(jdbcRelation))
+          .thenReturn(Optional.of(sqlMeta));
+      mockedJdbcUtils
+          .when(() -> JdbcSparkUtils.getDatasetIdentifier(any(), any()))
+          .thenCallRealMethod();
+
+      InputFieldsCollector.collect(context, plan);
+    }
+
+    // "namex" must never appear as an input field — it is an alias, not a source column.
+    // Before the fix, extractInternalInputs() would add it from Spark's output attributes.
+    verify(builder, never()).addInput(any(), any(), eq("namex"));
+  }
+
+  @Test
+  void collectUsesInternalInputsForJdbcRelationWithoutSqlColumnLineage() {
+    JDBCRelation jdbcRelation = createMockJdbcRelation();
+    LogicalRelation logicalRelation = createJdbcLogicalRelation(jdbcRelation);
+
+    // SqlMeta with empty column lineage (e.g., simple table name, no subquery)
+    SqlMeta sqlMeta = mock(SqlMeta.class);
+    when(sqlMeta.columnLineage()).thenReturn(Collections.emptyList());
+    when(sqlMeta.inTables())
+        .thenReturn(Collections.singletonList(new DbTableMeta(null, null, "jdbc_source1")));
+
+    when(context.getNamespaceResolver())
+        .thenReturn(new DatasetNamespaceCombinedResolver(new SparkOpenLineageConfig()));
+    when(openLineageContext.getOpenLineageConfig()).thenReturn(new SparkOpenLineageConfig());
+
+    LogicalPlan plan = createPlanWithGrandChild(logicalRelation);
+
+    try (MockedStatic<JdbcSparkUtils> mockedJdbcUtils = mockStatic(JdbcSparkUtils.class)) {
+      mockedJdbcUtils
+          .when(() -> JdbcSparkUtils.extractQueryFromSpark(jdbcRelation))
+          .thenReturn(Optional.of(sqlMeta));
+      mockedJdbcUtils
+          .when(() -> JdbcSparkUtils.getDatasetIdentifier(any(), any()))
+          .thenCallRealMethod();
+
+      InputFieldsCollector.collect(context, plan);
+    }
+    // builder.addInput SHOULD be called because there's no SQL column lineage,
+    // so the normal extractInternalInputs path is used
+    verify(builder, times(1)).addInput(any(), any(), any());
+  }
+
+  private LogicalPlan createPlanWithGrandChild(LogicalPlan grandChild) {
+    LogicalPlan child =
+        new Project(
+            scala.collection.JavaConverters.collectionAsScalaIterableConverter(
+                    Arrays.asList(expression))
+                .asScala()
+                .toSeq(),
+            grandChild);
+    return new CreateTableAsSelect(null, null, null, child, null, null, false);
+  }
+}

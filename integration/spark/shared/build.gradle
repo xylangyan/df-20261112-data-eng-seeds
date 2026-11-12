@@ -1,0 +1,232 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+plugins {
+    id("java-library")
+    id("pmd")
+    id("com.diffplug.spotless")
+    id("io.freefair.lombok")
+    id("io.openlineage.common-config")
+    id("io.openlineage.scala-variants")
+    id("idea")
+    id("java-test-fixtures")
+}
+
+scalaVariants {
+    create("2.12")
+    create("2.13")
+}
+
+idea {
+    module {
+        testSources.from(sourceSets.testScala212.java.srcDirs, sourceSets.testScala213.java.srcDirs)
+    }
+}
+
+javadoc {
+    options.tags = ["apiNote"]
+}
+
+ext {
+    assertjVersion = "3.27.7"
+    awaitilityVersion = "4.3.0"
+    bigqueryVersion = "0.42.2"
+    databricksVersion = "0.1.5"
+    junit5Version = "5.14.4"
+    micrometerVersion = '1.17.1'
+    mockitoVersion = "4.11.0"
+    mockserverVersion = "5.14.0"
+    postgresqlVersion = "42.7.14"
+    sqlLiteVersion = "3.53.4.0"
+    testcontainersVersion = "1.19.3"
+    awsSdkVersion = '2.57.1'
+
+    sparkVersion = project.findProperty("shared.spark.version")
+    sparkSeries = sparkVersion.substring(0, 3)
+    scalaBinaryVersion = project.findProperty("scala.binary.version")
+}
+
+dependencies {
+    testImplementation(testFixtures(project(":test-commons")))
+    testScala212Implementation(testFixtures(project(":test-commons")))
+    testScala213Implementation(testFixtures(project(":test-commons")))
+
+    // Design time dependencies
+    api("io.openlineage:openlineage-java:${project.version}")
+    api("io.openlineage:openlineage-sql-java:${project.version}")
+    api("io.openlineage:spark-extension-entrypoint:1.0.0")
+
+    compileOnly("org.apache.spark:spark-hive_${scalaBinaryVersion}:${sparkVersion}")
+    compileOnly("org.apache.spark:spark-sql-kafka-0-10_${scalaBinaryVersion}:${sparkVersion}")
+    compileOnly("org.apache.spark:spark-sql_${scalaBinaryVersion}:${sparkVersion}")
+    compileOnly("org.apache.spark:spark-streaming_${scalaBinaryVersion}:${sparkVersion}")
+    compileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    compileOnly("com.databricks:databricks-dbutils-scala_${scalaBinaryVersion}:${databricksVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+    }
+    compileOnly("com.google.cloud.spark:spark-bigquery-with-dependencies_${scalaBinaryVersion}:${bigqueryVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.module")
+    }
+
+    implementation(platform("software.amazon.awssdk:bom:${awsSdkVersion}"))
+    implementation("software.amazon.awssdk:sts")
+    implementation("software.amazon.awssdk:url-connection-client")
+    scala212Implementation(platform("software.amazon.awssdk:bom:${awsSdkVersion}"))
+    scala212Implementation("software.amazon.awssdk:sts")
+    scala212Implementation("software.amazon.awssdk:url-connection-client")
+    scala213Implementation(platform("software.amazon.awssdk:bom:${awsSdkVersion}"))
+    scala213Implementation("software.amazon.awssdk:sts")
+    scala213Implementation("software.amazon.awssdk:url-connection-client")
+
+    // TODO: Convert these to testImplementation
+    testFixturesApi(platform("org.junit:junit-bom:${junit5Version}"))
+    testFixturesApi("org.junit.jupiter:junit-jupiter")
+    testFixturesApi("org.junit.jupiter:junit-jupiter-params")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testFixturesApi("org.junit-pioneer:junit-pioneer:1.9.1")
+    testFixturesApi("org.postgresql:postgresql:${postgresqlVersion}")
+    testFixturesApi("org.xerial:sqlite-jdbc:${sqlLiteVersion}")
+    testFixturesApi("org.mock-server:mockserver-client-java:${mockserverVersion}") {
+        exclude(group: "com.google.guava")
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.datatype")
+        exclude(group: "com.fasterxml.jackson.dataformat")
+    }
+    testFixturesApi("org.mock-server:mockserver-netty:${mockserverVersion}:shaded")
+    testFixturesApi("org.awaitility:awaitility:${awaitilityVersion}")
+    testFixturesApi("org.assertj:assertj-core:${assertjVersion}")
+    testFixturesApi("org.mockito:mockito-core:${mockitoVersion}")
+    testFixturesApi("org.mockito:mockito-inline:${mockitoVersion}")
+    testFixturesApi("org.mockito:mockito-junit-jupiter:${mockitoVersion}")
+    testFixturesApi("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    testFixturesApi("org.apache.spark:spark-hive_${scalaBinaryVersion}:${sparkVersion}")
+    testFixturesApi("org.apache.spark:spark-sql-kafka-0-10_${scalaBinaryVersion}:${sparkVersion}")
+    testFixturesApi("org.apache.spark:spark-sql_${scalaBinaryVersion}:${sparkVersion}")
+
+    testFixturesApi("com.databricks:databricks-dbutils-scala_${scalaBinaryVersion}:${databricksVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+    }
+    testFixturesApi("com.google.cloud.spark:spark-bigquery-with-dependencies_${scalaBinaryVersion}:${bigqueryVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.module")
+    }
+    testFixturesApi("io.openlineage:spark-extension-interfaces:${project.version}")
+
+    // Scala 2.12 dependencies
+    scala212Api("io.openlineage:openlineage-java:${project.version}")
+    scala212Api("io.openlineage:openlineage-sql-java:${project.version}")
+    scala212Api("io.openlineage:spark-extension-entrypoint:1.0.0")
+
+    scala212CompileOnly("org.apache.spark:spark-hive_2.12:${sparkVersion}")
+    scala212CompileOnly("org.apache.spark:spark-sql-kafka-0-10_2.12:${sparkVersion}")
+    scala212CompileOnly("org.apache.spark:spark-sql_2.12:${sparkVersion}")
+    scala212CompileOnly("org.apache.spark:spark-streaming_2.12:${sparkVersion}")
+    scala212CompileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    scala212CompileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    scala212CompileOnly("com.databricks:databricks-dbutils-scala_2.12:${databricksVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+    }
+    scala212CompileOnly("com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:${bigqueryVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.module")
+    }
+
+    testScala212Implementation("org.apache.spark:spark-hive_2.12:${sparkVersion}")
+    testScala212Implementation("org.apache.spark:spark-sql-kafka-0-10_2.12:${sparkVersion}")
+    testScala212Implementation("org.apache.spark:spark-sql_2.12:${sparkVersion}")
+    testScala212Implementation("org.apache.spark:spark-streaming_2.12:${sparkVersion}")
+
+    testScala212Implementation("com.databricks:databricks-dbutils-scala_2.12:${databricksVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+    }
+    testScala212Implementation("com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:${bigqueryVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.module")
+    }
+
+    testScala212Implementation("org.assertj:assertj-core:${assertjVersion}")
+    testScala212Implementation("org.awaitility:awaitility:${awaitilityVersion}")
+    testScala212Implementation(platform("org.junit:junit-bom:${junit5Version}"))
+    testScala212Implementation("org.junit.jupiter:junit-jupiter")
+    testScala212Implementation("org.junit.jupiter:junit-jupiter-params")
+    testScala212RuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testScala212Implementation("org.junit-pioneer:junit-pioneer:1.9.1")
+    testScala212Implementation("io.micrometer:micrometer-core:${micrometerVersion}")
+    testScala212Implementation("org.mockito:mockito-core:${mockitoVersion}")
+    testScala212Implementation("org.mockito:mockito-inline:${mockitoVersion}")
+    testScala212Implementation("org.mockito:mockito-junit-jupiter:${mockitoVersion}")
+    testScala212Implementation("org.mock-server:mockserver-client-java:${mockserverVersion}") {
+        exclude(group: "com.google.guava", module: "guava")
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.datatype")
+        exclude(group: "com.fasterxml.jackson.dataformat")
+    }
+    testScala212Implementation("org.mock-server:mockserver-netty:${mockserverVersion}:shaded")
+    testScala212Implementation("org.postgresql:postgresql:${postgresqlVersion}")
+    testScala212Implementation("org.xerial:sqlite-jdbc:${sqlLiteVersion}")
+    testScala212Implementation("io.openlineage:spark-extension-interfaces:${project.version}")
+
+    // Scala 2.13 dependencies
+    scala213Api("io.openlineage:openlineage-java:${project.version}")
+    scala213Api("io.openlineage:openlineage-sql-java:${project.version}")
+    scala213Api(("io.micrometer:micrometer-core:${micrometerVersion}"))
+    scala213Api("io.openlineage:spark-extension-entrypoint:1.0.0")
+
+    scala213CompileOnly("org.apache.spark:spark-hive_2.13:${sparkVersion}")
+    scala213CompileOnly("org.apache.spark:spark-sql-kafka-0-10_2.13:${sparkVersion}")
+    scala213CompileOnly("org.apache.spark:spark-sql_2.13:${sparkVersion}")
+    scala213CompileOnly("org.apache.spark:spark-streaming_2.13:${sparkVersion}")
+    scala213CompileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    scala213CompileOnly("io.micrometer:micrometer-core:${micrometerVersion}")
+
+    scala213CompileOnly("com.databricks:databricks-dbutils-scala_2.13:${databricksVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+    }
+    scala213CompileOnly("com.google.cloud.spark:spark-bigquery-with-dependencies_2.13:${bigqueryVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.module")
+    }
+
+    testScala213Implementation("org.apache.spark:spark-hive_2.13:${sparkVersion}")
+    testScala213Implementation("org.apache.spark:spark-sql-kafka-0-10_2.13:${sparkVersion}")
+    testScala213Implementation("org.apache.spark:spark-sql_2.13:${sparkVersion}")
+    testScala213Implementation("org.apache.spark:spark-streaming_2.13:${sparkVersion}")
+
+    testScala213Implementation("com.databricks:databricks-dbutils-scala_2.13:${databricksVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+    }
+    testScala213Implementation("com.google.cloud.spark:spark-bigquery-with-dependencies_2.13:${bigqueryVersion}") {
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.module")
+    }
+
+    testScala213Implementation("org.assertj:assertj-core:${assertjVersion}")
+    testScala213Implementation("org.awaitility:awaitility:${awaitilityVersion}")
+    testScala213Implementation(platform("org.junit:junit-bom:${junit5Version}"))
+    testScala213Implementation("org.junit.jupiter:junit-jupiter")
+    testScala213Implementation("org.junit.jupiter:junit-jupiter-params")
+    testScala213RuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testScala213Implementation("org.junit-pioneer:junit-pioneer:1.9.1")
+    testScala212Implementation("io.micrometer:micrometer-core:${micrometerVersion}")
+    testScala213Implementation("org.mockito:mockito-core:${mockitoVersion}")
+    testScala213Implementation("org.mockito:mockito-inline:${mockitoVersion}")
+    testScala213Implementation("org.mockito:mockito-junit-jupiter:${mockitoVersion}")
+    testScala213Implementation("org.mock-server:mockserver-client-java:${mockserverVersion}") {
+        exclude(group: "com.google.guava", module: "guava")
+        exclude(group: "com.fasterxml.jackson.core")
+        exclude(group: "com.fasterxml.jackson.datatype")
+        exclude(group: "com.fasterxml.jackson.dataformat")
+    }
+    testScala213Implementation("org.mock-server:mockserver-netty:${mockserverVersion}:shaded")
+    testScala213Implementation("org.postgresql:postgresql:${postgresqlVersion}")
+    testScala213Implementation("org.xerial:sqlite-jdbc:${sqlLiteVersion}")
+    testScala213Implementation("io.openlineage:spark-extension-interfaces:${project.version}")
+}

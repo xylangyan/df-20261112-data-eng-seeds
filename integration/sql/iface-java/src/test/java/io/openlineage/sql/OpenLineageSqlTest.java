@@ -1,0 +1,340 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.sql;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+import org.apache.commons.lang3.tuple.Pair;
+import org.junit.jupiter.api.Test;
+
+class OpenLineageSqlTest {
+  @Test
+  void inlineAggregateFilter() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Arrays.asList("SELECT COUNT(* WHERE status = 'paid') AS paid_orders FROM orders"))
+            .get();
+    assertEquals(
+        Arrays.asList(columnLineage("paid_orders", "orders", "status")), output.columnLineage());
+    assertEquals(Collections.emptyList(), output.errors());
+  }
+
+  @Test
+  void unsupportedPipeQuery() {
+    assertFalse(
+        OpenLineageSql.parse(
+                Arrays.asList(
+                    "FROM orders |> JOIN customers ON orders.customer_id = customers.id |> SELECT orders.id"),
+                "databricks")
+            .isPresent());
+  }
+
+  /** MySQL joined UPDATE reads the joined table and writes only the target. */
+  @Test
+  void mysqlUpdateJoin() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Collections.singletonList(
+                    "UPDATE inventory i JOIN new_arrivals n ON i.product = n.product "
+                        + "SET i.quantity = i.quantity + n.quantity"),
+                "mysql")
+            .get();
+    assertEquals(Collections.emptyList(), output.errors());
+    assertEquals(
+        Collections.singletonList(new DbTableMeta(null, null, "new_arrivals")), output.inTables());
+    assertEquals(
+        Collections.singletonList(new DbTableMeta(null, null, "inventory")), output.outTables());
+  }
+
+  @Test
+  void basicParse() {
+    SqlMeta output = OpenLineageSql.parse(Arrays.asList("SELECT * FROM test")).get();
+    assertEquals(
+        output,
+        new SqlMeta(
+            Arrays.asList(new DbTableMeta(null, null, "test")),
+            new ArrayList<DbTableMeta>(),
+            Collections.emptyList(),
+            Collections.emptyList()));
+  }
+
+  @Test
+  void parseWithDialect() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Arrays.asList(
+                    "SELECT * FROM `random-project`.`dbt_test1`.`source_table` WHERE id = 1"),
+                "bigquery")
+            .get();
+    assertEquals(
+        output,
+        new SqlMeta(
+            Arrays.asList(
+                new DbTableMeta(
+                    "random-project", "dbt_test1", "source_table", new QuoteStyle("`", "`", "`"))),
+            new ArrayList<DbTableMeta>(),
+            Collections.emptyList(),
+            Collections.emptyList()));
+  }
+
+  @Test
+  void parseWithDefaultDatabaseAndSchema() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Collections.singletonList("INSERT INTO target SELECT src.id FROM source src"),
+                "postgres",
+                ParseOptions.builder().defaultSchema("public").defaultDatabase("mydb").build())
+            .get();
+    DbTableMeta source = new DbTableMeta("mydb", "public", "source");
+    DbTableMeta target = new DbTableMeta("mydb", "public", "target");
+    assertEquals(Collections.singletonList(source), output.inTables());
+    assertEquals(Collections.singletonList(target), output.outTables());
+    assertEquals(
+        Collections.singletonList(
+            new ColumnLineage(
+                new ColumnMeta(null, "id"),
+                Collections.singletonList(new ColumnMeta(source, "id")))),
+        output.columnLineage());
+    assertEquals(Collections.emptyList(), output.errors());
+  }
+
+  @Test
+  void explicitDatabaseOverridesDefault() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Collections.singletonList("SELECT id FROM \"OtherDB\".\"OtherSchema\".customers"),
+                "postgres",
+                ParseOptions.builder().defaultSchema("public").defaultDatabase("mydb").build())
+            .get();
+    DbTableMeta source = output.inTables().get(0);
+    assertEquals("OtherDB", source.database());
+    assertEquals("OtherSchema", source.schema());
+    assertEquals(source, output.columnLineage().get(0).lineage().get(0).origin().get());
+    assertEquals(Collections.emptyList(), output.errors());
+  }
+
+  @Test
+  void nullDefaultsPreserveExistingCalls() {
+    List<String> sql = Collections.singletonList("SELECT id FROM customers");
+    assertEquals(
+        OpenLineageSql.parse(sql, "postgres"),
+        OpenLineageSql.parse(sql, "postgres", ParseOptions.defaults()));
+    assertEquals(
+        OpenLineageSql.parse(sql), OpenLineageSql.parse(sql, null, ParseOptions.builder().build()));
+  }
+
+  @Test
+  void defaultDatabaseIsScopedToOneCall() {
+    List<String> sql = Collections.singletonList("SELECT id FROM customers");
+    SqlMeta first =
+        OpenLineageSql.parse(
+                sql,
+                "postgres",
+                ParseOptions.builder().defaultSchema("public").defaultDatabase("first_db").build())
+            .get();
+    SqlMeta second =
+        OpenLineageSql.parse(
+                sql,
+                "postgres",
+                ParseOptions.builder().defaultSchema("public").defaultDatabase("second_db").build())
+            .get();
+    assertEquals("first_db", first.inTables().get(0).database());
+    assertEquals("second_db", second.inTables().get(0).database());
+    assertNull(OpenLineageSql.parse(sql, "postgres").get().inTables().get(0).database());
+  }
+
+  @Test
+  void parseOptionsBuilder() {
+    ParseOptions options =
+        ParseOptions.builder().defaultSchema("public").defaultDatabase("mydb").build();
+    assertEquals("public", options.defaultSchema());
+    assertEquals("mydb", options.defaultDatabase());
+    assertEquals(
+        options, ParseOptions.builder().defaultDatabase("mydb").defaultSchema("public").build());
+    assertNull(ParseOptions.defaults().defaultSchema());
+    assertNull(ParseOptions.defaults().defaultDatabase());
+    assertEquals(ParseOptions.defaults(), ParseOptions.builder().build());
+  }
+
+  @Test
+  void simpleColumnLevelLineage() {
+    SqlMeta output =
+        OpenLineageSql.parse(Arrays.asList("SELECT t1.a, b, c as x, d as y FROM table1 t1")).get();
+    assertEquals(
+        Arrays.asList(
+            columnLineage("a", "table1", "a"),
+            columnLineage("b", "table1", "b"),
+            columnLineage("x", "table1", "c"),
+            columnLineage("y", "table1", "d")),
+        output.columnLineage());
+  }
+
+  @Test
+  void columnLevelLineageJoinAndRename() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Arrays.asList(
+                    "SELECT t1.a as x, t2.b as y\n"
+                        + "FROM table1 t1\n"
+                        + "INNER JOIN table2 t2\n"
+                        + "ON t1.a = t2.a"))
+            .get();
+    assertEquals(
+        Arrays.asList(columnLineage("x", "table1", "a"), columnLineage("y", "table2", "b")),
+        output.columnLineage());
+  }
+
+  @Test
+  void columnLevelLineageRename() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Arrays.asList(
+                    "SELECT t1.a, t2.c as d\n"
+                        + "FROM table1 t1\n"
+                        + "INNER JOIN (SELECT t2.a, t2.b as c FROM table2 t2) t2"))
+            .get();
+    assertEquals(
+        Arrays.asList(columnLineage("a", "table1", "a"), columnLineage("d", "table2", "b")),
+        output.columnLineage());
+  }
+
+  @Test
+  void columnLevelLineageMultipleDependencies() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Arrays.asList("SELECT CASE WHEN a > b THEN c ELSE a END as d FROM table1\n"))
+            .get();
+    assertEquals(
+        Arrays.asList(
+            columnLineage(
+                "d",
+                Arrays.asList(
+                    Pair.of("table1", "a"), Pair.of("table1", "b"), Pair.of("table1", "c")))),
+        output.columnLineage());
+  }
+
+  @Test
+  void columnLevelLineageSimpleOperator() {
+    SqlMeta output =
+        OpenLineageSql.parse(Collections.singletonList("SELECT t1.a + b as c FROM table1 t1"))
+            .get();
+    assertEquals(
+        Arrays.asList(
+            columnLineage("c", Arrays.asList(Pair.of("table1", "a"), Pair.of("table1", "b")))),
+        output.columnLineage());
+  }
+
+  @Test
+  void columnLevelLineageCount() {
+    SqlMeta output =
+        OpenLineageSql.parse(Collections.singletonList("SELECT COUNT(t1.a) as b FROM table1 t1"))
+            .get();
+    assertEquals(Arrays.asList(columnLineage("b", "table1", "a")), output.columnLineage());
+  }
+
+  @Test
+  void columnLevelLineageWindow() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Collections.singletonList(
+                    "SELECT RANK() OVER (PARTITION BY i.a ORDER BY i.b DESC) AS c FROM table1 i"))
+            .get();
+    assertEquals(
+        Arrays.asList(
+            columnLineage("c", Arrays.asList(Pair.of("table1", "a"), Pair.of("table1", "b")))),
+        output.columnLineage());
+  }
+
+  @Test
+  void columnLevelLineageCte() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Collections.singletonList(
+                    ""
+                        + "WITH cte1 AS (\n"
+                        + "    SELECT col1, col2\n"
+                        + "    FROM table1\n"
+                        + "    WHERE col1 = 'value1'\n"
+                        + "), cte2 AS (\n"
+                        + "    SELECT col3, col4\n"
+                        + "    FROM table2\n"
+                        + "    WHERE col2 = 'value2'\n"
+                        + ")\n"
+                        + "SELECT cte1.col1, cte2.col3\n"
+                        + "FROM cte1\n"
+                        + "JOIN cte2 ON cte1.col2 = cte2.col4\n"))
+            .get();
+    assertEquals(
+        Arrays.asList(
+            columnLineage("col1", "table1", "col1"), columnLineage("col3", "table2", "col3")),
+        output.columnLineage());
+  }
+
+  @Test
+  void returnedError() {
+    SqlMeta output = OpenLineageSql.parse(Collections.singletonList("NOT A STATEMENT")).get();
+    assertEquals(1, output.errors().size());
+    assertEquals(
+        Collections.singletonList(
+            new ExtractionError(
+                0,
+                "Expected: an SQL statement, found: NOT at Line: 1, Column: 1",
+                "NOT A STATEMENT")),
+        output.errors());
+  }
+
+  @Test
+  void returnedMultipleErrors() {
+    SqlMeta output =
+        OpenLineageSql.parse(
+                Arrays.asList("NOT A STATEMENT", "SELECT * FROM test", "ANOTHER NON STATEMENT"))
+            .get();
+    assertEquals(Collections.singletonList(new DbTableMeta(null, null, "test")), output.inTables());
+
+    assertEquals(2, output.errors().size());
+    assertEquals(
+        Arrays.asList(
+            new ExtractionError(
+                0,
+                "Expected: an SQL statement, found: NOT at Line: 1, Column: 1",
+                "NOT A STATEMENT"),
+            new ExtractionError(
+                2,
+                "Expected: an SQL statement, found: ANOTHER at Line: 1, Column: 1",
+                "ANOTHER NON STATEMENT")),
+        output.errors());
+  }
+
+  @Test
+  void columnLineageWildcard() {
+    SqlMeta output =
+        OpenLineageSql.parse(Collections.singletonList("INSERT INTO table_1 SELECT * FROM table_2"))
+            .get();
+    assertEquals(0, output.columnLineage().size());
+  }
+
+  ColumnLineage columnLineage(String columnName, String sourceTable, String sourceColumn) {
+    return columnLineage(columnName, Collections.singletonList(Pair.of(sourceTable, sourceColumn)));
+  }
+
+  ColumnLineage columnLineage(String columnName, List<Pair<String, String>> sourceColumn) {
+    return new ColumnLineage(
+        new ColumnMeta(null, columnName),
+        sourceColumn.stream()
+            .map(
+                column ->
+                    new ColumnMeta(
+                        new DbTableMeta(null, null, column.getLeft()), column.getRight()))
+            .collect(Collectors.toList()));
+  }
+}

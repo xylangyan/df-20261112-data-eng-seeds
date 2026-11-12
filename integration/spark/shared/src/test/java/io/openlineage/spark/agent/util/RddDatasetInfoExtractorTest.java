@@ -1,0 +1,387 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark.agent.util;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.when;
+
+import io.openlineage.client.utils.DatasetIdentifier;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import org.apache.commons.lang3.reflect.FieldUtils;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.spark.SparkConf;
+import org.apache.spark.SparkContext;
+import org.apache.spark.rdd.MapPartitionsRDD;
+import org.apache.spark.rdd.NewHadoopRDD;
+import org.apache.spark.rdd.ParallelCollectionRDD;
+import org.apache.spark.rdd.RDD;
+import org.apache.spark.rdd.UnionRDD;
+import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.execution.datasources.FilePartition;
+import org.apache.spark.sql.execution.datasources.FileScanRDD;
+import org.apache.spark.sql.execution.datasources.PartitionedFile;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceRDD;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceRDDPartition;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import scala.Tuple2;
+import scala.collection.JavaConverters;
+import scala.collection.Seq;
+import scala.collection.mutable.ArrayBuffer;
+
+@SuppressWarnings("PMD.AvoidDuplicateLiterals")
+class RddDatasetInfoExtractorTest {
+
+  private static final String DATA_FIELD_NAME = "data";
+
+  @Test
+  void testFindRDDPathsForMapPartitionsRDD() {
+    FilePartition filePartition = mock(FilePartition.class);
+    PartitionedFile partitionedFile = mock(PartitionedFile.class);
+    FileScanRDD fileScanRDD = mock(FileScanRDD.class);
+    MapPartitionsRDD mapPartitions = mock(MapPartitionsRDD.class);
+
+    when(mapPartitions.prev()).thenReturn(fileScanRDD);
+    when(fileScanRDD.filePartitions())
+        .thenReturn(ScalaConversionUtils.fromList(Collections.singletonList(filePartition)));
+    when(filePartition.files()).thenReturn(new PartitionedFile[] {partitionedFile});
+    when(partitionedFile.filePath()).thenReturn("/some-path/sub-path");
+
+    List<DatasetIdentifier> datasetIdentifiers =
+        PlanUtils.findDatasetIdentifiers(Collections.singletonList(mapPartitions));
+
+    assertThat(datasetIdentifiers)
+        .extracting(DatasetIdentifier::getNamespace, DatasetIdentifier::getName)
+        .containsExactlyInAnyOrder(tuple("file", "/some-path"));
+  }
+
+  @Test
+  void testFindRDDPathsForParallelCollectionRDD() throws IllegalAccessException {
+    ParallelCollectionRDD parallelCollectionRDD = mock(ParallelCollectionRDD.class);
+    Seq<Tuple2<String, Integer>> data =
+        JavaConverters.asScalaIteratorConverter(
+                Arrays.asList(
+                        new Tuple2<>("/some-path1/data-file-325342.snappy.parquet", 345),
+                        new Tuple2<>("/some-path2/data-file-654342.snappy.parquet", 345))
+                    .iterator())
+            .asScala()
+            .toSeq();
+
+    FieldUtils.writeDeclaredField(parallelCollectionRDD, DATA_FIELD_NAME, data, true);
+
+    List<DatasetIdentifier> datasetIdentifiers =
+        PlanUtils.findDatasetIdentifiers(Collections.singletonList(parallelCollectionRDD));
+
+    assertThat(datasetIdentifiers)
+        .extracting(DatasetIdentifier::getNamespace, DatasetIdentifier::getName)
+        .containsExactlyInAnyOrder(tuple("file", "/some-path1"), tuple("file", "/some-path2"));
+  }
+
+  @Test
+  void testFindRDDPathsForUnionRDD() throws IllegalAccessException {
+    UnionRDD unionRdd = mock(UnionRDD.class);
+    ParallelCollectionRDD rdd1 = mock(ParallelCollectionRDD.class);
+    ParallelCollectionRDD rdd2 = mock(ParallelCollectionRDD.class);
+
+    Seq<Tuple2<String, Integer>> data1 =
+        JavaConverters.asScalaIteratorConverter(
+                Arrays.asList(new Tuple2<>("/some-path2/data-file-654342.snappy.parquet", 345))
+                    .iterator())
+            .asScala()
+            .toSeq();
+    Seq<Tuple2<String, Integer>> data2 =
+        JavaConverters.asScalaIteratorConverter(
+                Arrays.asList(new Tuple2<>("/some-path1/data-file-325342.snappy.parquet", 345))
+                    .iterator())
+            .asScala()
+            .toSeq();
+    FieldUtils.writeDeclaredField(rdd1, "data", data1, true);
+    FieldUtils.writeDeclaredField(rdd2, "data", data2, true);
+
+    when(unionRdd.rdds()).thenReturn(ScalaConversionUtils.fromList(Arrays.asList(rdd1, rdd2)));
+
+    List<DatasetIdentifier> datasetIdentifiers =
+        PlanUtils.findDatasetIdentifiers(Collections.singletonList(unionRdd));
+
+    assertThat(datasetIdentifiers)
+        .extracting(DatasetIdentifier::getNamespace, DatasetIdentifier::getName)
+        .containsExactlyInAnyOrder(tuple("file", "/some-path1"), tuple("file", "/some-path2"));
+  }
+
+  @Test
+  void testNewHadoopRDDExtractor() {
+    SparkConf sparkConf = new SparkConf();
+    sparkConf.setMaster("local[*]").setAppName("test");
+    SparkContext sparkContext = new SparkContext(sparkConf);
+    NewHadoopRDD rdd = new NewHadoopRDD(sparkContext, null, null, null, new Configuration());
+
+    try (MockedStatic<FileInputFormat> ignored = mockStatic(FileInputFormat.class)) {
+      when(FileInputFormat.getInputPaths(any()))
+          .thenReturn(new Path[] {new Path("some-path1"), new Path("some-path2")});
+
+      List<DatasetIdentifier> datasetIdentifiers =
+          PlanUtils.findDatasetIdentifiers(Collections.singletonList(rdd));
+      assertThat(datasetIdentifiers)
+          .extracting(DatasetIdentifier::getNamespace, DatasetIdentifier::getName)
+          .containsExactlyInAnyOrder(tuple("file", "some-path1"), tuple("file", "some-path2"));
+    }
+    sparkContext.stop();
+  }
+
+  @Test
+  void testFindRDDPathsForParallelCollectionRDDWhenNoDataField() throws IllegalAccessException {
+    ParallelCollectionRDD parallelCollectionRDD = mock(ParallelCollectionRDD.class);
+
+    FieldUtils.writeDeclaredField(parallelCollectionRDD, DATA_FIELD_NAME, null, true);
+    assertThat(PlanUtils.findDatasetIdentifiers(Collections.singletonList(parallelCollectionRDD)))
+        .hasSize(0);
+  }
+
+  @Test
+  void testFindRDDPathsForParallelCollectionRDDWhenDataFieldNotSeqOfTuples()
+      throws IllegalAccessException {
+    ParallelCollectionRDD parallelCollectionRDD = mock(ParallelCollectionRDD.class);
+    Seq<Integer> data =
+        JavaConverters.asScalaIteratorConverter(Arrays.asList(333).iterator()).asScala().toSeq();
+
+    FieldUtils.writeDeclaredField(parallelCollectionRDD, DATA_FIELD_NAME, data, true);
+    assertThat(PlanUtils.findDatasetIdentifiers(Collections.singletonList(parallelCollectionRDD)))
+        .hasSize(0);
+  }
+
+  @Test
+  void testFindRDDPathsForParallelCollectionRDDWhenDataFieldIsArrayBuffer()
+      throws IllegalAccessException {
+    Assumptions.assumeTrue(
+        FieldUtils.getDeclaredField(ParallelCollectionRDD.class, DATA_FIELD_NAME, true)
+            .getType()
+            .isAssignableFrom(ArrayBuffer.class),
+        "Skipping test: ArrayBuffer not assignable to Seq (Scala 2.13+)");
+
+    ParallelCollectionRDD<?> parallelCollectionRDD = mock(ParallelCollectionRDD.class);
+    ArrayBuffer<Path> data = new ArrayBuffer<>();
+    Path path1 = new Path("/some-path1/part-9-256964}");
+    Path path2 = new Path("/some-path2/part-5-123964");
+    Path path3 = new Path("/some-path2/part-2-453964");
+    data.appendAll(
+        JavaConverters.asScalaBufferConverter(Arrays.asList(path1, path2, path3)).asScala());
+
+    FieldUtils.writeDeclaredField(parallelCollectionRDD, DATA_FIELD_NAME, data, true);
+    List<DatasetIdentifier> datasetIdentifiers =
+        PlanUtils.findDatasetIdentifiers(Collections.singletonList(parallelCollectionRDD));
+
+    assertThat(datasetIdentifiers)
+        .extracting(DatasetIdentifier::getNamespace, DatasetIdentifier::getName)
+        .containsExactlyInAnyOrder(tuple("file", "/some-path1"), tuple("file", "/some-path2"));
+  }
+
+  @Test
+  void testFindRDDPathsEmptyStringPath() {
+    FilePartition filePartition = mock(FilePartition.class);
+    FileScanRDD fileScanRDD = mock(FileScanRDD.class);
+    PartitionedFile partitionedFile = mock(PartitionedFile.class);
+
+    when(filePartition.files()).thenReturn(new PartitionedFile[] {partitionedFile});
+    when(partitionedFile.filePath()).thenReturn("");
+    when(fileScanRDD.filePartitions())
+        .thenReturn(ScalaConversionUtils.fromList(Collections.singletonList(filePartition)));
+
+    List<DatasetIdentifier> datasetIdentifiers =
+        PlanUtils.findDatasetIdentifiers(Collections.singletonList(fileScanRDD));
+
+    assertThat(datasetIdentifiers).hasSize(0);
+  }
+
+  @Test
+  void testFindRDDPathsUnknownRdd() {
+    assertThat(PlanUtils.findDatasetIdentifiers(Collections.singletonList(mock(RDD.class))))
+        .isEmpty();
+  }
+
+  @Test
+  void testDataSourceRDDExtractor() {
+    Map<InputPartition, List<DatasetIdentifier>> datasetIdentifiers = new HashMap<>();
+    DataSourceRDD dataSourceRDD = getDataSourceRDD();
+
+    DataSourceRDDPartition partition1 =
+        getDataSourceRDDPartition(
+            datasetIdentifiers, PathUtils.fromPath(new Path("/warehouse/source1")));
+    DataSourceRDDPartition partition2 =
+        getDataSourceRDDPartition(
+            datasetIdentifiers,
+            PathUtils.fromPath(new Path("/warehouse/source2"))
+                .withSymlink(
+                    "default.source2", "file:/warehouse", DatasetIdentifier.SymlinkType.TABLE));
+    when(dataSourceRDD.getPartitions())
+        .thenReturn(new DataSourceRDDPartition[] {partition1, partition2});
+
+    RddDatasetInfoExtractor.DataSourceRDDExtractor extractor =
+        getDataSourceRDDExtractor(datasetIdentifiers);
+
+    List<DatasetIdentifier> extracted =
+        extractor.extract(dataSourceRDD).collect(Collectors.toList());
+
+    assertThat(extracted)
+        .extracting(
+            DatasetIdentifier::getNamespace,
+            DatasetIdentifier::getName,
+            DatasetIdentifier::getSymlinks)
+        .containsExactlyInAnyOrder(
+            tuple("file", "/warehouse/source1", Collections.emptyList()),
+            tuple(
+                "file",
+                "/warehouse/source2",
+                Collections.singletonList(
+                    new DatasetIdentifier.Symlink(
+                        "default.source2",
+                        "file:/warehouse",
+                        DatasetIdentifier.SymlinkType.TABLE))));
+  }
+
+  @Test
+  void testDataSourceRDDExtractorExtractSchema() {
+    Map<InputPartition, StructType> schemas = new HashMap<>();
+    DataSourceRDD dataSourceRDD = getDataSourceRDD();
+
+    StructType expectedSchema =
+        new StructType(
+            new StructField[] {
+              DataTypes.createStructField("id", DataTypes.LongType, false),
+              DataTypes.createStructField("name", DataTypes.StringType, true)
+            });
+
+    DataSourceRDDPartition partition = getDataSourceRDDPartitionWithSchema(schemas, expectedSchema);
+    when(dataSourceRDD.getPartitions()).thenReturn(new DataSourceRDDPartition[] {partition});
+
+    RddDatasetInfoExtractor.DataSourceRDDExtractor extractor =
+        getDataSourceRDDExtractorWithSchema(schemas);
+
+    Optional<StructType> result = extractor.extractSchema(dataSourceRDD);
+
+    assertThat(result).isPresent();
+    assertThat(result.get().fields()).hasSize(2);
+    assertThat(result.get().fields()[0].name()).isEqualTo("id");
+    assertThat(result.get().fields()[1].name()).isEqualTo("name");
+  }
+
+  @Test
+  void testDataSourceRDDExtractorExtractSchemaReturnsEmptyWhenNoSchema() {
+    Map<InputPartition, StructType> schemas = new HashMap<>();
+    DataSourceRDD dataSourceRDD = getDataSourceRDD();
+
+    DataSourceRDDPartition partition = getDataSourceRDDPartitionWithSchema(schemas, null);
+    when(dataSourceRDD.getPartitions()).thenReturn(new DataSourceRDDPartition[] {partition});
+
+    RddDatasetInfoExtractor.DataSourceRDDExtractor extractor =
+        getDataSourceRDDExtractorWithSchema(schemas);
+
+    Optional<StructType> result = extractor.extractSchema(dataSourceRDD);
+
+    assertThat(result).isEmpty();
+  }
+
+  private static DataSourceRDD getDataSourceRDD() {
+    DataSourceRDD dataSourceRDD = mock(DataSourceRDD.class);
+    SparkContext sparkContext = mock(SparkContext.class);
+    Configuration hadoopConfiguration = new Configuration();
+    when(dataSourceRDD.sparkContext()).thenReturn(sparkContext);
+    when(sparkContext.hadoopConfiguration()).thenReturn(hadoopConfiguration);
+    return dataSourceRDD;
+  }
+
+  private static DataSourceRDDPartition getDataSourceRDDPartition(
+      Map<InputPartition, List<DatasetIdentifier>> partitionToDatasetIdentifiers,
+      DatasetIdentifier expectedDatasetIdentifier) {
+    DataSourceRDDPartition partition = mock(DataSourceRDDPartition.class);
+    InputPartition inputPartition = mock(InputPartition.class);
+    partitionToDatasetIdentifiers.put(
+        inputPartition, Collections.singletonList(expectedDatasetIdentifier));
+    when(partition.inputPartition()).thenReturn(inputPartition);
+    return partition;
+  }
+
+  private static DataSourceRDDPartition getDataSourceRDDPartitionWithSchema(
+      Map<InputPartition, StructType> partitionToSchema, StructType expectedSchema) {
+    DataSourceRDDPartition partition = mock(DataSourceRDDPartition.class);
+    InputPartition inputPartition = mock(InputPartition.class);
+    if (expectedSchema != null) {
+      partitionToSchema.put(inputPartition, expectedSchema);
+    }
+    when(partition.inputPartition()).thenReturn(inputPartition);
+    return partition;
+  }
+
+  private static RddDatasetInfoExtractor.DataSourceRDDExtractor getDataSourceRDDExtractor(
+      Map<InputPartition, List<DatasetIdentifier>> partitionToDatasetIdentifiers) {
+    InputPartitionExtractor customExtractor =
+        new TestInputPartitionExtractor(partitionToDatasetIdentifiers, Collections.emptyMap());
+
+    RddDatasetInfoExtractor.InputPartitionExtractorFactory mockFactory =
+        mock(RddDatasetInfoExtractor.InputPartitionExtractorFactory.class);
+    when(mockFactory.createInputPartitionExtractors())
+        .thenReturn(Collections.singletonList(customExtractor));
+
+    return new RddDatasetInfoExtractor.DataSourceRDDExtractor(mockFactory);
+  }
+
+  private static RddDatasetInfoExtractor.DataSourceRDDExtractor getDataSourceRDDExtractorWithSchema(
+      Map<InputPartition, StructType> partitionToSchema) {
+    InputPartitionExtractor customExtractor =
+        new TestInputPartitionExtractor(Collections.emptyMap(), partitionToSchema);
+
+    RddDatasetInfoExtractor.InputPartitionExtractorFactory mockFactory =
+        mock(RddDatasetInfoExtractor.InputPartitionExtractorFactory.class);
+    when(mockFactory.createInputPartitionExtractors())
+        .thenReturn(Collections.singletonList(customExtractor));
+
+    return new RddDatasetInfoExtractor.DataSourceRDDExtractor(mockFactory);
+  }
+
+  static class TestInputPartitionExtractor implements InputPartitionExtractor {
+    private final Map<InputPartition, List<DatasetIdentifier>> partitionToDatasetIdentifiers;
+    private final Map<InputPartition, StructType> partitionToSchema;
+
+    public TestInputPartitionExtractor(
+        Map<InputPartition, List<DatasetIdentifier>> partitionToDatasetIdentifiers,
+        Map<InputPartition, StructType> partitionToSchema) {
+      this.partitionToDatasetIdentifiers = partitionToDatasetIdentifiers;
+      this.partitionToSchema = partitionToSchema;
+    }
+
+    @Override
+    public boolean isDefinedAt(InputPartition inputPartition) {
+      return true;
+    }
+
+    @Override
+    public List<DatasetIdentifier> extract(
+        SparkContext sparkContext, InputPartition inputPartition) {
+      return partitionToDatasetIdentifiers.getOrDefault(inputPartition, Collections.emptyList());
+    }
+
+    @Override
+    public Optional<StructType> extractSchema(
+        SparkContext sparkContext, InputPartition inputPartition) {
+      return Optional.ofNullable(partitionToSchema.get(inputPartition));
+    }
+  }
+}

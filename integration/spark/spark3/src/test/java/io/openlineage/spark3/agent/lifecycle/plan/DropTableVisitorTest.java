@@ -1,0 +1,208 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark3.agent.lifecycle.plan;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.when;
+
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.openlineage.client.OpenLineage;
+import io.openlineage.client.utils.DatasetIdentifier;
+import io.openlineage.spark.agent.Versions;
+import io.openlineage.spark.agent.util.ScalaConversionUtils;
+import io.openlineage.spark.api.OpenLineageContext;
+import io.openlineage.spark.api.SparkOpenLineageConfig;
+import io.openlineage.spark3.agent.utils.PlanUtils3;
+import java.util.List;
+import java.util.Optional;
+import org.apache.spark.SparkContext;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.analysis.ResolvedTable;
+import org.apache.spark.sql.catalyst.plans.logical.DropTable;
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.Table;
+import org.apache.spark.sql.connector.catalog.TableCatalog;
+import org.apache.spark.sql.types.StructType;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import scala.collection.immutable.HashMap;
+import scala.collection.immutable.Map;
+
+class DropTableVisitorTest {
+
+  private static final String TABLE = "table";
+  OpenLineageContext openLineageContext =
+      OpenLineageContext.builder()
+          .sparkSession(mock(SparkSession.class))
+          .sparkContext(mock(SparkContext.class))
+          .openLineage(new OpenLineage(Versions.OPEN_LINEAGE_PRODUCER_URI))
+          .openLineageConfig(new SparkOpenLineageConfig())
+          .meterRegistry(new SimpleMeterRegistry())
+          .build();
+
+  DropTableVisitor visitor = new DropTableVisitor(openLineageContext);
+
+  DropTable dropTable = mock(DropTable.class);
+  ResolvedTable resolvedTable = mock(ResolvedTable.class);
+  TableCatalog tableCatalog = mock(TableCatalog.class);
+  StructType schema = new StructType();
+  Table table = mock(Table.class);
+  Map<String, String> tableProperties = new HashMap<>();
+  DatasetIdentifier di = new DatasetIdentifier(TABLE, "db");
+
+  @BeforeEach
+  public void setUp() {
+    when(dropTable.child()).thenReturn(resolvedTable);
+    when(resolvedTable.catalog()).thenReturn(tableCatalog);
+    when(resolvedTable.schema()).thenReturn(schema);
+    when(resolvedTable.table()).thenReturn(table);
+    when(resolvedTable.identifier()).thenReturn(Identifier.of(new String[] {"db"}, TABLE));
+    when(table.properties())
+        .thenReturn(ScalaConversionUtils.<String, String>fromMap(tableProperties));
+    when(table.name()).thenReturn("db.table");
+  }
+
+  @Test
+  void testIsDefinedAtWithResolvedTable() {
+    assertTrue(visitor.isDefinedAt(dropTable));
+  }
+
+  @Test
+  void testIsDefinedAtWithNonDropTable() {
+    LogicalPlan nonDropTable = mock(LogicalPlan.class);
+    assertFalse(visitor.isDefinedAt(nonDropTable));
+  }
+
+  @Test
+  void testIsDefinedAtWithUnknownChildType() {
+    DropTable dropTableWithUnknownChild = mock(DropTable.class);
+    LogicalPlan unknownChild = mock(LogicalPlan.class);
+    when(dropTableWithUnknownChild.child()).thenReturn(unknownChild);
+    assertFalse(visitor.isDefinedAt(dropTableWithUnknownChild));
+  }
+
+  @Test
+  void testApply() {
+    try (MockedStatic mocked = mockStatic(PlanUtils3.class)) {
+      when(PlanUtils3.getDatasetIdentifier(
+              openLineageContext,
+              tableCatalog,
+              Identifier.of(new String[] {"db"}, TABLE),
+              ScalaConversionUtils.<String, String>fromMap(tableProperties)))
+          .thenReturn(Optional.of(di));
+
+      List<OpenLineage.OutputDataset> outputDatasets = visitor.apply(dropTable);
+
+      assertEquals(1, outputDatasets.size());
+      assertEquals(
+          OpenLineage.LifecycleStateChangeDatasetFacet.LifecycleStateChange.DROP,
+          outputDatasets.get(0).getFacets().getLifecycleStateChange().getLifecycleStateChange());
+      assertEquals(TABLE, outputDatasets.get(0).getName());
+      assertEquals("db", outputDatasets.get(0).getNamespace());
+    }
+  }
+
+  @Test
+  void testApplyWhenNoIdentifierFound() {
+    try (MockedStatic mocked = mockStatic(PlanUtils3.class)) {
+      when(PlanUtils3.getDatasetIdentifier(
+              openLineageContext,
+              tableCatalog,
+              Identifier.of(new String[] {"db"}, TABLE),
+              ScalaConversionUtils.<String, String>fromMap(tableProperties)))
+          .thenReturn(Optional.empty());
+
+      List<OpenLineage.OutputDataset> outputDatasets = visitor.apply(dropTable);
+
+      assertEquals(0, outputDatasets.size());
+    }
+  }
+
+  @Test
+  void testApplyResolvedTableWithSchemaFacet() {
+    // Test that the schema facet is properly extracted from ResolvedTable
+    // This verifies that the applyResolvedTable method (and by extension applyResolvedIdentifier)
+    // correctly handles schema extraction
+    try (MockedStatic mocked = mockStatic(PlanUtils3.class)) {
+      when(PlanUtils3.getDatasetIdentifier(
+              openLineageContext,
+              tableCatalog,
+              Identifier.of(new String[] {"db"}, TABLE),
+              ScalaConversionUtils.<String, String>fromMap(tableProperties)))
+          .thenReturn(Optional.of(di));
+
+      List<OpenLineage.OutputDataset> outputDatasets = visitor.apply(dropTable);
+
+      // Verify the output contains schema facet
+      assertEquals(1, outputDatasets.size());
+      assertEquals(
+          OpenLineage.LifecycleStateChangeDatasetFacet.LifecycleStateChange.DROP,
+          outputDatasets.get(0).getFacets().getLifecycleStateChange().getLifecycleStateChange());
+      assertEquals(TABLE, outputDatasets.get(0).getName());
+      assertEquals("db", outputDatasets.get(0).getNamespace());
+      // Verify schema facet is present (even if empty)
+      assertEquals(0, outputDatasets.get(0).getFacets().getSchema().getFields().size());
+    }
+  }
+
+  @Test
+  void testApplyResolvedTableWithComplexIdentifier() {
+    // Test that multi-level identifiers are handled correctly
+    // This is important for ResolvedIdentifier which may have complex catalog structures
+    Identifier complexIdentifier = Identifier.of(new String[] {"catalog", "db"}, TABLE);
+    when(resolvedTable.identifier()).thenReturn(complexIdentifier);
+
+    try (MockedStatic mocked = mockStatic(PlanUtils3.class)) {
+      when(PlanUtils3.getDatasetIdentifier(
+              openLineageContext,
+              tableCatalog,
+              complexIdentifier,
+              ScalaConversionUtils.<String, String>fromMap(tableProperties)))
+          .thenReturn(Optional.of(di));
+
+      List<OpenLineage.OutputDataset> outputDatasets = visitor.apply(dropTable);
+
+      // Verify the output
+      assertEquals(1, outputDatasets.size());
+      assertEquals(TABLE, outputDatasets.get(0).getName());
+      assertEquals("db", outputDatasets.get(0).getNamespace());
+    }
+  }
+
+  @Test
+  void testApplyResolvedTableWithEmptyTableProperties() {
+    // Test that empty table properties are handled correctly
+    // This simulates ResolvedIdentifier behavior which doesn't have table properties
+    Map<String, String> emptyProperties = new HashMap<>();
+    Table tableWithEmptyProps = mock(Table.class);
+    when(tableWithEmptyProps.properties())
+        .thenReturn(ScalaConversionUtils.<String, String>fromMap(emptyProperties));
+    when(tableWithEmptyProps.name()).thenReturn("db.table");
+    when(resolvedTable.table()).thenReturn(tableWithEmptyProps);
+
+    try (MockedStatic mocked = mockStatic(PlanUtils3.class)) {
+      when(PlanUtils3.getDatasetIdentifier(
+              openLineageContext,
+              tableCatalog,
+              Identifier.of(new String[] {"db"}, TABLE),
+              ScalaConversionUtils.<String, String>fromMap(emptyProperties)))
+          .thenReturn(Optional.of(di));
+
+      List<OpenLineage.OutputDataset> outputDatasets = visitor.apply(dropTable);
+
+      // Verify the output
+      assertEquals(1, outputDatasets.size());
+      assertEquals(TABLE, outputDatasets.get(0).getName());
+      assertEquals("db", outputDatasets.get(0).getNamespace());
+    }
+  }
+}

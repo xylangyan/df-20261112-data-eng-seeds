@@ -1,0 +1,142 @@
+version: 2.1
+
+setup: true
+
+# the continuation orb is required to continue a pipeline based on
+# the path of an updated fileset
+orbs:
+  continuation: circleci/continuation@1.0.0
+  github-cli: circleci/github-cli@2.4.0
+
+# optional parameter when triggering to
+# only run a particular type of integration
+parameters:
+  integration-type:
+    type: enum
+    default: "*"
+    enum: ["*", "dbt", "publish", "python"]
+  databricks-test:
+    type: string
+    default: "disabled"
+  nightly-run:
+    type: string
+    default: "inactive"
+
+jobs:
+  # Determine the modules that have changed and trigger a series of workflow tasks as necessary.
+  # We merge multiple workflows from files in the workflows subdirectory based on the changed
+  # modules. A single module changed may require tests and builds in multiple downstream modules.
+  # For example, a change to the python client requires building common
+  # modules. Changing the spec requires building everything.
+  # Note that we don't use the path-filtering orb because we require this dynamic combination of
+  # workflows. The path-filtering orb will let us set some boolean parameters (e.g., airflow: true),
+  # but we can't stitch together multiple workflows and create cross-workflow dependencies. E.g.,
+  # it's possible to create a workflow for the python client and one for the airflow library, but we
+  # can't create an airflow workflow and a python client workflow and have the airflow workflow
+  # depend on the python client workflow if both boolean parameters happen to be true. We could
+  # simply make each workflow include its dependencies, but then we'll end up with duplicate steps
+  # (e.g., if the python client changes it triggers the airflow and common modules;
+  # including dependencies means that each module would run the python client tests).
+  #
+  # The workflow files in the subdirectory are yaml files that adhere to the schema of the workflows
+  # section of a circleci config.yml file. See the spec here: https://circleci.com/docs/2.0/configuration-reference/#workflows
+  # In addition, each workflow should include a job called "workflow_complete". This workflow_complete
+  # is defined as a no-op job in the continue_config.yml file. The job should have dependencies on
+  # each required terminal step in the workflow. E.g., the Java workflow requires the Spark
+  # integration test step which is the last required step in the workflow. All of the
+  # workflow_complete jobs will be merged together so the final workflow will have a single
+  # workflow_complete job that depends on all of the required terminal steps in each executed
+  # workflow
+  determine_changed_modules:
+    docker:
+      - image: cimg/python:3.10
+    steps:
+      - checkout
+      - github-cli/setup
+      - run:
+          name: Install yq
+          command: |
+            wget -q https://github.com/mikefarah/yq/releases/download/v4.35.2/yq_linux_amd64
+            sudo mv yq_linux_amd64 /usr/local/bin/yq
+            sudo chmod +x /usr/local/bin/yq
+      - run:
+          name: Check changes and merge workflows.
+          command: .circleci/check-changes.sh
+          environment:
+            NIGHTLY_RUN: << pipeline.parameters.nightly-run >>
+            INTEGRATION_TYPE: << pipeline.parameters.integration-type >>
+      - run:
+          name: Remove approval steps if committer is the PR author or a project committer.
+          command: |
+            pip install pyyaml==6.0.1
+            if [ -z "$CIRCLE_PULL_REQUEST" ]; then
+              # Not a pull request build (e.g. main branch or tag) - no approval needed.
+              echo "Not a pull request build. Removing approval steps."
+              python dev/filter_approvals.py
+            else
+              PR_AUTHOR=$(gh pr view "$CIRCLE_PULL_REQUEST" --repo OpenLineage/OpenLineage --json author -q .author.login 2>/dev/null)
+              COMMITTER="${CIRCLE_USERNAME:-}"
+              COMMITTER_LOWER=$(echo "$COMMITTER" | tr '[:upper:]' '[:lower:]')
+              AUTHOR_LOWER=$(echo "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')
+              echo "Committer: ${COMMITTER:-<unset>}"
+              echo "PR author: ${PR_AUTHOR:-<unknown>}"
+              if [ -n "$COMMITTER_LOWER" ] && [ -n "$AUTHOR_LOWER" ] && [ "$COMMITTER_LOWER" == "$AUTHOR_LOWER" ]; then
+                echo "Committer is the PR author. Removing approval steps."
+                python dev/filter_approvals.py
+              elif [ -n "$COMMITTER" ] && gh api "repos/OpenLineage/OpenLineage/collaborators/$COMMITTER" >/dev/null 2>&1; then
+                # Covers committers who push to their own fork: they are trusted
+                # collaborators of the repo even though the PR comes from a fork.
+                echo "Committer is a project committer. Removing approval steps."
+                python dev/filter_approvals.py
+              else
+                echo "Committer is not the PR author and not a project committer. Keeping approval steps."
+              fi
+            fi
+      - run: |
+          export PR_NUM=$(echo $CIRCLE_PULL_REQUEST | cut -d'/' -f7)
+          export HAS_FULL_TESTS_LABEL=$(gh pr view $CIRCLE_PULL_REQUEST --repo OpenLineage/OpenLineage --json labels | jq 'any(.labels[]; .name == "full-tests")')
+          if [ "<< pipeline.parameters.nightly-run >>" == "active" ]; then
+            export IS_FULL_TESTS=1
+          elif [ "<< pipeline.git.branch >>" == "main" ]; then
+            export IS_FULL_TESTS=1
+          elif [ "$HAS_FULL_TESTS_LABEL" == "true" ]; then
+            export IS_FULL_TESTS=1
+          else
+            export IS_FULL_TESTS=0
+          fi
+
+          echo $IS_FULL_TESTS
+
+          if [ -z "$IS_FULL_TESTS" ] || [ "$IS_FULL_TESTS" == "0" ]; then
+            echo "Skipping full tests"
+            pip install pyyaml==6.0.1
+            python dev/filter_matrix.py 
+          fi
+      - when:
+          condition:
+            or:
+              - equal: [ 'main',  << pipeline.git.branch >> ]
+              - << pipeline.git.tag >>
+          steps:
+            - continuation/continue:
+                configuration_path: complete_config.yml
+                parameters: '{ "build-context": "release" }'
+      - when:
+          condition:
+            not:
+              or:
+                - equal: [ 'main',  << pipeline.git.branch >> ]
+                - << pipeline.git.tag >>
+          steps:
+            - continuation/continue:
+                configuration_path: complete_config.yml
+                parameters: '{ "build-context": "pr" }'
+
+workflows:
+  schedule_workflow:
+    jobs:
+      - determine_changed_modules:
+          context: pr
+          filters:
+            tags:
+              only: /^[0-9]+(\.[0-9]+){2}(-rc\.[0-9]+)?$/

@@ -1,0 +1,863 @@
+# Copyright 2018-2026 contributors to the OpenLineage project
+# SPDX-License-Identifier: Apache-2.0
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from collections.abc import Generator
+from functools import cached_property
+from typing import NamedTuple, TextIO
+
+from openlineage.client.event_v2 import RunEvent, RunState
+from openlineage.client.facet_v2 import (
+    error_message_run,
+    external_query_run,
+    extraction_error_run,
+    job_type_job,
+    sql_job,
+)
+from openlineage.client.uuid import generate_new_uuid
+from openlineage.common.provider.dbt.facets import (
+    DbtNodeJobFacet,
+    ParentRunMetadata,
+)
+from openlineage.common.provider.dbt.live_events import (  # noqa: F401 - re-exported for compatibility
+    DbtLiveProcessor,
+    handle_keyerror,
+)
+from openlineage.common.provider.dbt.processor import (
+    ModelNode,
+    UnsupportedDbtCommand,
+)
+from openlineage.common.provider.dbt.utils import (
+    DBT_LOG_FILE_MAX_BYTES,
+    HANDLED_COMMANDS,
+    generate_run_event,
+    get_dbt_log_path,
+    get_dbt_profiles_dir,
+    get_event_timestamp,
+    get_job_type,
+    get_node_unique_id,
+    get_parent_run_metadata,
+    is_random_logfile,
+)
+from openlineage.common.utils import (
+    IncrementalFileReader,
+    add_command_line_args,
+    add_or_replace_command_line_option,
+    get_from_nullable_chain,
+)
+
+
+class ManifestIntegrityResult(NamedTuple):
+    """Result of manifest integrity validation.
+
+    Attributes:
+        is_valid: bool indicating if manifest is valid
+        missing_nodes: list of node IDs that are missing
+        missing_parents: list of parent node IDs that are missing
+        missing_children: list of child node IDs that are missing
+        total_missing: total count of missing nodes
+        parent_map_size: total number of entries in parent_map
+        available_nodes: total number of available nodes (nodes + sources)
+    """
+
+    is_valid: bool
+    missing_nodes: list[str]
+    missing_parents: list[str]
+    missing_children: list[str]
+    total_missing: int
+    parent_map_size: int
+    available_nodes: int
+
+
+class DbtStructuredLogsProcessor(DbtLiveProcessor):
+    should_raise_on_unsupported_command = True
+
+    def __init__(
+        self,
+        dbt_command_line: list[str],
+        *args,
+        **kwargs,
+    ):
+        """Configure live log processing using the artifact processor's selected project directory."""
+        super().__init__(dbt_command_line, *args, **kwargs)
+
+        self.profiles_dir = get_dbt_profiles_dir(command=self.dbt_command_line)
+        self.dbt_log_file_path: str = get_dbt_log_path(
+            command=self.dbt_command_line, project_dir=self.project_dir
+        )
+        self.is_random_logfile: bool = is_random_logfile(command=self.dbt_command_line)
+        self.dbt_log_dirname: str = os.path.dirname(self.dbt_log_file_path)
+
+        # sql query ids are incremented sequentially per node_id
+        self.node_id_to_sql_query_id: dict[str, dict[str, int]] = defaultdict(lambda: {"next_id": 1})
+        self.node_id_to_sql_start_event: dict[str, RunEvent] = {}
+
+        self.node_id_to_output: dict[str, ModelNode] = {}
+
+        self._dbt_started_at: float | None = None
+        self._dbt_log_file: TextIO | None = None
+        self.received_dbt_command_completed = False
+        self.processed_bytes = 0
+        # START events of runs that did not get a terminal event yet, in emission order
+        self._open_runs: dict[str, RunEvent] = {}
+
+        # stays None until the dbt process has exited
+        self.dbt_command_return_code: int | None = None
+
+    @cached_property
+    def catalog(self) -> dict | None:
+        if os.path.isfile(self.catalog_path):
+            return self.load_metadata(self.catalog_path, [1], self.logger)
+        return None
+
+    @property
+    def compiled_manifest(self) -> dict:
+        """
+        Manifest is loaded and cached.
+        It's loaded when the dbt structured logs are generated and processed.
+        """
+        if self._compiled_manifest != {}:
+            return self._compiled_manifest
+        elif os.path.isfile(self.manifest_path):
+            if self._dbt_started_at is not None:
+                mtime = os.path.getmtime(self.manifest_path)
+                # Allow 2s tolerance for coarse filesystem mtime granularity.
+                if mtime < self._dbt_started_at - 2.0:
+                    self.logger.warning(
+                        "manifest.json at %s predates this dbt invocation (mtime=%.1f, started=%.1f); "
+                        "skipping load to avoid stale dataset identities",
+                        self.manifest_path,
+                        mtime,
+                        self._dbt_started_at,
+                    )
+                    return {}
+            self._compiled_manifest = self.load_metadata(self.manifest_path, list(range(2, 13)), self.logger)
+            manifest_data = self._validate_manifest_integrity()
+            self.logger.debug(manifest_data)
+            return self._compiled_manifest
+        else:
+            return {}
+
+    def parse(self) -> Generator[RunEvent, None, None]:  # type: ignore[override]
+        """
+        This executes the dbt command and parses the structured log events emitted.
+        OL events are generated and yielded when relevant.
+        """
+        if self.dbt_command not in HANDLED_COMMANDS:
+            raise UnsupportedDbtCommand(
+                f"dbt integration for structured logs doesn't recognize dbt command "
+                f"{self.dbt_command_line} - operation should be one of {HANDLED_COMMANDS}"
+            )
+
+        self.extract_adapter_type(self.profile)
+
+        self.extract_dataset_namespace(self.profile)
+
+        parsing_error: extraction_error_run.ExtractionErrorRunFacet | None = None
+        for line in self._run_dbt_command():
+            # keep consuming the logs after a parsing error so that dbt is waited for
+            if parsing_error:
+                continue
+            try:
+                ol_event = self._parse_structured_log_event(line)
+            except Exception as e:
+                self.logger.exception(
+                    "OpenLineage failed to parse a dbt log event. Further dbt log events won't be parsed, "
+                    "runs already started will be closed when dbt exits. dbt execution continues unaffected."
+                )
+                parsing_error = extraction_error_run.ExtractionErrorRunFacet(
+                    totalTasks=1,
+                    failedTasks=1,
+                    errors=[
+                        extraction_error_run.Error(
+                            errorMessage=f"Failed to parse a dbt log event, lineage of this dbt execution "
+                            f"is incomplete: {e!r}",
+                            task="_parse_structured_log_event",
+                        )
+                    ],
+                )
+                continue
+            if ol_event:
+                if ol_event.eventType == RunState.START:
+                    self._open_runs[ol_event.run.runId] = ol_event
+                elif ol_event.eventType in (RunState.COMPLETE, RunState.FAIL, RunState.ABORT):
+                    self._open_runs.pop(ol_event.run.runId, None)
+                yield ol_event
+
+        if parsing_error:
+            yield from self._close_open_runs(parsing_error)
+        elif not self.received_dbt_command_completed:
+            # We did not receive the CommandCompleted event, so we emit an abort event
+            self.logger.debug("CommandCompleted event was not received. ABORT event will be send.")
+            ol_event = self._get_dbt_command_abort_event()
+            if ol_event:
+                yield ol_event
+
+    def _parse_structured_log_event(self, line: str) -> RunEvent | None:
+        """
+        dbt generates structured events https://docs.getdbt.com/reference/events-logging
+        relevant events are consumed to generate OL events.
+        They are usually composed of start/finish events:
+        1. NodeStart/NodeFinish for node lifecycle events
+        2. MainReportVersion/CommandCompleted for dbt command lifecycle events
+        3. SQLQuery/SQLQueryStatus/CatchableExceptionOnRun For SQL query lifecycle events
+        """
+        self.processed_bytes += len(line)
+        self.logger.debug(
+            "Received event of size %d. Total processed bytes %d", len(line), self.processed_bytes
+        )
+        try:
+            dbt_event = json.loads(line)
+        except ValueError:
+            # log that can't be consumed
+            self.logger.error("The following log is not valid JSON:\n%s", line)
+            return None
+
+        dbt_event_name = dbt_event["info"]["name"]
+        self.logger.debug("Parsing dbt event: %s", dbt_event_name)
+        if dbt_event_name == "MainReportVersion":
+            self._dbt_version = dbt_event["data"]["version"][1:]
+            self._dbt_invocation_id = dbt_event["info"].get("invocation_id")
+            start_event = self._parse_dbt_start_command_event(dbt_event)
+            self._setup_dbt_run_metadata(start_event)
+            return start_event
+
+        elif dbt_event_name == "CommandCompleted":
+            end_event = self._parse_command_completed_event(dbt_event)
+            self.received_dbt_command_completed = True
+            return end_event
+
+        elif dbt_event_name == "ArtifactWritten":
+            # dbt >= 1.9 emits this after writing each artifact. Load the manifest as soon as
+            # dbt confirms it wrote a fresh one so we don't have to wait until the first NodeStart.
+            if dbt_event.get("data", {}).get("artifact_type") == "WritableManifest":
+                _ = self.compiled_manifest
+            return None
+
+        if get_node_unique_id(dbt_event) is None:
+            return None
+
+        # Exposures describe downstream consumers, not executable jobs. Their metadata
+        # is attached to datasets through the dbt_exposures facet instead.
+        if get_from_nullable_chain(dbt_event, ["data", "node_info", "resource_type"]) == "exposure":
+            return None
+
+        ol_event = None
+
+        if dbt_event_name == "NodeStart":
+            ol_event = self._parse_node_start_event(dbt_event)
+        elif dbt_event_name == "SQLQuery":
+            ol_event = self._parse_sql_query_event(dbt_event)
+        elif dbt_event_name in ("SQLQueryStatus", "CatchableExceptionOnRun"):
+            ol_event = self._parse_sql_query_status_event(dbt_event)
+        elif dbt_event_name == "NodeFinished":
+            ol_event = self.parse_node_finished_event(dbt_event)
+
+        return ol_event
+
+    def _parse_dbt_start_command_event(self, event) -> RunEvent:
+        event_time = get_event_timestamp(event["info"]["ts"])
+        run_facets = {
+            **self.dbt_version_facet(),
+            **self.processing_engine_facet(),
+            **self.dbt_run_run_facet(),
+        }
+
+        if self.parent_run_metadata:
+            run_facets["parent"] = self.parent_run_metadata.to_openlineage()
+
+        start_event_run_id = str(generate_new_uuid())
+        job_facets = {
+            "jobType": job_type_job.JobTypeJobFacet(
+                jobType=get_job_type(event),
+                integration="DBT",
+                processingType="BATCH",
+                producer=self.producer,
+            )
+        }
+
+        start_event = generate_run_event(
+            event_type=RunState.START,
+            event_time=event_time,
+            run_id=start_event_run_id,
+            job_name=self.job_name,
+            job_namespace=self.job_namespace,
+            job_facets=job_facets,
+            run_facets=run_facets,
+        )
+
+        return start_event
+
+    def _close_open_runs(
+        self, extraction_error: extraction_error_run.ExtractionErrorRunFacet
+    ) -> Generator[RunEvent, None, None]:
+        """
+        After a parsing error the remaining dbt log events are not interpreted, so every run that
+        emitted START gets its terminal event here: node and sql runs first, the dbt command run last.
+        """
+        dbt_command_run_id = self.dbt_run_metadata.run_id if self.dbt_run_metadata else None
+        # sql runs start after their node, so reversed emission order closes children before parents
+        for run_id, start_event in reversed(self._open_runs.items()):
+            if run_id == dbt_command_run_id:
+                # dbt exited on its own, so its outcome is known even though its logs weren't parsed
+                event_type = RunState.COMPLETE if self.dbt_command_return_code == 0 else RunState.FAIL
+            else:
+                # the node or sql query result was never observed. dbt exiting 0 implies it succeeded,
+                # but a non-zero exit doesn't say which node failed, and a COMPLETE built here would
+                # lack what the finished event carries (status, outputs, test results), so it's ABORT
+                event_type = RunState.ABORT
+            run_facets = {
+                **self.dbt_version_facet(),
+                **self.processing_engine_facet(),
+                **self.dbt_run_run_facet(),
+                "extractionError": extraction_error,
+            }
+            if parent := (start_event.run.facets or {}).get("parent"):
+                run_facets["parent"] = parent
+            yield generate_run_event(
+                event_type=event_type,
+                event_time=datetime.datetime.now().isoformat(),
+                run_id=run_id,
+                job_name=start_event.job.name,
+                job_namespace=start_event.job.namespace,
+                job_facets=start_event.job.facets,
+                run_facets=run_facets,
+            )
+
+    def _get_dbt_command_abort_event(self):
+        run_facets = {
+            **self.dbt_version_facet(),
+            **self.processing_engine_facet(),
+            **self.dbt_run_run_facet(),
+        }
+
+        parent_run_metadata = get_parent_run_metadata()
+        if parent_run_metadata:
+            run_facets["parent"] = parent_run_metadata.to_openlineage()
+
+        job_facets = {
+            "jobType": job_type_job.JobTypeJobFacet(
+                jobType="JOB",
+                integration="DBT",
+                processingType="BATCH",
+                producer=self.producer,
+            )
+        }
+        if not self.dbt_run_metadata:
+            return None
+        return generate_run_event(
+            event_type=RunState.ABORT,
+            event_time=datetime.datetime.now().isoformat(),  # Current time - no other data source
+            run_id=self.dbt_run_metadata.run_id,
+            job_name=self.dbt_run_metadata.job_name,
+            job_namespace=self.dbt_run_metadata.job_namespace,
+            job_facets=job_facets,
+            run_facets=run_facets,
+        )
+
+    def _parse_node_start_event(self, event: dict) -> RunEvent:
+        node_unique_id = get_node_unique_id(event)
+        run_id = self.node_id_to_ol_run_id[node_unique_id]
+        node_start_time = get_event_timestamp(event["data"]["node_info"]["node_started_at"])
+
+        run_facets = {
+            **self.dbt_version_facet(),
+            **self.processing_engine_facet(),
+            **self.dbt_run_run_facet(),
+            "parent": self.dbt_run_metadata.to_openlineage(),
+        }
+
+        # Add tags (dbt tags + meta) if they exist for this node
+        if tags_facet := self._build_tags_run_facet(
+            self._get_node_tags(node_unique_id), self._get_node_meta(node_unique_id)
+        ):
+            run_facets["tags"] = tags_facet
+
+        resource_type = event["data"]["node_info"]["resource_type"]
+        job_name = self._get_job_name(event)
+        node_metadata = self._node_metadata(node_unique_id)
+        test_type = None
+        if resource_type == "test":
+            test_type = "singular" if not node_metadata.get("test_metadata") else "generic"
+        job_facets = {
+            "jobType": job_type_job.JobTypeJobFacet(
+                jobType=get_job_type(event),
+                integration="DBT",
+                processingType="BATCH",
+                producer=self.producer,
+            ),
+            "dbt_node": DbtNodeJobFacet(
+                original_file_path=node_metadata.get("original_file_path"),
+                database=node_metadata.get("database"),
+                schema=node_metadata.get("schema"),
+                alias=node_metadata.get("alias"),
+                unique_id=node_metadata.get("unique_id"),
+                test_type=test_type,
+                tested_node_unique_id=self._tested_node_unique_id(node_unique_id),
+            ),
+        }
+
+        inputs = []
+        outputs = []
+        # A unit test runs against mocked rows in a temporary relation: it reads and writes no dataset.
+        if resource_type != "unit_test":
+            inputs = [
+                self.node_to_dataset(node=model_input, has_facets=True)
+                for model_input in self._get_model_inputs(node_unique_id)
+            ]
+            if node := self._get_model_node(node_unique_id):
+                outputs = [self.node_to_output_dataset(node=node, has_facets=True)]
+
+        if extraction_error := self._get_extraction_error_facet(node_unique_id):
+            run_facets["extractionError"] = extraction_error
+
+        return generate_run_event(
+            event_type=RunState.START,
+            event_time=node_start_time,
+            run_id=run_id,
+            run_facets=run_facets,
+            job_name=job_name,
+            job_namespace=self.job_namespace,
+            job_facets=job_facets,
+            inputs=inputs,  # type: ignore[arg-type]
+            outputs=outputs,
+        )
+
+    def parse_node_finished_event(self, event) -> RunEvent:
+        resource_type = event["data"]["node_info"]["resource_type"]
+        node_unique_id = get_node_unique_id(event)
+        node_finished_at = get_event_timestamp(event["data"]["node_info"]["node_finished_at"])
+        if node_finished_at == "":
+            node_finished_at = get_event_timestamp(event["data"]["node_info"]["node_started_at"])
+        node_status = event["data"]["node_info"]["node_status"]
+        run_id = self.node_id_to_ol_run_id[node_unique_id]
+
+        run_facets = {
+            **self.dbt_version_facet(),
+            **self.processing_engine_facet(),
+            **self.dbt_run_run_facet(),
+            "parent": self.dbt_run_metadata.to_openlineage(),
+        }
+
+        if resource_type in ("model", "snapshot"):
+            run_result = get_from_nullable_chain(event, ["data", "run_result"]) or {}
+            if query_id := self.get_query_id(run_result):
+                run_facets["externalQuery"] = external_query_run.ExternalQueryRunFacet(
+                    externalQueryId=query_id,
+                    source=self.dataset_namespace,
+                )
+
+        # Add tags (dbt tags + meta) if they exist for this node
+        if tags_facet := self._build_tags_run_facet(
+            self._get_node_tags(node_unique_id), self._get_node_meta(node_unique_id)
+        ):
+            run_facets["tags"] = tags_facet
+
+        job_name = self._get_job_name(event)
+        node_metadata = self._node_metadata(node_unique_id)
+        test_type = None
+        if resource_type == "test":
+            test_type = "singular" if not node_metadata.get("test_metadata") else "generic"
+        job_facets = {
+            "jobType": job_type_job.JobTypeJobFacet(
+                jobType=get_job_type(event),
+                integration="DBT",
+                processingType="BATCH",
+                producer=self.producer,
+            ),
+            "dbt_node": DbtNodeJobFacet(
+                original_file_path=node_metadata.get("original_file_path"),
+                database=node_metadata.get("database"),
+                schema=node_metadata.get("schema"),
+                alias=node_metadata.get("alias"),
+                unique_id=node_metadata.get("unique_id"),
+                test_type=test_type,
+                tested_node_unique_id=self._tested_node_unique_id(node_unique_id),
+            ),
+        }
+
+        event_type = RunState.OTHER
+
+        if node_status == "skipped":
+            event_type = RunState.ABORT
+        elif node_status in ("fail", "error", "runtime error"):
+            event_type = RunState.FAIL
+            error_message = event["data"]["run_result"]["message"]
+            run_facets["errorMessage"] = error_message_run.ErrorMessageRunFacet(
+                message=error_message, programmingLanguage="sql"
+            )
+        elif node_status in ("success", "pass", "warn"):
+            event_type = RunState.COMPLETE
+        else:
+            self.logger.info("Node %s has an unknown node status %s", node_unique_id, node_status)
+
+        inputs: list = []
+        outputs: list = []
+        if resource_type != "unit_test":
+            inputs, outputs = self._node_end_datasets(
+                node_unique_id, self._get_model_node(node_unique_id), event_type
+            )
+
+        if resource_type == "test":
+            success = node_status == "pass"
+            # Structured-log NodeFinished events name the count `num_failures`
+            # (run_results.json calls the same value `failures`).
+            num_failures = (event["data"].get("run_result") or {}).get("num_failures")
+            if (
+                test_inputs := self._test_datasets_with_assertion(node_unique_id, success, num_failures)
+            ) is not None:
+                inputs = test_inputs
+            if test_facet := self._singular_test_facet(node_unique_id, success, num_failures):
+                run_facets["test"] = test_facet
+
+        if extraction_error := self._get_extraction_error_facet(node_unique_id):
+            run_facets["extractionError"] = extraction_error
+
+        return generate_run_event(
+            event_type=event_type,
+            event_time=node_finished_at,
+            run_id=run_id,
+            run_facets=run_facets,
+            job_name=job_name,
+            job_namespace=self.job_namespace,
+            job_facets=job_facets,
+            inputs=inputs,  # type: ignore[arg-type]
+            outputs=outputs,
+        )
+
+    def _parse_sql_query_event(self, event) -> RunEvent:
+        node_unique_id = get_node_unique_id(event)
+        node_start_run_id = self.node_id_to_ol_run_id[node_unique_id]
+        sql_ol_run_id = str(generate_new_uuid())
+        sql_start_at = event["info"]["ts"]
+
+        parent_run = ParentRunMetadata(
+            run_id=node_start_run_id,
+            job_name=self._get_job_name(event),
+            job_namespace=self.job_namespace,
+            root_parent_run_id=self.get_root_parent_run_id(),
+            root_parent_job_namespace=self.get_root_parent_job_namespace(),
+            root_parent_job_name=self.get_root_parent_job_name(),
+        )
+
+        run_facets = {
+            **self.dbt_version_facet(),
+            **self.processing_engine_facet(),
+            **self.dbt_run_run_facet(),
+            "parent": parent_run.to_openlineage(),
+        }
+
+        job_facets = {
+            "jobType": job_type_job.JobTypeJobFacet(
+                jobType=get_job_type(event),
+                integration="DBT",
+                processingType="BATCH",
+                producer=self.producer,
+            ),
+            "sql": sql_job.SQLJobFacet(query=event["data"]["sql"], dialect=self.extract_dialect()),
+        }
+
+        sql_event = generate_run_event(
+            event_type=RunState.START,
+            event_time=sql_start_at,
+            run_id=sql_ol_run_id,
+            run_facets=run_facets,
+            job_name=self._get_sql_job_name(event),
+            job_namespace=self.job_namespace,
+            job_facets=job_facets,
+        )
+
+        self.node_id_to_sql_start_event[node_unique_id] = sql_event
+
+        return sql_event
+
+    def _parse_sql_query_status_event(self, event):
+        """
+        If the sql query is successful a SQLQueryStatus is generated by dbt.
+        In case of failure a CatchableExceptionOnRun is generated instead
+        """
+        node_unique_id = get_node_unique_id(event)
+
+        # We are heavily relying here on the fact that sql events for sql executions for
+        # given node are run sequentially, as there is no information in a log
+        # event that would allow us to distinguish different sql events for a single model
+        sql_ol_run_event = self.node_id_to_sql_start_event[node_unique_id]
+
+        dbt_node_type = event["info"]["name"]
+        run_state = RunState.OTHER
+        event_time = get_event_timestamp(event["info"]["ts"])
+        run_facets = sql_ol_run_event.run.facets
+
+        if dbt_node_type == "CatchableExceptionOnRun":
+            run_state = RunState.FAIL
+            error_message = event["data"]["exc"]
+            stacktrace = event["data"]["exc_info"]
+            run_facets["errorMessage"] = error_message_run.ErrorMessageRunFacet(
+                message=error_message, programmingLanguage="sql", stackTrace=stacktrace
+            )
+        elif dbt_node_type == "SQLQueryStatus":
+            run_state = RunState.COMPLETE
+
+            if query_id := get_from_nullable_chain(event, ["data", "query_id"]):
+                run_facets["externalQuery"] = external_query_run.ExternalQueryRunFacet(
+                    externalQueryId=query_id, source=self.dataset_namespace
+                )
+
+        return generate_run_event(
+            event_type=run_state,
+            event_time=event_time,
+            run_id=sql_ol_run_event.run.runId,
+            run_facets=run_facets,
+            job_name=sql_ol_run_event.job.name,
+            job_namespace=sql_ol_run_event.job.namespace,
+            job_facets=sql_ol_run_event.job.facets,
+        )
+
+    def _parse_command_completed_event(self, event) -> RunEvent:
+        success = event["data"]["success"]
+        event_time = get_event_timestamp(event["data"]["completed_at"])
+        run_facets = {
+            **self.dbt_version_facet(),
+            **self.processing_engine_facet(),
+            **self.dbt_run_run_facet(),
+        }
+
+        parent_run_metadata = get_parent_run_metadata()
+        if parent_run_metadata:
+            run_facets["parent"] = parent_run_metadata.to_openlineage()
+
+        if success:
+            run_state = RunState.COMPLETE
+        else:
+            run_state = RunState.FAIL
+            error_message = event["info"]["msg"]
+            run_facets["errorMessage"] = error_message_run.ErrorMessageRunFacet(
+                message=error_message, programmingLanguage="sql"
+            )
+
+        job_facets = {
+            "jobType": job_type_job.JobTypeJobFacet(
+                jobType=get_job_type(event),
+                integration="DBT",
+                processingType="BATCH",
+                producer=self.producer,
+            )
+        }
+
+        return generate_run_event(
+            event_type=run_state,
+            event_time=event_time,
+            run_id=self.dbt_run_metadata.run_id,
+            job_name=self.dbt_run_metadata.job_name,
+            job_namespace=self.dbt_run_metadata.job_namespace,
+            job_facets=job_facets,
+            run_facets=run_facets,
+        )
+
+    def _get_sql_query_id(self, timestamp: str, node_id: str) -> int:
+        """
+        Not all adapters have the sql id defined in their dbt event.
+        A node is executed by a single thread which means that sql queries of a single node are executed
+        sequentially and their status is also reported sequentially.
+        This function gives us a surrogate query id. It's auto-incremented.
+        It gives the same id for the couple node_id, timestamp.
+        """
+        ids = self.node_id_to_sql_query_id[node_id]
+        if timestamp not in ids:
+            next_id = ids["next_id"]
+            ids[timestamp] = next_id
+            ids["next_id"] += 1
+
+        return ids[timestamp]
+
+    def _get_sql_job_name(self, event) -> str:
+        """
+        The name of the sql job is as follows
+        {node_job_name}.sql.{incremental_id}
+        """
+        timestamp_str = event["info"]["ts"]
+        node_unique_id = get_node_unique_id(event)
+        query_id = self._get_sql_query_id(timestamp_str, node_unique_id)
+        job_name = f"{node_unique_id}.sql.{query_id}"
+
+        return job_name
+
+    def _get_job_name(self, event) -> str:
+        """
+        The job name of models, snapshots, tests and others.
+        """
+        return get_node_unique_id(event)
+
+    def _run_dbt_command(self) -> Generator[str, None, None]:
+        """
+        This executes the dbt command.
+        Logs from the dbt log file are consumed in json format.
+        """
+        dbt_command_line = add_command_line_args(
+            self.dbt_command_line,
+            arg_names=["--log-format-file", "--log-level-file", "--log-path", "--log-file-max-bytes"],
+            arg_values=["json", "debug", self.dbt_log_dirname, DBT_LOG_FILE_MAX_BYTES],
+        )
+        dbt_command_line = add_or_replace_command_line_option(
+            dbt_command_line, option="--write-json", replace_option="--no-write-json"
+        )
+
+        self._open_dbt_log_file()
+        self.logger.debug("Opened log file %s", self.dbt_log_file_path)
+
+        incremental_reader = IncrementalFileReader(self._dbt_log_file)  # type: ignore[arg-type]
+        last_size = os.stat(self.dbt_log_file_path).st_size
+        self.logger.debug("Running dbt command: %s", " ".join(dbt_command_line))
+
+        self._dbt_started_at = time.time()
+        process = subprocess.Popen(dbt_command_line, stdout=sys.stdout, stderr=sys.stderr, text=True)
+        last_log = datetime.datetime.now()
+
+        try:
+            while process.poll() is None:
+                if (datetime.datetime.now() - last_log) >= datetime.timedelta(seconds=10):
+                    self.logger.debug("dbt process is still running: waiting for logs to appear")
+                    last_log = datetime.datetime.now()
+
+                current_size = os.stat(self.dbt_log_file_path).st_size
+                if current_size > last_size:
+                    self.logger.debug(
+                        "Current size: %d, last size: %d, to read: %d",
+                        current_size,
+                        last_size,
+                        current_size - last_size,
+                    )
+                    yield from incremental_reader.read_lines(current_size - last_size)
+                    last_size = current_size
+                time.sleep(0.01)
+
+            self.logger.debug("dbt process has exited. Waiting for logs to be flushed")
+            max_loops = 10
+            i = 0
+            while (
+                self._dbt_log_file is not None and not self.received_dbt_command_completed and i < max_loops
+            ):
+                i += 1
+                current_size = os.stat(self.dbt_log_file_path).st_size
+                if current_size > last_size:
+                    self.logger.debug(
+                        "Current size: %d, last size: %d, to read: %d",
+                        current_size,
+                        last_size,
+                        current_size - last_size,
+                    )
+                    yield from incremental_reader.read_lines(current_size - last_size)
+                    last_size = current_size
+            self.logger.debug("Finished waiting for logs to be flushed")
+
+        except Exception:
+            self.logger.exception(
+                "An exception occurred in OpenLineage dbt wrapper. "
+                "It should not affect underlying dbt execution that is still running."
+            )
+        finally:
+            # also runs when the consumer closes this generator early: never leave dbt running untracked
+            self.logger.debug("Waiting for the dbt process to finish")
+            self.dbt_command_return_code = process.wait()
+            self.logger.debug("dbt process has finished")
+            if self._dbt_log_file is not None:
+                self._dbt_log_file.close()
+                if self.is_random_logfile:
+                    try:
+                        # The directory has a random name and was created for this run only.
+                        self.logger.debug("Removing log directory: %s", self.dbt_log_dirname)
+                        shutil.rmtree(self.dbt_log_dirname)
+                    except Exception:
+                        self.logger.warning(
+                            "Failed to remove log directory: %s. Leftover logs can consume disk space.",
+                            self.dbt_log_dirname,
+                        )
+
+    def _open_dbt_log_file(self):
+        """
+        If the log file already exists when the dbt command is executed logs are appended.
+        This reads all the lines on first (and only) open to get rid of those previous lines.
+        If the file doesn't exist it creates an empty one
+        """
+        if self._dbt_log_file is not None:
+            return
+
+        if not os.path.exists(self.dbt_log_file_path):
+            logs_directory = os.path.dirname(self.dbt_log_file_path)
+            os.makedirs(logs_directory, exist_ok=True)
+            with open(self.dbt_log_file_path, "w", encoding="utf-8"):
+                pass
+
+        self._dbt_log_file = open(self.dbt_log_file_path, encoding="utf-8")
+        while self._dbt_log_file.readlines():
+            pass
+
+    def _validate_manifest_integrity(self) -> ManifestIntegrityResult:
+        """
+        Performs metadata integrity checks on the compiled manifest.
+
+        Validates that all nodes referenced in parent_map exist in the manifest's
+        node definitions (either in 'nodes' or 'sources' sections).
+
+        Returns:
+            ManifestIntegrityResult: Validation results with integrity check information.
+        """
+        if not self._compiled_manifest:
+            return ManifestIntegrityResult(
+                is_valid=True,
+                missing_nodes=[],
+                missing_parents=[],
+                missing_children=[],
+                total_missing=0,
+                parent_map_size=0,
+                available_nodes=0,
+            )
+
+        parent_map = self._compiled_manifest.get("parent_map", {})
+        all_nodes = {**self._compiled_manifest.get("nodes", {}), **self._compiled_manifest.get("sources", {})}
+
+        missing_nodes = []
+        missing_parents = []
+        missing_children = []
+
+        for parent_node_id, child_node_ids in parent_map.items():
+            # Check that the parent node exists
+            if parent_node_id not in all_nodes:
+                missing_nodes.append(parent_node_id)
+                missing_parents.append(parent_node_id)
+
+            # Check that all child nodes exist
+            for child_node_id in child_node_ids:
+                if child_node_id not in all_nodes:
+                    missing_nodes.append(child_node_id)
+                    missing_children.append(child_node_id)
+
+        # Remove duplicates while preserving order
+        missing_nodes = list(dict.fromkeys(missing_nodes))
+        missing_parents = list(dict.fromkeys(missing_parents))
+        missing_children = list(dict.fromkeys(missing_children))
+
+        if missing_nodes:
+            self.logger.warning(
+                "Manifest integrity check failed: Found %d nodes in parent_map that don't exist "
+                "in manifest node definitions, printing first %d of them: %s",
+                len(missing_nodes),
+                min(10, len(missing_nodes)),
+                missing_nodes[: min(10, len(missing_nodes))],  # Log first 10 to avoid overwhelming logs
+            )
+
+        return ManifestIntegrityResult(
+            is_valid=len(missing_nodes) == 0,
+            missing_nodes=missing_nodes,
+            missing_parents=missing_parents,
+            missing_children=missing_children,
+            total_missing=len(missing_nodes),
+            parent_map_size=len(parent_map),
+            available_nodes=len(all_nodes),
+        )

@@ -1,0 +1,46 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark.agent;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import io.openlineage.spark.api.SparkOpenLineageConfig;
+import lombok.SneakyThrows;
+import org.apache.spark.SparkConf;
+import org.junit.jupiter.api.Test;
+
+class EventEmitterTest {
+  @SneakyThrows
+  @Test
+  void testApplicationNameOverride() {
+    String appName = "test-app";
+    String overrideName = "override-app";
+
+    SparkConf sparkConf =
+        new SparkConf().setAppName(appName).set(ArgumentParser.SPARK_CONF_APP_NAME, overrideName);
+    SparkOpenLineageConfig olConfig = ArgumentParser.parse(sparkConf);
+    EventEmitter eventEmitter = new EventEmitter(olConfig, appName);
+
+    assertThat(eventEmitter.getApplicationJobName()).isEqualTo(overrideName);
+  }
+
+  @SneakyThrows
+  @Test
+  void testApplicationJobNameCanBeUpdatedAfterConstruction() {
+    String appName = "raw-spark-app-name";
+
+    SparkConf sparkConf = new SparkConf().setAppName(appName);
+    SparkOpenLineageConfig olConfig = ArgumentParser.parse(sparkConf);
+    EventEmitter eventEmitter = new EventEmitter(olConfig, appName);
+
+    assertThat(eventEmitter.getApplicationJobName()).isEqualTo(appName);
+
+    String resolvedName = "glue_job_name";
+    eventEmitter.setApplicationJobName(resolvedName);
+
+    assertThat(eventEmitter.getApplicationJobName()).isEqualTo(resolvedName);
+  }
+}

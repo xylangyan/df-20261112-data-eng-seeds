@@ -1,0 +1,133 @@
+# Copyright 2018-2026 contributors to the OpenLineage project
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+import attr
+from openlineage.client.generated.base import JobFacet, RunFacet
+from openlineage.client.utils import RedactMixin
+
+
+@attr.define
+class Job(RedactMixin):
+    namespace: str
+    """
+    The namespace containing that job
+
+    Example: my-scheduler-namespace
+    """
+    name: str
+    """
+    The unique name for that job within that namespace
+
+    Example: myjob.mytask
+    """
+    facets: dict[str, JobFacet] | None = attr.field(factory=dict)
+    """
+    Selected subset of facets of the parent job (not the current job), forwarded here for convenience.
+    See the parent job's own event for full information.
+    """
+
+
+@attr.define
+class ParentRunFacet(RunFacet):
+    """
+    the id of the parent run and job, iff this run was spawn from an other run (for example, the Dag run
+    scheduling its tasks)
+    """
+
+    run: Run
+    job: Job
+    root: Root | None = attr.field(default=None)
+    _additional_skip_redact: ClassVar[list[str]] = ["job", "run"]
+
+    @staticmethod
+    def _get_schema() -> str:
+        return "https://openlineage.io/spec/facets/1-2-0/ParentRunFacet.json#/$defs/ParentRunFacet"
+
+    @classmethod
+    def create(cls, runId: str, namespace: str, name: str) -> "ParentRunFacet":  # noqa: N803
+        import warnings
+
+        warnings.warn(
+            "ParentRunFacet.create method is deprecated. Please use class initializator instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls(run=Run(runId=runId), job=Job(namespace=namespace, name=name))
+
+
+@attr.define
+class Root(RedactMixin):
+    run: RootRun
+    job: RootJob
+    _skip_redact: ClassVar[list[str]] = ["run", "job"]
+
+
+@attr.define
+class RootJob(RedactMixin):
+    namespace: str
+    """
+    The namespace containing root job
+
+    Example: my-scheduler-namespace
+    """
+    name: str
+    """
+    The unique name containing root job within that namespace
+
+    Example: myjob.mytask
+    """
+    facets: dict[str, JobFacet] | None = attr.field(factory=dict)
+    """
+    Selected subset of facets of the root job (not the current job), forwarded here for convenience. See
+    the root job's own event for full information.
+    """
+    _skip_redact: ClassVar[list[str]] = ["namespace", "name"]
+
+    @staticmethod
+    def _get_schema() -> str:
+        return "https://openlineage.io/spec/facets/1-2-0/ParentRunFacet.json#/$defs/RootJob"
+
+
+@attr.define
+class RootRun(RedactMixin):
+    runId: str = attr.field()  # noqa: N815
+    """The globally unique ID of the root run associated with the root job."""
+
+    facets: dict[str, RunFacet] | None = attr.field(factory=dict)
+    """
+    Selected subset of facets of the root run (not the current run), forwarded here for convenience. See
+    the root run's own event for full information.
+    """
+    _skip_redact: ClassVar[list[str]] = ["runId"]
+
+    @staticmethod
+    def _get_schema() -> str:
+        return "https://openlineage.io/spec/facets/1-2-0/ParentRunFacet.json#/$defs/RootRun"
+
+    @runId.validator
+    def runid_check(self, attribute: str, value: str) -> None:  # noqa: ARG002
+        from uuid import UUID
+
+        UUID(value)
+
+
+@attr.define
+class Run(RedactMixin):
+    runId: str = attr.field()  # noqa: N815
+    """The globally unique ID of the run associated with the job."""
+
+    facets: dict[str, RunFacet] | None = attr.field(factory=dict)
+    """
+    Selected subset of facets of the parent run (not the current run), forwarded here for convenience.
+    See the parent run's own event for full information.
+    """
+
+    @runId.validator
+    def runid_check(self, attribute: str, value: str) -> None:  # noqa: ARG002
+        from uuid import UUID
+
+        UUID(value)
