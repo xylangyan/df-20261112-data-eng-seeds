@@ -1,0 +1,8 @@
+*.py,cover
+*.pyc
+*.pyc.d
+.coverage
+.ruff_cache
+build
+dist
+json5.egg-info

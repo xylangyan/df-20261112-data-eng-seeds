@@ -1,0 +1,115 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [ "setuptools>=61" ]
+
+[project]
+name = "json5"
+description = "A Python implementation of the JSON5 data format."
+readme = "README.md"
+keywords = [ "json5" ]
+license = "Apache-2.0"
+license-files = [ "LICENSE" ]
+authors = [
+    { name = "Dirk Pranke", email = "dpranke@gmail.com" },
+]
+requires-python = ">=3.8.0"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+dynamic = [ "version" ]
+urls.Changelog = "https://github.com/dpranke/pyjson5/blob/master/README.md"
+urls.Issues = "https://github.com/dpranke/pyjson5/issues"
+urls.Repository = "https://github.com/dpranke/pyjson5"
+scripts.pyjson5 = "json5.tool:main"
+
+[dependency-groups]
+# You are expected to develop using Python 3.11 or newer; you can
+# install a dev environment using an older version of Python, but the
+# only thing you can do is run the tests.
+dev = [
+    "build>=1.4.4; python_version>='3.11'",
+    "coverage>=7.16; python_version>='3.11'",
+    "glop==0.9.0; python_version>='3.11'",
+    "mypy>=2.3; python_version>='3.11'",
+    "pip>=26.2; python_version>='3.11'",
+    "pylint>=4.0.8; python_version>='3.11'",
+    "pyproject-fmt>=2.2.4; python_version>='3.11'",
+    "ruff>=0.16.6; python_version>='3.11'",
+    "twine>=7.0; python_version>='3.11'",
+
+    # Not a direct dependency, but this picks up a security fix.
+    "urllib3>=2.8.0; python_version>='3.11'",
+]
+
+[tool.setuptools]
+packages = [ "json5" ]
+dynamic.version = { attr = "json5.__version__" }
+
+[tool.uv]
+# 0.9.0 is the first version supporting Python 3.14
+required-version = ">=0.9.0"
+# By default, do not install/resolve to packages published within
+# the past 30 days; this gives us some protection against automatically
+# upgrading to a package that might have been newly compromised.
+exclude-newer = "30 days"
+# Pick up the pinned version of glop; don't worry about the 30 day
+# cooling off period.
+exclude-newer-package.glop = false
+# Pick up a security fix in 2.8.0; drop this once it's been another week.
+exclude-newer-package.urllib3 = "2026-09-16T00:00:00Z"
+
+[tool.ruff]
+line-length = 79
+include = [ "*/*.py", "run" ]
+format.quote-style = "single"
+lint.ignore = [ "FA100" ]  # from __future__ import annotations
+
+[tool.pylint]
+main.persistent = "yes"
+reports.reports = "no"
+reports.score = "no"
+# By default, pylint wants all parameter names to be at least two chars long,
+# but we want to allow single-char parameter names as well.
+basic.argument-rgx = "[a-z_][a-z0-9_]{0,30}$"
+# By default, pylint only allows UPPER_CASE constants, but we want to
+# allow snake_case as well in some situations.
+basic.const-rgx = "[a-zA-Z_][a-zA-Z0-9_]{0,30}$"
+# By default, pylint wants method names to be at most 31 chars long,
+# but we want to allow up to 49 to allow for longer test names.
+basic.method-rgx = "[a-zA-Z_][a-zA-Z0-9_]{0,48}$"
+# By default, pylint wants all variable names to be at least two chars long,
+# but we want to allow single-char variable names as well.
+basic.variable-rgx = "[a-z_][a-z0-9_]{0,30}$"
+"message control".disable = [
+    "broad-except",
+    "fixme",
+    "global-statement",
+    "locally-disabled",
+    "missing-docstring",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-branches",
+    "too-many-instance-attributes",
+    "too-many-lines",
+    "too-many-locals",
+    "too-many-positional-arguments",
+    "too-many-public-methods",
+    "too-many-return-statements",
+    "too-many-statements",
+    "unidiomatic-typecheck",
+]
+
+[tool.pyproject-fmt]
+indent = 4
+keep_full_version = true
+max_supported_python = "3.15"
