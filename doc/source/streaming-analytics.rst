@@ -161,6 +161,54 @@ Only the output must be able to fit comfortably in memory and this is rarely an
 issue, even for very large split-apply-combine computations.
 
 
+Streaming contiguous partitions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The `partitionby_iter`_ function is the lazy counterpart of `partitionby`_.  It
+requires its input to be sorted by the key, and yields one partition at a time
+from a single pass over the input.  A partition is not materialized; it is a
+small object with a ``key``, a running ``count``, and the normal iterator
+protocol::
+
+   >>> from toolz import partitionby_iter
+   >>> partitions = partitionby_iter(0, [('a', 1), ('a', 2), ('b', 3)])
+   >>> first = next(partitions)
+   >>> first.key, first.count
+   ('a', 0)
+   >>> next(first)
+   ('a', 1)
+   >>> first.count
+   1
+
+A partition remains active only until the outer iterator is advanced.  At that
+point any unconsumed items are drained and the partition becomes inactive.  This
+is also what makes it safe to skip a partition: advancing the outer iterator
+lands on the first item of the next partition, even when the previous partition
+was only partly read.  The explicit ``skip()`` method performs the same drain::
+
+   >>> first.skip()
+   PartitionSummary(key='a', count=2, result='__no__default__')
+   >>> next(partitions).key
+   'b'
+
+``skip()`` does not apply a reducer to discarded items.  To reduce a partition,
+pass a binary ``reducer`` and an optional ``init`` in the same form accepted by
+`reduceby`_.  The reducer then runs as the partition is consumed.  A summary is
+available only after the partition is exhausted or skipped: ``summary.key`` and
+``summary.count`` describe the partition, while ``summary.result`` contains the
+reduction result, or ``no_default`` if the partition was skipped.  A reducer
+exception propagates immediately; the input cursor remains at the record that
+raised, the failed partition has no summary, and advancing the outer iterator
+drains its remainder without running the reducer again.
+
+Only adjacent records are grouped, so a key that reappears later starts a new
+partition.  Empty input yields an empty partition iterator.  Discovering the end
+of a partition requires reading the first record of the next partition; that
+record is held in a one-item boundary buffer and is not lost.  Memory use is
+therefore bounded by that buffer plus any state held by the caller, not by the
+size of the whole input.
+
+
 Semi-Streaming ``join``
 -----------------------
 
@@ -310,6 +358,8 @@ using projects specific to data analytics like Pandas_ or SQLAlchemy.
 
 .. _groupby: https://toolz.readthedocs.io/en/latest/api.html#toolz.itertoolz.groupby
 .. _join: https://toolz.readthedocs.io/en/latest/api.html#toolz.itertoolz.join
+.. _partitionby: https://toolz.readthedocs.io/en/latest/api.html#toolz.recipes.partitionby
+.. _partitionby_iter: https://toolz.readthedocs.io/en/latest/api.html#toolz.recipes.partitionby_iter
 .. _reduceby: https://toolz.readthedocs.io/en/latest/api.html#toolz.itertoolz.reduceby
 .. _valmap: https://toolz.readthedocs.io/en/latest/api.html#toolz.dicttoolz.valmap
 .. _Pandas: http://pandas.pydata.org/pandas-docs/stable/groupby.html

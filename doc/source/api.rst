@@ -96,6 +96,7 @@ Recipes
 .. autosummary::
    countby
    partitionby
+   partitionby_iter
 
 Sandbox
 -------
