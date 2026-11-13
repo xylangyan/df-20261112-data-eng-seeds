@@ -3,7 +3,7 @@ import collections
 from functools import reduce
 from collections.abc import Mapping
 
-__all__ = ('merge', 'merge_with', 'valmap', 'keymap', 'itemmap',
+__all__ = ('merge', 'merge_with', 'deep_merge', 'valmap', 'keymap', 'itemmap',
            'valfilter', 'keyfilter', 'itemfilter',
            'assoc', 'dissoc', 'assoc_in', 'update_in', 'get_in')
 
@@ -68,6 +68,115 @@ def merge_with(func, *dicts, **kwargs):
     for k, v in values.items():
         result[k] = func(v.__self__)
     return result
+
+
+_MISSING = object()
+
+
+def deep_merge(*dicts, **kwargs):
+    """ Deeply merge nested mappings with per-field conflict resolution
+
+    Sources are merged key by key, recursing into nested mappings.
+    Semantics for each key:
+
+    - A key missing from a source means that source did not report it.
+    - An explicit ``None`` value retracts any previously reported value;
+      the key is dropped from the result and its full path is recorded
+      in the report under ``'cleared'``.
+    - If several sources report different truthy values for the same
+      field, a per-field decision is made: a rule registered under the
+      full key path in ``rules`` wins, otherwise the last source wins.
+      Either way the field's full path, the competing values, and the
+      source order are recorded in the report under ``'conflicts'``.
+
+    ``rules`` maps a full key path (a tuple of keys) to a function
+    taking the list of reported values and returning the value to keep.
+
+    Inputs are never mutated, and mappings obtained from a one-shot
+    iterable are read exactly once.  A custom ``factory`` is used for
+    the result and for every nested mapping it creates.
+
+    Returns a ``(result, report)`` pair where ``report`` is a dict with
+    ``'conflicts'`` and ``'cleared'`` lists of full key paths.
+
+    >>> result, report = deep_merge({'a': 1, 'b': {'x': 1}},
+    ...                             {'b': {'x': 2, 'y': None}})
+    >>> result
+    {'a': 1, 'b': {'x': 2}}
+    >>> report['cleared']
+    [('b', 'y')]
+
+    >>> result, report = deep_merge({'a': 1}, {'a': 2},
+    ...                             rules={('a',): min})
+    >>> result
+    {'a': 1}
+    >>> report['conflicts']
+    [(('a',), [1, 2], (0, 1))]
+
+    See Also:
+        merge
+        merge_with
+    """
+    if len(dicts) == 1 and not isinstance(dicts[0], Mapping):
+        dicts = tuple(dicts[0])
+    rules = kwargs.pop('rules', None) or {}
+    factory = _get_factory(deep_merge, kwargs)
+
+    conflicts = []
+    cleared = []
+
+    def merge_maps(sources, path):
+        # Read each source exactly once, collecting per-key entries as
+        # (source_index, value) pairs in source order.
+        entries = {}
+        for index, d in enumerate(sources):
+            for k, v in d.items():
+                entries.setdefault(k, []).append((index, v))
+
+        rv = factory()
+        for k, pairs in entries.items():
+            key_path = path + (k,)
+            value = merge_values(pairs, key_path)
+            if value is not _MISSING:
+                rv[k] = value
+        return rv
+
+    def merge_values(pairs, path):
+        values = [v for _, v in pairs]
+        if values[-1] is None:
+            # The latest report retracts the field entirely.
+            cleared.append(path)
+            return _MISSING
+        values = [v for v in values if v is not None]
+        if not values:
+            return _MISSING
+        if all(isinstance(v, Mapping) for v in values):
+            return merge_maps(values, path)
+        if any(isinstance(v, Mapping) for v in values):
+            # Branch shapes disagree: some sources report a nested
+            # mapping, others a plain value.  Record and keep the last.
+            kinds = ['mapping' if isinstance(v, Mapping) else 'value'
+                     for v in values]
+            sources = tuple(i for i, v in pairs if v is not None)
+            conflicts.append((path, kinds, sources))
+            if path in rules:
+                return rules[path](values)
+            return values[-1]
+        distinct = []
+        for v in values:
+            if v not in distinct:
+                distinct.append(v)
+        if len(distinct) == 1:
+            return distinct[0]
+        sources = tuple(i for i, v in pairs if v is not None)
+        conflicts.append((path, values, sources))
+        if path in rules:
+            return rules[path](values)
+        return values[-1]
+
+    result = merge_maps(dicts, ())
+    report = {'conflicts': conflicts, 'cleared': cleared}
+    return result, report
 
 
 def valmap(func, d, factory=dict):

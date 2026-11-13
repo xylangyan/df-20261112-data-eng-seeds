@@ -76,6 +76,7 @@ Dicttoolz
 .. autosummary::
    assoc
    assoc_in
+   deep_merge
    dissoc
    get_in
    itemfilter
