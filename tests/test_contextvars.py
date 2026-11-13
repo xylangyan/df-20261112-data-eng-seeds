@@ -5,13 +5,17 @@
 
 import asyncio
 import inspect
+import logging
 import secrets
+import threading
 
 import pytest
 
 import structlog
 
+from structlog import make_filtering_bound_logger
 from structlog.contextvars import (
+    _ASYNC_CALLING_THREAD,
     _CONTEXT_VARS,
     bind_contextvars,
     bound_contextvars,
@@ -22,6 +26,9 @@ from structlog.contextvars import (
     reset_contextvars,
     unbind_contextvars,
 )
+from structlog.processors import CallsiteParameter, CallsiteParameterAdder
+from structlog.stdlib import BoundLogger as StdlibBoundLogger
+from structlog.testing import CapturingLogger
 
 
 @pytest.fixture(autouse=True)
@@ -302,3 +309,175 @@ class TestBoundContextvars:
         assert "wrapped" == wrapped.__name__
         assert "(arg1)" == str(inspect.signature(wrapped))
         assert "Wrapped documentation" == wrapped.__doc__
+
+
+class TestAsyncContextAttribution:
+    """
+    Async log entries must be attributed to the context that was active at
+    *call time*, even though the processor chain runs on an executor thread.
+    """
+
+    @staticmethod
+    def _build_logger(flavor, sink):
+        """
+        A logger of *flavor* ("stdlib" or "native") whose async entries merge
+        the contextvars context and end in the shared capturing *sink*.
+        """
+        processors = [merge_contextvars]
+
+        if flavor == "stdlib":
+            return StdlibBoundLogger(sink, processors, {})
+
+        return make_filtering_bound_logger(logging.NOTSET)(
+            sink, processors, {}
+        )
+
+    @pytest.fixture(params=["stdlib", "native"])
+    def flavor(self, request):
+        return request.param
+
+    async def test_interleaved_groups_keep_their_partition(self, flavor):
+        """
+        Two source groups logging through a common barrier never swap or lose
+        their ``partition_id``; records are matched by their message.
+        """
+        sink = CapturingLogger()
+        log = self._build_logger(flavor, sink)
+        barrier = asyncio.Barrier(2)
+
+        async def collect(group):
+            bind_contextvars(partition_id=group)
+            await barrier.wait()
+            await log.ainfo(f"{group}-one")
+            await log.ainfo(f"{group}-two")
+
+        await asyncio.gather(collect("A"), collect("B"))
+
+        by_event = {
+            call.kwargs["event"]: call.kwargs
+            for call in sink.calls
+        }
+
+        assert 4 == len(sink.calls)
+        assert "A" == by_event["A-one"]["partition_id"]
+        assert "A" == by_event["A-two"]["partition_id"]
+        assert "B" == by_event["B-one"]["partition_id"]
+        assert "B" == by_event["B-two"]["partition_id"]
+
+    async def test_processor_thread_reads_call_time_context(self, flavor):
+        """
+        The executor-thread processor sees the calling context, including the
+        captured calling thread, rather than the executor's own thread.
+        """
+        sink = CapturingLogger()
+        adder = CallsiteParameterAdder(
+            [
+                CallsiteParameter.THREAD,
+                CallsiteParameter.THREAD_NAME,
+            ]
+        )
+
+        if flavor == "stdlib":
+            log = StdlibBoundLogger(sink, [merge_contextvars, adder], {})
+        else:
+            log = make_filtering_bound_logger(logging.NOTSET)(
+                sink, [merge_contextvars, adder], {}
+            )
+
+        calling_ident = threading.get_ident()
+        calling_name = threading.current_thread().name
+        bind_contextvars(partition_id="A")
+
+        await log.ainfo("thread-attributed")
+
+        (call,) = sink.calls
+        assert calling_ident == call.kwargs["thread"]
+        assert calling_name == call.kwargs["thread_name"]
+        assert "A" == call.kwargs["partition_id"]
+        # The async entry point must not leak the captured metadata into the
+        # calling context once it is done.
+        assert _ASYNC_CALLING_THREAD.get(None) is None
+
+    async def test_nested_override_raises_restores_outer_id(self, flavor):
+        """
+        A temporary nested binding that raises still restores the outer
+        partition ID, and neither the temporary nor the outer value leaks
+        into a sibling task.
+        """
+        sink = CapturingLogger()
+        log = self._build_logger(flavor, sink)
+        barrier = asyncio.Barrier(2)
+
+        async def with_nested_failure():
+            bind_contextvars(partition_id="A")
+            await barrier.wait()
+            try:
+                with bound_contextvars(partition_id="A-nested"):
+                    await log.ainfo("A-nested-before-error")
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+            await log.ainfo("A-restored")
+
+        async def sibling():
+            bind_contextvars(partition_id="B")
+            await barrier.wait()
+            await log.ainfo("B-sibling")
+
+        await asyncio.gather(with_nested_failure(), sibling())
+
+        by_event = {
+            call.kwargs["event"]: call.kwargs
+            for call in sink.calls
+        }
+
+        assert "A-nested" == by_event["A-nested-before-error"][
+            "partition_id"
+        ]
+        assert "A" == by_event["A-restored"]["partition_id"]
+        assert "B" == by_event["B-sibling"]["partition_id"]
+        assert {} == get_contextvars()
+
+    async def test_cancellation_restores_outer_binding(self, flavor):
+        """
+        Cancelling a task inside a nested binding restores the outer value
+        for the next log call made from the parent context.
+        """
+        sink = CapturingLogger()
+        log = self._build_logger(flavor, sink)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def child():
+            with bound_contextvars(partition_id="child"):
+                started.set()
+                await release.wait()
+
+        async def parent():
+            bind_contextvars(partition_id="parent")
+            task = asyncio.create_task(child())
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await log.ainfo("after-cancellation")
+
+        await parent()
+
+        (call,) = sink.calls
+        assert "after-cancellation" == call.kwargs["event"]
+        assert "parent" == call.kwargs["partition_id"]
+
+    async def test_unbound_call_still_logs(self, flavor):
+        """
+        Without any bound partition ID the async entry still writes; the
+        missing key simply stays absent from the event dict.
+        """
+        sink = CapturingLogger()
+        log = self._build_logger(flavor, sink)
+
+        await log.ainfo("no-binding")
+
+        (call,) = sink.calls
+        assert "no-binding" == call.kwargs["event"]
+        assert "partition_id" not in call.kwargs
