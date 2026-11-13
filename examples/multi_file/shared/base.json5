@@ -1,0 +1,11 @@
+// Shared field dictionary. Both a.json5 and b.json5 reference this file,
+// so the dictionary only has to be maintained in one place.
+{
+    name: 'collector',
+    fields: {
+        host: '*',
+        port: 8080,
+    },
+    tags: ['base'],
+    only_base: true,
+}

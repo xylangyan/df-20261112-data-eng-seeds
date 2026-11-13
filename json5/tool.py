@@ -30,6 +30,12 @@ import argparse
 import sys
 
 import json5
+from json5.config_merge import (
+    LIST_APPEND,
+    LIST_REPLACE,
+    ConfigMergeError,
+    load_config,
+)
 from json5.host import Host
 from json5.version import __version__
 
@@ -45,13 +51,6 @@ def main(argv=None, host=None):
         host.print(__version__)
         return 0
 
-    if args.cmd:
-        inp = args.cmd
-    elif args.file == '-':
-        inp = host.stdin.read()
-    else:
-        inp = host.read_text_file(args.file)
-
     if args.indent == 'None':
         args.indent = None
     else:
@@ -64,6 +63,16 @@ def main(argv=None, host=None):
         args.quote_keys = True
         args.trailing_commas = False
         args.quote_style = json5.QuoteStyle.ALWAYS_DOUBLE.value
+
+    if args.multi_file:
+        return _run_multi_file(host, args)
+
+    if args.cmd:
+        inp = args.cmd
+    elif args.file == '-':
+        inp = host.stdin.read()
+    else:
+        inp = host.read_text_file(args.file)
 
     obj = json5.loads(inp, strict=args.strict)
     try:
@@ -80,6 +89,87 @@ def main(argv=None, host=None):
         return 1
     host.print(s)
     return 0
+
+
+def _run_multi_file(host, args):
+    if args.cmd:
+        host.print(
+            'error: --multi-file cannot be combined with -c',
+            file=host.stderr,
+        )
+        return 2
+    if args.file == '-':
+        host.print(
+            'error: --multi-file requires a FILE argument; stdin cannot '
+            'contain relative references',
+            file=host.stderr,
+        )
+        return 2
+
+    config_root = host.normpath(host.abspath(args.config_root))
+    try:
+        result = load_config(
+            host,
+            args.file,
+            config_root,
+            list_policy=args.list_policy,
+            strict=args.strict,
+        )
+    except ConfigMergeError as error:
+        host.print(f'error: {error.message}', file=host.stderr)
+        if error.chain:
+            host.print(
+                'reference chain: ' + ' -> '.join(error.chain),
+                file=host.stderr,
+            )
+        return 1
+
+    if args.show_sources:
+        payload = {
+            'value': result.value,
+            'sources': _relativize(result.sources, config_root, host),
+            'files_loaded': [
+                _relative_path(path, config_root, host)
+                for path in result.files_loaded
+            ],
+        }
+    else:
+        payload = result.value
+
+    try:
+        s = json5.dumps(
+            payload,
+            indent=args.indent,
+            quote_keys=args.quote_keys,
+            trailing_commas=args.trailing_commas,
+            quote_style=QUOTE_STYLES[args.quote_style],
+            allow_nan=not args.as_json,
+        )
+    except ValueError as error:
+        host.print(str(error), file=host.stderr)
+        return 1
+    host.print(s)
+    return 0
+
+
+def _relative_path(path, root, host):
+    prefix = root.rstrip(host.sep) + host.sep
+    if path.startswith(prefix):
+        return path[len(prefix):]
+    return path
+
+
+def _relativize(value, root, host):
+    if isinstance(value, dict):
+        return {
+            key: _relativize(item, root, host)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_relativize(item, root, host) for item in value]
+    if isinstance(value, str):
+        return _relative_path(value, root, host)
+    return value
 
 
 class _HostedArgumentParser(argparse.ArgumentParser):
@@ -188,6 +278,35 @@ def _parse_args(host, argv):
         'double-quoted ("always_double")',
     )
     parser.add_argument(
+        '--multi-file',
+        action='store_true',
+        default=False,
+        help='resolve relative $references between config files, merge them, '
+        'and report which file each value came from (requires FILE)',
+    )
+    parser.add_argument(
+        '--config-root',
+        metavar='DIR',
+        default=None,
+        help='directory every referenced file must stay inside '
+        '(default: the directory containing FILE)',
+    )
+    parser.add_argument(
+        '--list-policy',
+        action='store',
+        default=LIST_REPLACE,
+        choices=(LIST_REPLACE, LIST_APPEND),
+        help='how lists combine when merging: replace the whole list '
+        '(default "replace") or append to it ("append")',
+    )
+    parser.add_argument(
+        '--show-sources',
+        action='store_true',
+        default=False,
+        help='include the per-key source table and the loaded file order '
+        'in the output',
+    )
+    parser.add_argument(
         'file',
         metavar='FILE',
         nargs='?',
@@ -196,7 +315,10 @@ def _parse_args(host, argv):
         'not specified or "-", will read from stdin '
         'instead',
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.config_root is None:
+        args.config_root = host.dirname(host.abspath(args.file))
+    return args
 
 
 if __name__ == '__main__':  # pragma: no cover

@@ -43,6 +43,69 @@ switch the directory layout to move `json5` under a `src` directory
 version of the code), bake that for a month or so as well, and then
 release this as 1.0.
 
+## Multi-file configs
+
+The command line tool can also merge several config files into one
+document. This is useful when several configs share a common field
+dictionary: keep the shared keys in one base file and reference it from
+the others instead of copying it (and inevitably forgetting to update
+one of the copies).
+
+The mode is off by default and must be enabled explicitly with
+`--multi-file`; without it, a key named `$references` is just data and
+`json5.loads()` gives it no special meaning. In multi-file mode each
+file must contain a JSON5 object, and may list relative references:
+
+```json5
+{
+    $references: ['shared/base.json5'],
+    fields: {port: 9001},
+}
+```
+
+Referenced files are loaded first, in the order they are listed, and the
+values in the current file then override what the references
+contributed. Objects merge recursively; a value in the current file only
+replaces the keys it actually mentions. References are resolved relative
+to the directory of the file that lists them, and every resolved path
+must stay inside a config root (by default the directory containing the
+entry file; override with `--config-root`). A file that is referenced
+more than once (a diamond) is only read once.
+
+How lists combine is controlled by `--list-policy`: `replace` (the
+default) swaps in the new list wholesale, while `append` concatenates
+the incoming list onto the existing one.
+
+By default `--multi-file` prints the merged config object, just like
+single-file mode prints the document it read. Use `--show-sources` to
+also report, for every key in the merged result, which file its value
+came from, plus the order the files were loaded in:
+
+```sh
+$ python -m json5 --multi-file --show-sources entry.json5
+{
+    value: {
+        ...
+    },
+    sources: {
+        fields: {
+            host: "shared/base.json5",
+            port: "entry.json5",
+        },
+        ...
+    },
+    files_loaded: [
+        "shared/base.json5",
+        "entry.json5",
+    ],
+}
+```
+
+Circular references, missing files, parse errors, and references that
+escape the config root are all reported as errors; the message includes
+the chain of files that was actually followed to reach the problem.
+See `examples/multi_file/` for a small working setup.
+
 ## Known issues
 
 * Did I mention that it is **SLOW**?
@@ -269,6 +332,10 @@ to activate it.
 ## Version History / Release Notes:
 
 * Unreleased
+    * Add an explicitly enabled `--multi-file` mode to the command line tool
+      that resolves relative `$references`, merges referenced configs before
+      the referring file, reports per-key value provenance, and controls list
+      replacement vs. append. Single-file loads are unchanged.
     * Preserve duck-typed mapping contents without testing their truth value.
     * Preserve duck-typed array contents without testing their truth value.
     * Honor explicit false-valued callable parsing hooks and default encoders

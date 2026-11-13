@@ -19,19 +19,39 @@ import tempfile
 
 
 class Host:
+    sep = os.sep
+
     def __init__(self):
         self.stdin = sys.stdin
         self.stdout = sys.stdout
         self.stderr = sys.stderr
 
+    def abspath(self, *comps):
+        return os.path.abspath(self.join(*comps))
+
     def chdir(self, *comps):
         return os.chdir(self.join(*comps))
+
+    def dirname(self, path):
+        return os.path.dirname(path)
 
     def getcwd(self):
         return os.getcwd()
 
+    def isabs(self, path):
+        return os.path.isabs(path)
+
     def join(self, *comps):
         return os.path.join(*comps)
+
+    def normpath(self, path):
+        return os.path.normpath(path)
+
+    def realpath(self, path):
+        return os.path.realpath(path)
+
+    def makedirs(self, path):
+        os.makedirs(path, exist_ok=True)
 
     def mkdtemp(self, **kwargs):
         return tempfile.mkdtemp(**kwargs)

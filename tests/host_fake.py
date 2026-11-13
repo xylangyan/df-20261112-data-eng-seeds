@@ -72,6 +72,15 @@ class FakeHost:
             p = '/'.join(comps)
         return p
 
+    def isabs(self, path):
+        return path.startswith('/')
+
+    def normpath(self, path):
+        return self.join(path)
+
+    def realpath(self, path):
+        return self.abspath(path)
+
     def maybe_mkdir(self, *comps):  # pragma: no cover
         path = self.abspath(self.join(*comps))
         if path not in self.dirs:
@@ -101,7 +110,10 @@ class FakeHost:
         return self._read(comps)
 
     def _read(self, comps):
-        return self.files[self.abspath(*comps)]
+        path = self.abspath(*comps)
+        if path not in self.files or self.files[path] is None:
+            raise FileNotFoundError(path)
+        return self.files[path]
 
     def remove(self, *comps):
         path = self.abspath(*comps)

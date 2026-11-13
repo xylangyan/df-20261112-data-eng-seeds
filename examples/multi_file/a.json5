@@ -1,0 +1,9 @@
+{
+    $references: ['shared/base.json5'],
+    fields: {
+        port: 9001,
+        region: 'cn',
+    },
+    tags: ['a'],
+    from_a: 1,
+}

@@ -219,3 +219,276 @@ class ToolTest(unittest.TestCase):
 
 if __name__ == '__main__':  # pragma: no cover
     unittest.main()
+
+
+class MultiFileToolTest(unittest.TestCase):
+    maxDiff = None
+
+    def check(self, args, files, returncode=0, out=None, err=None):
+        in_proc = True
+        out_of_proc = True
+
+        if in_proc:
+            fake_host = FakeHost()
+            orig_wd = fake_host.getcwd()
+            tmpdir = fake_host.mkdtemp()
+            fake_host.chdir(tmpdir)
+            for path, contents in files.items():
+                fake_host.write_text_file(path, contents)
+            try:
+                mock_ret = main(args, fake_host)
+            except SystemExit as e:
+                mock_ret = e.code
+            mock_out = fake_host.stdout.getvalue()
+            mock_err = fake_host.stderr.getvalue()
+            fake_host.rmtree(tmpdir)
+            fake_host.chdir(orig_wd)
+            self.assertEqual(returncode, mock_ret)
+            if out is not None:
+                self.assertMultiLineEqual(out, mock_out)
+            if err is not None:
+                self.assertMultiLineEqual(
+                    err.replace('<TMPPARENT>', fake_host.dirname(tmpdir))
+                    .replace('<TMP>', tmpdir),
+                    mock_err,
+                )
+
+        if out_of_proc:
+            host = Host()
+            orig_wd = host.getcwd()
+            tmpdir = host.mkdtemp()
+            try:
+                host.chdir(tmpdir)
+                for path, contents in files.items():
+                    host.makedirs(host.dirname(host.abspath(path)))
+                    host.write_text_file(path, contents)
+                cmd = [sys.executable, '-m', 'json5'] + args
+                with subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding='utf-8',
+                ) as proc:
+                    actual_out, actual_err = proc.communicate()
+                    actual_ret = proc.returncode
+                self.assertEqual(returncode, actual_ret)
+                if out is not None:
+                    self.assertMultiLineEqual(out, actual_out)
+                if err is not None:
+                    self.assertMultiLineEqual(
+                        err.replace(
+                            '<TMPPARENT>', host.dirname(tmpdir)
+                        ).replace('<TMP>', tmpdir),
+                        actual_err,
+                    )
+            finally:
+                host.rmtree(tmpdir)
+                host.chdir(orig_wd)
+
+        if in_proc:
+            return mock_ret, mock_out, mock_err
+        return actual_ret, actual_out, actual_err  # pragma: no cover
+
+    def _diamond_files(self):
+        return {
+            'shared/base.json5': (
+                "{name: 'collector', fields: {host: '*', port: 8080},"
+                " tags: ['base'], only_base: true}"
+            ),
+            'a.json5': (
+                "{$references: ['shared/base.json5'],"
+                " fields: {port: 9001, region: 'cn'},"
+                " tags: ['a'], from_a: 1}"
+            ),
+            'b.json5': (
+                "{$references: ['shared/base.json5'],"
+                " fields: {host: 'example.com'},"
+                " tags: ['b'], from_b: 2}"
+            ),
+            'entry.json5': (
+                "{$references: ['a.json5', 'b.json5'],"
+                " fields: {port: 7000}, top: 'entry'}"
+            ),
+        }
+
+    def test_multi_file_merge_with_sources(self):
+        files = self._diamond_files()
+        expected_out = """{
+    value: {
+        name: "collector",
+        fields: {
+            host: "example.com",
+            port: 7000,
+            region: "cn",
+        },
+        tags: [
+            "b",
+        ],
+        only_base: true,
+        from_a: 1,
+        from_b: 2,
+        top: "entry",
+    },
+    sources: {
+        name: "shared/base.json5",
+        fields: {
+            host: "b.json5",
+            port: "entry.json5",
+            region: "a.json5",
+        },
+        tags: [
+            "b.json5",
+        ],
+        only_base: "shared/base.json5",
+        from_a: "a.json5",
+        from_b: "b.json5",
+        top: "entry.json5",
+    },
+    files_loaded: [
+        "shared/base.json5",
+        "a.json5",
+        "b.json5",
+        "entry.json5",
+    ],
+}
+"""
+        self.check(
+            ['--multi-file', '--show-sources', 'entry.json5'],
+            files,
+            out=expected_out,
+        )
+
+    def test_multi_file_default_output_is_the_merged_config(self):
+        files = self._diamond_files()
+        expected_out = """{
+    name: "collector",
+    fields: {
+        host: "example.com",
+        port: 7000,
+        region: "cn",
+    },
+    tags: [
+        "b",
+    ],
+    only_base: true,
+    from_a: 1,
+    from_b: 2,
+    top: "entry",
+}
+"""
+        self.check(
+            ['--multi-file', 'entry.json5'], files, out=expected_out
+        )
+
+    def test_multi_file_append_policy(self):
+        files = self._diamond_files()
+        expected_out = """{
+    name: "collector",
+    fields: {
+        host: "example.com",
+        port: 7000,
+        region: "cn",
+    },
+    tags: [
+        "base",
+        "a",
+        "base",
+        "b",
+    ],
+    only_base: true,
+    from_a: 1,
+    from_b: 2,
+    top: "entry",
+}
+"""
+        self.check(
+            ['--multi-file', '--list-policy=append', 'entry.json5'],
+            files,
+            out=expected_out,
+        )
+
+    def test_multi_file_cycle_reports_chain(self):
+        files = {
+            'x.json5': "{$references: ['y.json5'], x: 1}",
+            'y.json5': "{$references: ['x.json5'], y: 1}",
+        }
+        expected_err = (
+            'error: circular reference detected: '
+            '<TMP>/x.json5 -> <TMP>/y.json5 -> <TMP>/x.json5\n'
+            'reference chain: '
+            '<TMP>/x.json5 -> <TMP>/y.json5 -> <TMP>/x.json5\n'
+        )
+        self.check(
+            ['--multi-file', 'x.json5'],
+            files,
+            returncode=1,
+            err=expected_err,
+        )
+
+    def test_multi_file_missing_reference(self):
+        files = {'m.json5': "{$references: ['nope.json5']}"}
+        expected_err = (
+            'error: referenced config file not found: <TMP>/nope.json5\n'
+            'reference chain: <TMP>/m.json5 -> <TMP>/nope.json5\n'
+        )
+        self.check(
+            ['--multi-file', 'm.json5'],
+            files,
+            returncode=1,
+            err=expected_err,
+        )
+
+    def test_multi_file_parse_error(self):
+        files = {'bad.json5': '{oops: '}
+        self.check(
+            ['--multi-file', 'bad.json5'],
+            files,
+            returncode=1,
+            err='error: failed to parse <TMP>/bad.json5: '
+            '<string>:1 Unexpected end of input at column 8\n'
+            'reference chain: <TMP>/bad.json5\n',
+        )
+
+    def test_multi_file_outside_root(self):
+        files = {'esc.json5': "{$references: ['../escape.json5']}"}
+        self.check(
+            ['--multi-file', 'esc.json5'],
+            files,
+            returncode=1,
+            err='error: reference <TMPPARENT>/escape.json5 is outside the '
+            'config root <TMP>\n'
+            'reference chain: <TMP>/esc.json5\n',
+        )
+
+    def test_multi_file_requires_file(self):
+        self.check(
+            ['--multi-file'],
+            {},
+            returncode=2,
+            err='error: --multi-file requires a FILE argument; stdin '
+            'cannot contain relative references\n',
+        )
+
+    def test_multi_file_rejects_inline_command(self):
+        self.check(
+            ['--multi-file', '-c', '{a: 1}'],
+            {},
+            returncode=2,
+            err='error: --multi-file cannot be combined with -c\n',
+        )
+
+    def test_single_file_keeps_references_key(self):
+        files = {'a.json5': "{$references: ['x.json5'], a: 1}"}
+        expected_out = """{
+    $references: [
+        "x.json5",
+    ],
+    a: 1,
+}
+"""
+        self.check(['a.json5'], files, out=expected_out)
+
+
+if __name__ == '__main__':  # pragma: no cover
+    unittest.main()

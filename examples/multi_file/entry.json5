@@ -1,0 +1,8 @@
+{
+    // Loaded first, in order; this file overrides them afterwards.
+    $references: ['a.json5', 'b.json5'],
+    fields: {
+        port: 7000,
+    },
+    top: 'entry',
+}

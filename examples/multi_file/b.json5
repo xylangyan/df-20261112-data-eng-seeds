@@ -1,0 +1,8 @@
+{
+    $references: ['shared/base.json5'],
+    fields: {
+        host: 'example.com',
+    },
+    tags: ['b'],
+    from_b: 2,
+}
