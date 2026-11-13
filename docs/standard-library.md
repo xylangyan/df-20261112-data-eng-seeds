@@ -576,5 +576,50 @@ Additionally, for both `logging` and *structlog* -- but only for the colorful lo
 If you leave `foreign_pre_chain` as `None`, formatting will be left to `logging`.
 Meaning: you can define a `format` for {class}`~structlog.stdlib.ProcessorFormatter` too!
 
+#### Merging fields with a stable precedence
+
+In mixed setups, the same field name can reach {class}`~structlog.stdlib.ProcessorFormatter` from four places, and -- because one record may be formatted by several handlers -- the output must not depend on handler order.
+{class}`~structlog.stdlib.FieldMerger` makes the precedence explicit for `logging` records, and the `merge_record_extra` argument enables the same merge without adding a processor to `foreign_pre_chain`.
+
+The effective precedence, from weakest to strongest, is:
+
+1. **Global bindings** -- context-local values merged by {func}`structlog.contextvars.merge_contextvars`, or fields carried on a bound logger's context.
+2. **Call-site fields** -- keyword arguments of the logging call.
+3. **`logging.LogRecord` extras** -- values passed through `extra=` on a standard-library logging call.
+4. **Pre-processors** -- anything a processor assigns to the event dictionary. A processor always mutates the dictionary as it exists when it runs and therefore has the last word on a key.
+
+Three conventions are available through {class}`~structlog.stdlib.FieldMergeMode`:
+
+- `EVENT_DICT_FIRST` (the default): fields already in the event dictionary win; record extras only fill in missing keys. This matches the historical behavior of {class}`~structlog.stdlib.ExtraAdder`.
+- `EXTRA_FIRST`: record extras win over event-dictionary fields.
+- `RAISE`: a collision raises a `ValueError` instead of silently overwriting.
+
+```python
+import logging
+
+import structlog
+from structlog.stdlib import FieldMerger, FieldMergeMode, ProcessorFormatter
+from structlog.processors import JSONRenderer
+
+formatter = ProcessorFormatter(
+    # Merge after the pre-chain so pre-processors still win duplicates.
+    merge_record_extra=FieldMergeMode.EVENT_DICT_FIRST,
+    record_extra_allow={"request_id", "partition"},
+    processors=[
+        ProcessorFormatter.remove_processors_meta,
+        JSONRenderer(),
+    ],
+)
+```
+
+The equivalent explicit form is a `FieldMerger` in `foreign_pre_chain`, which also lets you merge at a chosen point in the chain.
+
+The merger writes to the formatter's private event dictionary only; the `LogRecord` is never modified.
+`ProcessorFormatter.format` starts from a shallow copy of the record, so a pre-processor that renames or drops a key in one handler cannot change the event another handler formats from the same record.
+
+For *structlog* records, the rules are enforced by the regular *structlog* machinery: `merge_contextvars` only fills missing keys, bound-logger context is overwritten by call-site keywords, and a processor that assigns a key wins over everything merged before it.
+
 
 [*python-json-logger*]: https://github.com/nhairs/python-json-logger
+
+

@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.stdlib.FieldMergeMode` and `structlog.stdlib.FieldMerger` define a configurable, stable precedence for fields coming from global bindings, call-site keywords, and `logging.LogRecord` extras. `ProcessorFormatter` can enable the merge without touching `foreign_pre_chain` using the new *merge_record_extra* and *record_extra_allow* arguments.
+  Merging only changes the formatter's private event dictionary, so one handler's renames cannot leak into another handler's event.
+
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

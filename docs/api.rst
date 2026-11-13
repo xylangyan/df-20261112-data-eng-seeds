@@ -323,6 +323,10 @@ API Reference
 
 .. autoclass:: ExtraAdder
 
+.. autoclass:: FieldMerger
+
+.. autoclass:: FieldMergeMode
+
 .. autoclass:: PositionalArgumentsFormatter
 
 .. autoclass:: ProcessorFormatter

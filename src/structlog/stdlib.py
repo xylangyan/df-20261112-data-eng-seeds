@@ -16,6 +16,7 @@ __lazy_modules__ = ["asyncio", "threading", "warnings"]
 
 import asyncio
 import contextvars
+import enum
 import functools
 import logging
 import sys
@@ -57,6 +58,8 @@ from .typing import (
 __all__ = [
     "BoundLogger",
     "ExtraAdder",
+    "FieldMergeMode",
+    "FieldMerger",
     "LoggerFactory",
     "PositionalArgumentsFormatter",
     "ProcessorFormatter",
@@ -1012,6 +1015,129 @@ def render_to_log_kwargs(
     }
 
 
+class FieldMergeMode(enum.Enum):
+    """
+    Precedence conventions used by `FieldMerger` when the same field name is
+    produced by more than one source.
+
+    The four sources that can contribute a field are, from weakest to
+    strongest:
+
+    #. **Global bindings** -- values merged in by *structlog* processors like
+       `structlog.contextvars.merge_contextvars` (context-local bindings) or
+       carried on a bound logger's context.
+    #. **Call-site fields** -- keyword arguments passed at the logging call
+       (``logger.info("event", field=...)``).
+    #. **`logging.LogRecord` extras** -- attributes attached through the
+       ``extra=`` argument of a standard-library logging call, or added to the
+       record by a handler/filter.
+    #. **Pre-processors** -- anything written into the event dictionary by a
+       processor. A processor always sees the dictionary as it exists after
+       the merge and therefore always has the last word on a key it assigns.
+
+    .. versionadded:: 26.2.0
+    """
+
+    EVENT_DICT_FIRST = "event_dict_first"
+    """
+    Fields already in the event dictionary (global bindings and call-site
+    fields) win; `LogRecord` extras only fill in missing keys. This is the
+    default and the safer choice when call-site fields are authoritative.
+    """
+
+    EXTRA_FIRST = "extra_first"
+    """
+    `LogRecord` extras win over global bindings and call-site fields. The
+    event dictionary only fills in keys the record does not provide.
+    """
+
+    RAISE = "raise"
+    """
+    Raise `ValueError` if a `LogRecord` extra and an event-dictionary field
+    carry the same key. Use this in configurations where a silent overwrite
+    would hide a programming error.
+    """
+
+
+class FieldMerger:
+    """
+    Merge legacy `logging.LogRecord` ``extra`` attributes into a foreign
+    event dictionary using a configurable, stable precedence convention.
+
+    Designed to be used in `ProcessorFormatter`'s ``foreign_pre_chain`` (or
+    anywhere a ``_record`` key is present) as a documented replacement for
+    `ExtraAdder` in mixed *structlog*/`logging` setups where both worlds may
+    write the same field. The default `FieldMergeMode.EVENT_DICT_FIRST`
+    convention matches what `ExtraAdder` has always done.
+
+    Only attributes that do not exist on a standard `logging.LogRecord` are
+    considered extras; internal attributes are never merged. The merge works
+    on the record's own dictionary, and the record itself is never modified.
+
+    Args:
+        mode:
+            One of the `FieldMergeMode` members (or its string value).
+            Selects who wins when the same key exists on both sides.
+
+        allow:
+            Optional collection of extra attribute names to consider. If
+            `None`, every non-standard record attribute is considered.
+
+    .. versionadded:: 26.2.0
+    """
+
+    __slots__ = ("_mode", "_allowed")
+
+    def __init__(
+        self,
+        mode: FieldMergeMode | str = FieldMergeMode.EVENT_DICT_FIRST,
+        allow: Collection[str] | None = None,
+    ) -> None:
+        self._mode = FieldMergeMode(mode)
+        self._allowed = None if allow is None else frozenset(allow)
+
+    @property
+    def mode(self) -> FieldMergeMode:
+        """The configured precedence convention."""
+        return self._mode
+
+    def __call__(
+        self, logger: logging.Logger, name: str, event_dict: EventDict
+    ) -> EventDict:
+        record: logging.LogRecord | None = event_dict.get("_record")
+        if record is None:
+            return event_dict
+
+        extras = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _LOG_RECORD_KEYS
+            and (self._allowed is None or key in self._allowed)
+        }
+
+        if self._mode is FieldMergeMode.EVENT_DICT_FIRST:
+            for key, value in extras.items():
+                event_dict.setdefault(key, value)
+            return event_dict
+
+        if self._mode is FieldMergeMode.EXTRA_FIRST:
+            for key, value in extras.items():
+                event_dict[key] = value
+            return event_dict
+
+        conflicts = extras.keys() & event_dict.keys()
+        if conflicts:
+            msg = (
+                "Conflicting field(s) between LogRecord extras and the event "
+                f"dictionary while using FieldMergeMode.RAISE: "
+                f"{sorted(conflicts)}."
+            )
+            raise ValueError(msg)
+
+        event_dict.update(extras)
+        return event_dict
+
+
 class ProcessorFormatter(logging.Formatter):
     r"""
     Call *structlog* processors on `logging.LogRecord`\s.
@@ -1085,8 +1211,51 @@ class ProcessorFormatter(logging.Formatter):
             If True, use ``record.getMessage`` to get a fully rendered log
             message, otherwise use ``str(record.msg)``. (default: True)
 
+        merge_record_extra:
+            If true, merge non-standard `logging.LogRecord` attributes -- the
+            values passed through ``extra=`` on a standard-library logging
+            call -- into the event dictionary of **non**-*structlog* records,
+            even without an explicit `ExtraAdder` in *foreign_pre_chain*.
+
+            Pass a `FieldMergeMode` member (or its string value) to select
+            the precedence convention. ``True`` is equivalent to
+            `FieldMergeMode.EVENT_DICT_FIRST`: fields already present in the
+            event dictionary win and record extras only fill in missing
+            keys. `FieldMergeMode.EXTRA_FIRST` lets record extras win, and
+            `FieldMergeMode.RAISE` turns collisions into a `ValueError`.
+
+            The merge runs immediately after *foreign_pre_chain*, so fields
+            written by *foreign_pre_chain* pre-processors always win over
+            record extras. To merge at a different point, or to restrict the
+            merged attributes, put a `FieldMerger` in *foreign_pre_chain*
+            explicitly and leave this disabled.
+
+            The record itself is never modified: merging writes to the
+            formatter's private event dictionary only, so renaming or
+            dropping a key in one handler cannot change the event another
+            handler formats from the same record. (default: False)
+
+        record_extra_allow:
+            An optional collection of extra attribute names that
+            *merge_record_extra* considers. If `None`, every non-standard
+            record attribute is considered. (default: `None`)
+
     Raises:
         TypeError: If both or neither *processor* and *processors* are passed.
+
+    Field precedence:
+        When the same field can come from several places, the effective
+        precedence -- weakest to strongest -- is:
+
+        1. Global bindings merged by *structlog* processors (for example
+           `structlog.contextvars.merge_contextvars`) or present on a bound
+           logger's context.
+        2. Call-site keyword fields of the logging call.
+        3. `logging.LogRecord` ``extra`` attributes, merged by
+           *merge_record_extra* or a `FieldMerger`/`ExtraAdder`.
+        4. Pre-processors in *foreign_pre_chain* and *processors*: a
+           processor always mutates the dictionary as it exists when it runs
+           and therefore wins over every source merged before it.
 
     .. versionadded:: 17.1.0
     .. versionadded:: 17.2.0 *keep_exc_info* and *keep_stack_info*
@@ -1097,6 +1266,7 @@ class ProcessorFormatter(logging.Formatter):
        *processor* (singular) in favor of *processors* (plural). Removal is not
        planned.
     .. versionadded:: 23.3.0 *use_get_message*
+    .. versionadded:: 26.2.0 *merge_record_extra* and *record_extra_allow*
     """
 
     processors: Sequence[Processor]
@@ -1106,6 +1276,8 @@ class ProcessorFormatter(logging.Formatter):
     logger: logging.Logger | None
     pass_foreign_args: bool
     use_get_message: bool
+    merge_record_extra: FieldMergeMode | None
+    record_extra_allow: frozenset[str] | None
 
     def __init__(
         self,
@@ -1117,6 +1289,8 @@ class ProcessorFormatter(logging.Formatter):
         logger: logging.Logger | None = None,
         pass_foreign_args: bool = False,
         use_get_message: bool = True,
+        merge_record_extra: bool | FieldMergeMode | str = False,
+        record_extra_allow: Collection[str] | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -1144,6 +1318,18 @@ class ProcessorFormatter(logging.Formatter):
         self.logger = logger
         self.pass_foreign_args = pass_foreign_args
         self.use_get_message = use_get_message
+        self.merge_record_extra = (
+            FieldMergeMode.EVENT_DICT_FIRST
+            if merge_record_extra is True
+            else FieldMergeMode(merge_record_extra)
+            if merge_record_extra
+            else None
+        )
+        self.record_extra_allow = (
+            None
+            if record_extra_allow is None
+            else frozenset(record_extra_allow)
+        )
 
     def format(self, record: logging.LogRecord) -> str:
         """
@@ -1200,6 +1386,15 @@ class ProcessorFormatter(logging.Formatter):
             # final processor (e.g. adding timestamps and log levels).
             for proc in self.foreign_pre_chain or ():
                 ed = cast(EventDict, proc(logger, meth_name, ed))
+
+            # Legacy `logging` extras pass through by default only if the
+            # user puts ExtraAdder/FieldMerger into foreign_pre_chain. The
+            # convenience switch merges them *after* the chain so that
+            # pre-processors keep the last word on duplicate keys.
+            if self.merge_record_extra is not None:
+                ed = FieldMerger(
+                    self.merge_record_extra, self.record_extra_allow
+                )(logger, meth_name, ed)
 
         # If required, unset stack-related attributes on the record copy so
         # that the base implementation doesn't append stacktraces to the

@@ -28,6 +28,11 @@ from structlog import (
     wrap_logger,
 )
 from structlog._config import _CONFIG
+from structlog.contextvars import (
+    bind_contextvars,
+    clear_contextvars,
+    merge_contextvars,
+)
 from structlog._log_levels import CRITICAL, DEBUG, NAME_TO_LEVEL, WARN
 from structlog.dev import ConsoleRenderer
 from structlog.exceptions import DropEvent
@@ -36,6 +41,8 @@ from structlog.stdlib import (
     AsyncBoundLogger,
     BoundLogger,
     ExtraAdder,
+    FieldMerger,
+    FieldMergeMode,
     LoggerFactory,
     PositionalArgumentsFormatter,
     ProcessorFormatter,
@@ -733,6 +740,112 @@ class TestExtraAdder:
         }
 
 
+class TestFieldMerger:
+    def test_event_dict_first(self, make_log_record):
+        """
+        Event dict fields win over LogRecord extras; extras fill in the rest.
+        """
+        record = make_log_record()
+        record.partition = "record"
+        record.legacy = "kept"
+
+        event_dict = {
+            "event": "event",
+            "partition": "event-dict",
+            "_record": record,
+        }
+
+        assert {
+            "event": "event",
+            "partition": "event-dict",
+            "legacy": "kept",
+            "_record": record,
+        } == FieldMerger()(None, None, event_dict)
+
+    def test_extra_first(self, make_log_record):
+        """
+        LogRecord extras win over event dict fields.
+        """
+        record = make_log_record()
+        record.partition = "record"
+
+        event_dict = {
+            "event": "event",
+            "partition": "event-dict",
+            "_record": record,
+        }
+
+        assert {
+            "event": "event",
+            "partition": "record",
+            "_record": record,
+        } == FieldMerger(FieldMergeMode.EXTRA_FIRST)(None, None, event_dict)
+
+    def test_raise_on_conflict(self, make_log_record):
+        """
+        RAISE turns a conflict into a ValueError naming the fields.
+        """
+        record = make_log_record()
+        record.partition = "record"
+
+        with pytest.raises(ValueError, match=r"\['partition'\]"):
+            FieldMerger(FieldMergeMode.RAISE)(
+                None, None, {"partition": "event-dict", "_record": record}
+            )
+
+    def test_raise_without_conflict(self, make_log_record):
+        """
+        RAISE only complains about actual collisions.
+        """
+        record = make_log_record()
+        record.legacy = "kept"
+
+        assert {
+            "event": "event",
+            "legacy": "kept",
+            "_record": record,
+        } == FieldMerger(FieldMergeMode.RAISE)(
+            None, None, {"event": "event", "_record": record}
+        )
+
+    def test_allow(self, make_log_record):
+        """
+        Only allowed extras are merged.
+        """
+        record = make_log_record()
+        record.keep = "yes"
+        record.drop = "no"
+
+        assert {
+            "event": "event",
+            "keep": "yes",
+            "_record": record,
+        } == FieldMerger(allow={"keep"})(
+            None, None, {"event": "event", "_record": record}
+        )
+
+    def test_no_record(self):
+        """
+        Without a _record key, the event dict is passed through unchanged.
+        """
+        event_dict = {"event": "event"}
+
+        assert event_dict is FieldMerger()(None, None, event_dict)
+
+    def test_record_is_not_mutated(self, make_log_record):
+        """
+        Merging copies values, it never moves or removes record attributes.
+        """
+        record = make_log_record()
+        record.legacy = "kept"
+
+        FieldMerger(FieldMergeMode.EXTRA_FIRST)(
+            None, None, {"legacy": "event-dict", "_record": record}
+        )
+
+        assert "kept" == record.legacy
+
+
 @pytest.fixture(name="stdlib_logger")
 def _stdlib_logger():
     logger = logging.getLogger("test_logger")
@@ -1277,6 +1390,247 @@ class TestProcessorFormatter:
         handler2_record = handler2.handle.call_args_list[0].args[0]
 
         assert "meh" == handler2_record.msg
+
+    def test_three_outputs_field_merge_contract(self):
+        """
+        The acceptance scenario: one LogRecord through two differently
+        configured handlers and one structlog event with a bound field.
+
+        Pre-chain processors win over event-dict fields; the merge mode
+        decides whether they also win over record extras. On the structlog
+        side, global contextvars are weak, bound fields beat them, and
+        call-site fields beat bound fields. Pre-processors have the last
+        word.
+        """
+        clear_contextvars()
+
+        record_extras = {
+            "partition": "record-partition",
+            "legacy_extra": 42,
+        }
+
+        def to_pre_chain(_, __, event_dict):
+            event_dict["partition"] = "pre-chain-partition"
+
+            return event_dict
+
+        def handler(formatter):
+            stream = StringIO()
+            rv = logging.StreamHandler(stream)
+            rv.setLevel(logging.DEBUG)
+            rv.setFormatter(formatter)
+
+            return rv, stream
+
+        def json_formatter(**kwargs):
+            return ProcessorFormatter(
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ],
+                **kwargs,
+            )
+
+        logger = logging.getLogger("acceptance")
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+
+        event_first_handler, event_first = handler(
+            json_formatter(
+                foreign_pre_chain=[to_pre_chain],
+                merge_record_extra=FieldMergeMode.EVENT_DICT_FIRST,
+            )
+        )
+        extra_first_handler, extra_first = handler(
+            json_formatter(
+                foreign_pre_chain=[to_pre_chain],
+                merge_record_extra=FieldMergeMode.EXTRA_FIRST,
+            )
+        )
+        logger.addHandler(event_first_handler)
+        logger.addHandler(extra_first_handler)
+
+        record = logger.makeRecord(
+            "acceptance",
+            logging.INFO,
+            "path.py",
+            42,
+            "request failed",
+            (),
+            None,
+            extra=record_extras,
+        )
+        logger.handle(record)
+
+        event_first_obj = json.loads(event_first.getvalue())
+        extra_first_obj = json.loads(extra_first.getvalue())
+
+        assert {
+            "event": "request failed",
+            "partition": "pre-chain-partition",
+            "legacy_extra": 42,
+        } == event_first_obj
+        assert {
+            "event": "request failed",
+            "partition": "record-partition",
+            "legacy_extra": 42,
+        } == extra_first_obj
+
+        # Structlog side: one bound field, one global contextvar, and one
+        # call-site field all write "partition".
+        bind_contextvars(
+            partition="contextvar-partition", tenant="global-tenant"
+        )
+        try:
+            configure(
+                processors=[
+                    merge_contextvars,
+                    add_log_level,
+                    ProcessorFormatter.wrap_for_formatter,
+                ],
+                logger_factory=LoggerFactory(),
+                wrapper_class=BoundLogger,
+            )
+
+            structlog_logger = logging.getLogger("structlog-acceptance")
+            structlog_handler, structlog_output = handler(
+                json_formatter()
+            )
+            structlog_logger.addHandler(structlog_handler)
+            structlog_logger.setLevel(logging.DEBUG)
+            structlog_logger.propagate = False
+
+            get_logger("structlog-acceptance").bind(
+                partition="bound-partition", bound_only=True
+            ).info(
+                "struct event",
+                partition="callsite-partition",
+                callsite_only=True,
+            )
+        finally:
+            clear_contextvars()
+
+        structlog_obj = json.loads(structlog_output.getvalue())
+
+        assert {
+            "partition": "callsite-partition",
+            "callsite_only": True,
+            "bound_only": True,
+            "event": "struct event",
+            "tenant": "global-tenant",
+            "level": "info",
+        } == structlog_obj
+
+    def test_one_handler_rename_does_not_leak_to_other(self):
+        """
+        A pre-processor that renames fields only mutates the formatter's
+        private event dictionary: the other handler and the LogRecord keep
+        the original values.
+        """
+        def rename(_, __, event_dict):
+            event_dict["renamed_event"] = event_dict.pop("event")
+            event_dict["renamed_legacy"] = event_dict.pop("legacy")
+
+            return event_dict
+
+        def json_formatter(pre_chain):
+            return ProcessorFormatter(
+                foreign_pre_chain=pre_chain,
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ],
+            )
+
+        stream_a, stream_b = StringIO(), StringIO()
+        handler_a = logging.StreamHandler(stream_a)
+        handler_a.setFormatter(
+            json_formatter([ExtraAdder(), rename])
+        )
+        handler_b = logging.StreamHandler(stream_b)
+        handler_b.setFormatter(json_formatter([ExtraAdder()]))
+
+        logger = logging.getLogger("rename-isolation")
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler_a)
+        logger.addHandler(handler_b)
+
+        record = logger.makeRecord(
+            "rename-isolation",
+            logging.INFO,
+            "path.py",
+            42,
+            "boom",
+            (),
+            None,
+            extra={"legacy": "L-1"},
+        )
+        logger.handle(record)
+
+        assert {
+            "renamed_event": "boom",
+            "renamed_legacy": "L-1",
+        } == json.loads(stream_a.getvalue())
+        assert {
+            "event": "boom",
+            "legacy": "L-1",
+        } == json.loads(stream_b.getvalue())
+        assert "boom" == record.msg
+        assert "L-1" == record.legacy
+
+    def test_merge_record_extra_allow_and_disabled(self):
+        """
+        merge_record_extra can be restricted, and is off by default.
+        """
+        def json_formatter(**kwargs):
+            return ProcessorFormatter(
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ],
+                **kwargs,
+            )
+
+        logger = logging.getLogger("merge-allow")
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        first, second, third = StringIO(), StringIO(), StringIO()
+        for stream, formatter in (
+            (first, json_formatter(merge_record_extra=True)),
+            (
+                second,
+                json_formatter(
+                    merge_record_extra=True, record_extra_allow={"keep"}
+                ),
+            ),
+            (third, json_formatter()),
+        ):
+            handler = logging.StreamHandler(stream)
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+
+        record = logger.makeRecord(
+            "merge-allow",
+            logging.INFO,
+            "path.py",
+            42,
+            "event",
+            (),
+            None,
+            extra={"keep": "yes", "drop": "no"},
+        )
+        logger.handle(record)
+
+        assert {
+            "event": "event",
+            "keep": "yes",
+            "drop": "no",
+        } == json.loads(first.getvalue())
+        assert {"event": "event", "keep": "yes"} == json.loads(
+            second.getvalue()
+        )
+        assert {"event": "event"} == json.loads(third.getvalue())
 
     @pytest.mark.parametrize("keep", [True, False])
     def test_formatter_unsets_exc_info(self, capsys, keep):
