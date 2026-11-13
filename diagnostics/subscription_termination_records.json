@@ -1,0 +1,251 @@
+{
+  "diagnostic": "graphql-core subscription termination",
+  "events": [
+    "event-1",
+    "event-2",
+    "event-3"
+  ],
+  "scenarios": [
+    {
+      "scenario": "source_error",
+      "records": [
+        {
+          "action": "subscribe_returned_stream"
+        },
+        {
+          "action": "caller_next",
+          "pull": 1
+        },
+        {
+          "action": "source_enter"
+        },
+        {
+          "action": "source_yield",
+          "event": "event-1"
+        },
+        {
+          "action": "resolver_enter",
+          "event": "event-1"
+        },
+        {
+          "action": "caller_observed",
+          "pull": 1,
+          "kind": "result",
+          "data": {
+            "event": "EVENT-1"
+          },
+          "errors": []
+        },
+        {
+          "action": "caller_next",
+          "pull": 2
+        },
+        {
+          "action": "source_raise",
+          "error": {
+            "type": "RuntimeError",
+            "message": "source failed after event-1"
+          }
+        },
+        {
+          "action": "source_finally"
+        },
+        {
+          "action": "caller_observed",
+          "pull": 2,
+          "kind": "exception",
+          "type": "RuntimeError",
+          "message": "source failed after event-1"
+        },
+        {
+          "action": "caller_next",
+          "pull": 3
+        },
+        {
+          "action": "caller_observed",
+          "pull": 3,
+          "kind": "stop"
+        },
+        {
+          "action": "diagnostic_cleanup_close"
+        }
+      ]
+    },
+    {
+      "scenario": "resolver_error",
+      "records": [
+        {
+          "action": "subscribe_returned_stream"
+        },
+        {
+          "action": "caller_next",
+          "pull": 1
+        },
+        {
+          "action": "source_enter"
+        },
+        {
+          "action": "source_yield",
+          "event": "event-1"
+        },
+        {
+          "action": "resolver_enter",
+          "event": "event-1"
+        },
+        {
+          "action": "caller_observed",
+          "pull": 1,
+          "kind": "result",
+          "data": {
+            "event": "EVENT-1"
+          },
+          "errors": []
+        },
+        {
+          "action": "caller_next",
+          "pull": 2
+        },
+        {
+          "action": "source_yield",
+          "event": "event-2"
+        },
+        {
+          "action": "resolver_enter",
+          "event": "event-2"
+        },
+        {
+          "action": "resolver_raise",
+          "event": "event-2",
+          "error": {
+            "type": "RuntimeError",
+            "message": "resolver failed on event-2"
+          }
+        },
+        {
+          "action": "caller_observed",
+          "pull": 2,
+          "kind": "result",
+          "data": {
+            "event": null
+          },
+          "errors": [
+            {
+              "type": "GraphQLError",
+              "message": "resolver failed on event-2\n\nGraphQL request:1:16\n1 | subscription { event }\n  |                ^"
+            }
+          ]
+        },
+        {
+          "action": "caller_next",
+          "pull": 3
+        },
+        {
+          "action": "source_yield",
+          "event": "event-3"
+        },
+        {
+          "action": "resolver_enter",
+          "event": "event-3"
+        },
+        {
+          "action": "caller_observed",
+          "pull": 3,
+          "kind": "result",
+          "data": {
+            "event": "EVENT-3"
+          },
+          "errors": []
+        },
+        {
+          "action": "caller_next",
+          "pull": 4
+        },
+        {
+          "action": "source_exhausted"
+        },
+        {
+          "action": "source_finally"
+        },
+        {
+          "action": "caller_observed",
+          "pull": 4,
+          "kind": "stop"
+        },
+        {
+          "action": "diagnostic_cleanup_close"
+        }
+      ]
+    },
+    {
+      "scenario": "caller_close",
+      "records": [
+        {
+          "action": "subscribe_returned_stream"
+        },
+        {
+          "action": "caller_next",
+          "pull": 1
+        },
+        {
+          "action": "source_enter"
+        },
+        {
+          "action": "source_yield",
+          "event": "event-1"
+        },
+        {
+          "action": "resolver_enter",
+          "event": "event-1"
+        },
+        {
+          "action": "caller_observed",
+          "pull": 1,
+          "kind": "result",
+          "data": {
+            "event": "EVENT-1"
+          },
+          "errors": []
+        },
+        {
+          "action": "caller_next",
+          "pull": 2
+        },
+        {
+          "action": "source_yield",
+          "event": "event-2"
+        },
+        {
+          "action": "resolver_enter",
+          "event": "event-2"
+        },
+        {
+          "action": "caller_observed",
+          "pull": 2,
+          "kind": "result",
+          "data": {
+            "event": "EVENT-2"
+          },
+          "errors": []
+        },
+        {
+          "action": "caller_close"
+        },
+        {
+          "action": "source_finally"
+        },
+        {
+          "action": "caller_next",
+          "pull": 3
+        },
+        {
+          "action": "caller_observed",
+          "pull": 3,
+          "kind": "stop"
+        },
+        {
+          "action": "diagnostic_cleanup_close"
+        }
+      ]
+    }
+  ]
+}
