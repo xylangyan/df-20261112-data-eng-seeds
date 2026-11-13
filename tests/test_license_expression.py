@@ -34,6 +34,12 @@ from license_expression import ParseError
 from license_expression import Token
 
 from license_expression import build_token_groups_for_with_subexpression
+from license_expression import ExpressionMigration
+from license_expression import LicenseMigrationIndex
+from license_expression import migrate_expression
+from license_expression import migrate_license_expression
+from license_expression import MigrationRecord
+from license_expression import SymbolMigrationIndex
 from license_expression import validate_symbols
 
 from license_expression import TOKEN_AND
@@ -2640,3 +2646,207 @@ class CombineExpressionTest(TestCase):
 
     def test_combine_expressions_with_or_relationship(self):
         assert str(combine_expressions(["mit", "apache-2.0"], "OR")) == "mit OR apache-2.0"
+
+
+class SymbolMigrationTest(TestCase):
+    test_data_dir = join(dirname(__file__), "data")
+
+    def get_licensing_and_index(self):
+        symbols = [
+            LicenseSymbol("gpl-2.0"),
+            LicenseSymbol("gpl-2.0-plus"),
+            LicenseSymbol("classpath-exception-2.0", is_exception=True),
+            LicenseSymbol("classpath-notice", is_exception=True),
+            LicenseSymbol("mit"),
+            LicenseSymbol("bsd-new"),
+        ]
+        licensing = Licensing(symbols)
+        migration_index_location = join(self.test_data_dir, "test_symbol_migration_index.json")
+        migration_index = SymbolMigrationIndex.load(migration_index_location)
+        return licensing, migration_index
+
+    def test_migration_index_keeps_source_specific_mappings(self):
+        _licensing, migration_index = self.get_licensing_and_index()
+
+        assert migration_index.get_sources() == ("collector-a:v1", "collector-b:v2")
+
+        # the same old spelling resolves to a different key per source version
+        assert migration_index.resolve("GPLv2", "collector-a:v1") == ("gpl-2.0",)
+        assert migration_index.resolve("gplv2", "collector-b:v2") == ("gpl-2.0-plus",)
+
+        # a spelling mapped to several keys is reported as ambiguous
+        assert migration_index.resolve("classpath", "collector-a:v1") == (
+            "classpath-exception-2.0",
+            "classpath-notice",
+        )
+        assert migration_index.resolve("classpath", "collector-b:v2") == (
+            "classpath-exception-2.0",
+        )
+
+        # unknown spelling or source yields no target instead of a guess
+        assert migration_index.resolve("not-a-license", "collector-a:v1") == tuple()
+        assert migration_index.resolve("gplv2", "collector-a:v0") == tuple()
+
+    def test_migrate_expression_preserves_structure_and_records_replacements(self):
+        licensing, migration_index = self.get_licensing_and_index()
+        original = "gplv2 AND (mit OR bsd)"
+
+        result = licensing.migrate(original, "collector-b:v2", migration_index)
+
+        assert isinstance(result, ExpressionMigration)
+        assert result.source == "collector-b:v2"
+        assert result.original_expression == original
+        assert result.migrated_expression == "gpl-2.0-plus AND (mit OR bsd-new)"
+        assert result.records == [
+            MigrationRecord("gplv2", "gpl-2.0-plus", 0),
+            MigrationRecord("bsd", "bsd-new", 18),
+        ]
+        # mit is not mapped by collector-b:v2 and is reported, not guessed
+        assert result.errors == [
+            {
+                "token": "mit",
+                "position": 11,
+                "reason": "unknown symbol",
+                "candidate_keys": [],
+                "source": "collector-b:v2",
+            }
+        ]
+        # AND, OR and parenthesis semantics are preserved by re-parsing the output
+        assert licensing.parse(result.migrated_expression).render() == result.migrated_expression
+
+    def test_migrate_with_qualifier_alias_conflict_is_ambiguous(self):
+        licensing, migration_index = self.get_licensing_and_index()
+        original = "GPLv2 WITH classpath"
+
+        result_a = licensing.migrate(original, "collector-a:v1", migration_index)
+
+        # the license side is migrated, the ambiguous qualifier keeps its spelling
+        assert result_a.migrated_expression == "gpl-2.0 WITH classpath"
+        assert result_a.records == [
+            MigrationRecord("GPLv2", "gpl-2.0", 0),
+        ]
+        assert result_a.errors == [
+            {
+                "token": "classpath",
+                "position": 11,
+                "reason": "ambiguous symbol",
+                "candidate_keys": ["classpath-exception-2.0", "classpath-notice"],
+                "source": "collector-a:v1",
+            }
+        ]
+
+        # the same spelling is unambiguous in the other source version
+        result_b = licensing.migrate(original, "collector-b:v2", migration_index)
+        assert result_b.migrated_expression == "gpl-2.0-plus WITH classpath-exception-2.0"
+        assert result_b.records == [
+            MigrationRecord("GPLv2", "gpl-2.0-plus", 0),
+            MigrationRecord("classpath", "classpath-exception-2.0", 11),
+        ]
+        assert result_b.errors == []
+
+    def test_migrate_with_conflict_inside_nested_expression(self):
+        licensing, migration_index = self.get_licensing_and_index()
+        original = "(GPLv2 WITH classpath) AND (mit OR bsd)"
+
+        result = licensing.migrate(original, "collector-a:v1", migration_index)
+
+        assert result.original_expression == original
+        # the semantically required parens around the OR branch are preserved
+        assert result.migrated_expression == "gpl-2.0 WITH classpath AND (mit OR bsd-new)"
+        # mit is mapped to its existing spelling and is not a replacement
+        assert result.records == [
+            MigrationRecord("GPLv2", "gpl-2.0", 1),
+            MigrationRecord("bsd", "bsd-new", 35),
+        ]
+        assert [error["reason"] for error in result.errors] == ["ambiguous symbol"]
+        assert result.errors[0]["token"] == "classpath"
+        assert result.errors[0]["position"] == 12
+        # the migrated string parses back to the same tree as the render output
+        assert licensing.parse(result.migrated_expression).render() == result.migrated_expression
+
+    def test_migrate_without_version_uses_existing_parsing_without_guessing(self):
+        licensing, migration_index = self.get_licensing_and_index()
+        original = "gplv2 AND bsd"
+
+        for source in (None, "collector-a:v0"):
+            result = licensing.migrate(original, source, migration_index)
+
+            assert result.original_expression == original
+            assert result.migrated_expression == licensing.parse(original).render()
+            assert result.migrated_expression == "gplv2 AND bsd"
+            assert result.records == []
+            assert result.errors == []
+
+    def test_migrate_strict_raises_on_ambiguous_or_unknown_symbols(self):
+        licensing, migration_index = self.get_licensing_and_index()
+
+        with self.assertRaises(ExpressionError):
+            licensing.migrate(
+                "GPLv2 WITH classpath",
+                "collector-a:v1",
+                migration_index,
+                strict=True,
+            )
+
+        with self.assertRaises(ExpressionError):
+            licensing.migrate(
+                "gplv2 AND not-a-license",
+                "collector-b:v2",
+                migration_index,
+                strict=True,
+            )
+
+    def test_migrate_empty_expression(self):
+        licensing, migration_index = self.get_licensing_and_index()
+
+        result = licensing.migrate("   ", "collector-a:v1", migration_index)
+
+        assert result.original_expression == "   "
+        assert result.migrated_expression == ""
+        assert result.records == []
+        assert result.errors == []
+
+    def test_migrate_expression_function_entry_point(self):
+        licensing, migration_index = self.get_licensing_and_index()
+
+        result = migrate_expression(
+            expression="gplv2 OR bsd",
+            source="collector-b:v2",
+            licensing=licensing,
+            migration_index=migration_index,
+        )
+
+        assert result == licensing.migrate("gplv2 OR bsd", "collector-b:v2", migration_index)
+        assert result.migrated_expression == "gpl-2.0-plus OR bsd-new"
+        assert result.records == [
+            MigrationRecord("gplv2", "gpl-2.0-plus", 0),
+            MigrationRecord("bsd", "bsd-new", 9),
+        ]
+
+    def test_migrate_requires_a_symbol_migration_index(self):
+        licensing, _migration_index = self.get_licensing_and_index()
+
+        with self.assertRaises(TypeError):
+            licensing.migrate("gplv2", "collector-b:v2", {"collector-b:v2": {}})
+
+    def test_migrate_alias_entry_points_and_record_properties(self):
+        licensing, migration_index = self.get_licensing_and_index()
+
+        result = migrate_license_expression(
+            expression="gplv2 OR bsd",
+            source="collector-b:v2",
+            licensing=licensing,
+            migration_index=migration_index,
+        )
+
+        assert isinstance(result, ExpressionMigration)
+        assert result.original == result.original_expression
+        assert result.migrated == result.migrated_expression
+        assert result.replacements == result.records
+
+        record = result.records[0]
+        assert record.original == record.original_spelling
+        assert record.target == record.target_key
+
+        # the index alias exposes the same mappings
+        assert LicenseMigrationIndex is SymbolMigrationIndex

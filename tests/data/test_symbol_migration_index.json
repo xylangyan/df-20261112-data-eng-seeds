@@ -1,0 +1,16 @@
+{
+  "collector-a:v1": {
+    "gplv2": "gpl-2.0",
+    "classpath": [
+      "classpath-exception-2.0",
+      "classpath-notice"
+    ],
+    "mit": "mit",
+    "bsd": "bsd-new"
+  },
+  "collector-b:v2": {
+    "gplv2": "gpl-2.0-plus",
+    "classpath": "classpath-exception-2.0",
+    "bsd": "bsd-new"
+  }
+}

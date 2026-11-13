@@ -558,6 +558,29 @@ class Licensing(boolean.BooleanAlgebra):
 
         return expression
 
+    def parse_tokens(self, tokens):
+        """
+        Return a new license LicenseExpression object by parsing a ``tokens``
+        sequence of standard 3-tuple parser tokens as yielded by tokenize().
+
+        Raise an ExpressionParseError on syntax errors, the same way parse()
+        does for an expression string.
+        """
+        try:
+            expression = super(Licensing, self).parse(tokens)
+        except ParseError as e:
+            raise ExpressionParseError(
+                token_type=e.token_type,
+                token_string=e.token_string,
+                position=e.position,
+                error_code=e.error_code,
+            ) from e
+
+        if not isinstance(expression, LicenseExpression):
+            raise ExpressionError("expression must be a LicenseExpression once parsed.")
+
+        return expression
+
     def tokenize(self, expression, strict=False, simple=False):
         """
         Return an iterable of 3-tuple describing each token given an
@@ -611,6 +634,30 @@ class Licensing(boolean.BooleanAlgebra):
                 raise ParseError(error_code=PARSE_INVALID_EXPRESSION)
 
             yield token_obj, token_string, pos
+
+    def tokenize_from_tokens(self, tokens, strict=False):
+        """
+        Yield the standard 3-tuple parser tokens from a sequence of Token,
+        skipping whitespace and grouping "XXX WITH YYY" sequences as a
+        LicenseWithExceptionSymbol.
+
+        This reuses the same post-processing as tokenize() but accepts an
+        existing Token sequence, such as the symbols replaced during a
+        migration, instead of tokenizing an expression string again.
+        """
+        tokens = (token for token in tokens if token.string and token.string.strip())
+        tokens = replace_with_subexpression_by_license_symbol(tokens, strict)
+
+        for token in tokens:
+            token_value = token.value
+            if isinstance(token_value, BaseSymbol):
+                token_obj = token_value
+            elif isinstance(token_value, Keyword):
+                token_obj = token_value.type
+            else:
+                raise ParseError(error_code=PARSE_INVALID_EXPRESSION)
+
+            yield token_obj, token.string, token.start
 
     def get_advanced_tokenizer(self):
         """
@@ -832,6 +879,293 @@ class Licensing(boolean.BooleanAlgebra):
         if not expression_info.errors and not expression_info.invalid_symbols:
             expression_info.normalized_expression = str(parsed_expression)
         return expression_info
+
+    def migrate(self, expression, source, migration_index, strict=False):
+        """
+        Return an ExpressionMigration created by migrating the old license and
+        exception symbols of a license ``expression`` using the known
+        ``source`` collection source version and a ``migration_index``.
+
+        This only performs data conversion: the expression is parsed with the
+        regular tokenizer, therefore its AND, OR, WITH and parenthesis syntax is
+        preserved. Symbols are then replaced one by one using the mappings of
+        the ``migration_index`` for the given ``source`` and the result is
+        re-parsed and rendered with this Licensing.
+
+        ``source`` is the versioned name of the collection source of the
+        expression, such as ``"collector-a:v1"``. If the source is unknown to
+        the ``migration_index`` or no source is provided, no migration is
+        attempted: the expression is parsed and rendered as-is and no
+        replacement record is returned.
+
+        Each symbol whose spelling is replaced keeps a MigrationRecord storing
+        its original spelling and the target license key. Symbols mapped to
+        their existing spelling are not recorded as replacements. Symbols that
+        are ambiguous (the same original spelling maps to several target keys
+        for this source) or unknown (no mapping exists for this source) are
+        left untouched and reported in the ExpressionMigration errors with the
+        offending token string and its position in the original expression.
+
+        If ``strict`` is True, an ExpressionError is raised when the migrated
+        expression contains ambiguous or unknown symbols. Otherwise the
+        migration still succeeds and these symbols keep their original spelling
+        in the migrated expression.
+        """
+        return migrate_expression(
+            expression=expression,
+            source=source,
+            licensing=self,
+            migration_index=migration_index,
+            strict=strict,
+        )
+
+
+class MigrationRecord(
+    namedtuple("MigrationRecordFields", "original_spelling target_key position")
+):
+    """
+    A single symbol replacement made during a migration.
+
+    Keep the ``original_spelling`` as found in the source expression and the
+    ``target_key`` it resolves to. ``position`` is the starting index of the
+    original spelling in the source expression.
+    """
+
+    __slots__ = ()
+
+    @property
+    def original(self):
+        return self.original_spelling
+
+    @property
+    def target(self):
+        return self.target_key
+
+
+class ExpressionMigration(
+    namedtuple(
+        "ExpressionMigrationFields",
+        "source original_expression migrated_expression records errors",
+    )
+):
+    """
+    The result of migrating an expression.
+
+    ``records`` is the list of MigrationRecord for symbols whose spelling
+    changed. ``errors`` is the list of mappings that could not be resolved
+    unambiguously and keep their original spelling in the migrated expression.
+    """
+
+    __slots__ = ()
+
+    @property
+    def original(self):
+        return self.original_expression
+
+    @property
+    def migrated(self):
+        return self.migrated_expression
+
+    @property
+    def replacements(self):
+        return self.records
+
+
+class SymbolMigrationIndex:
+    """
+    A versioned index of symbol mappings used to migrate license expressions
+    collected by different sources across license vocabulary generations.
+
+    The index only stores data conversion rules. It maps a collection source
+    version (such as ``"collector-a:v1"``) to mappings between the original
+    spelling of an old license or exception symbol and the license key it
+    resolves to in the current vocabulary.
+
+    The same original spelling may resolve to different keys across source
+    versions and a spelling mapped to several keys for the same source is
+    treated as ambiguous instead of being guessed.
+
+    An index is built from mappings such as::
+
+        {
+            "collector-a:v1": {
+                "gplv2": "gpl-2.0",
+                "classpath": ["classpath-exception-2.0", "classpath-notice"],
+            },
+            "collector-b:v2": {
+                "gplv2": "gpl-2.0-plus",
+            },
+        }
+    """
+
+    def __init__(self, mappings=None):
+        self.mappings = mappings or {}
+        # mapping of source to mapping of normalized original spelling to
+        # tuple of target license keys
+        self._index = {}
+        for source, source_mappings in self.mappings.items():
+            normalized = {}
+            for original_spelling, target_keys in source_mappings.items():
+                if isinstance(target_keys, str):
+                    target_keys = (target_keys,)
+                else:
+                    target_keys = tuple(target_keys)
+                normalized[normalize_symbol_spelling(original_spelling)] = target_keys
+            self._index[source] = normalized
+
+    @classmethod
+    def load(cls, location):
+        """
+        Return a SymbolMigrationIndex loaded from the JSON file at
+        ``location``.
+        """
+        with open(location) as migration_index_file:
+            return cls(json.load(migration_index_file))
+
+    def get_sources(self):
+        """
+        Return the collection source versions known to this index.
+        """
+        return tuple(self._index)
+
+    def resolve(self, original_spelling, source):
+        """
+        Return a tuple of target license keys for an ``original_spelling``
+        symbol as collected by ``source``.
+
+        Return an empty tuple when the source or the spelling is unknown.
+        Return several keys when the spelling is ambiguous for this source.
+        """
+        source_mappings = self._index.get(source)
+        if source_mappings is None:
+            return tuple()
+        return source_mappings.get(normalize_symbol_spelling(original_spelling), tuple())
+
+
+def normalize_symbol_spelling(spelling):
+    """
+    Return the normalized form of a symbol ``spelling`` used for migration
+    lookups: lowercased with collapsed whitespace.
+    """
+    return " ".join(spelling.lower().strip().split())
+
+
+def migrate_expression(expression, source, licensing, migration_index, strict=False):
+    """
+    Return an ExpressionMigration migrating the symbols of an ``expression``
+    string using the known ``source`` collection source version and a
+    ``migration_index`` SymbolMigrationIndex.
+
+    The expression is tokenized with the regular Licensing tokenizer so that
+    AND, OR, WITH and parenthesis structures are preserved. See
+    ``Licensing.migrate()`` for the migration and error semantics.
+    """
+    if not isinstance(migration_index, SymbolMigrationIndex):
+        raise TypeError(
+            "migration_index must be a SymbolMigrationIndex and not: "
+            f"{migration_index!r}"
+        )
+
+    original_expression = expression
+
+    parsed = licensing.parse(expression, strict=False)
+    if parsed is None:
+        return ExpressionMigration(
+            source=source,
+            original_expression=original_expression,
+            migrated_expression="",
+            records=[],
+            errors=[],
+        )
+
+    # no known source: fall back to the existing parsing and never guess.
+    if not source or source not in migration_index.get_sources():
+        return ExpressionMigration(
+            source=source,
+            original_expression=original_expression,
+            migrated_expression=parsed.render(),
+            records=[],
+            errors=[],
+        )
+
+    raw_tokens = list(
+        build_symbols_from_unknown_tokens(licensing.get_advanced_tokenizer().tokenize(expression))
+    )
+    token_groups = build_token_groups_for_with_subexpression(raw_tokens)
+
+    migrated_tokens = []
+    records = []
+    errors = []
+
+    def resolve_symbol(symbol_token):
+        original_spelling = symbol_token.string
+        target_keys = migration_index.resolve(original_spelling, source)
+        position = symbol_token.start
+
+        if len(target_keys) == 1:
+            target_key = target_keys[0]
+            target_symbol = licensing.known_symbols.get(target_key)
+            if target_symbol is None:
+                target_symbol = LicenseSymbol(target_key)
+            if original_spelling != target_key:
+                records.append(
+                    MigrationRecord(
+                        original_spelling=original_spelling,
+                        target_key=target_key,
+                        position=position,
+                    )
+                )
+            return Token(position, symbol_token.end, original_spelling, target_symbol)
+
+        if not target_keys:
+            reason = "unknown symbol"
+        else:
+            reason = "ambiguous symbol"
+        errors.append(
+            {
+                "token": original_spelling,
+                "position": position,
+                "reason": reason,
+                "candidate_keys": list(target_keys),
+                "source": source,
+            }
+        )
+        return symbol_token
+
+    for token_group in token_groups:
+        if len(token_group) == 3:
+            license_token, with_token, exception_token = token_group
+            migrated_tokens.append(resolve_symbol(license_token))
+            migrated_tokens.append(with_token)
+            migrated_tokens.append(resolve_symbol(exception_token))
+        else:
+            token = token_group[0]
+            if isinstance(token.value, LicenseSymbol):
+                migrated_tokens.append(resolve_symbol(token))
+            else:
+                migrated_tokens.append(token)
+
+    migrated = licensing.parse_tokens(licensing.tokenize_from_tokens(migrated_tokens))
+
+    if strict and errors:
+        details = "; ".join(
+            f"{error['token']!r} at position {error['position']} ({error['reason']})"
+            for error in errors
+        )
+        raise ExpressionError(f"Cannot migrate expression: {details}.")
+
+    return ExpressionMigration(
+        source=source,
+        original_expression=original_expression,
+        migrated_expression=migrated.render(),
+        records=records,
+        errors=errors,
+    )
+
+
+# aliases for the migration entry point and index
+migrate_license_expression = migrate_expression
+LicenseMigrationIndex = SymbolMigrationIndex
 
 
 def get_scancode_licensing(license_index_location=vendored_scancode_licensedb_index_location):
