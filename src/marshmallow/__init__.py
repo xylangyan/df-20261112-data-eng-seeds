@@ -8,14 +8,18 @@ from marshmallow.decorators import (
     validates_schema,
 )
 from marshmallow.exceptions import ValidationError
+from marshmallow.load_result import BATCH, LoadResult, RowResult
 from marshmallow.schema import Schema, SchemaOpts
 
 from . import fields
 
 __all__ = [
+    "BATCH",
     "EXCLUDE",
     "INCLUDE",
     "RAISE",
+    "LoadResult",
+    "RowResult",
     "Schema",
     "SchemaOpts",
     "ValidationError",

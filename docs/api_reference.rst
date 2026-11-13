@@ -5,6 +5,7 @@
 
     top_level
     marshmallow.schema
+    marshmallow.load_result
     marshmallow.fields
     marshmallow.decorators
     marshmallow.validate

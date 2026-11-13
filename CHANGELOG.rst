@@ -1,6 +1,19 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+Features:
+
+- Add `Schema.load_many <marshmallow.Schema.load_many>` for row-wise loading
+  of collections. It returns a `LoadResult <marshmallow.load_result.LoadResult>`
+  of `RowResult <marshmallow.load_result.RowResult>` objects that keep each
+  row's original index, deserialized value, and nested errors instead of
+  raising. Errors that cannot be attributed to a row are exposed under the
+  `BATCH <marshmallow.load_result.BATCH>` key.
+  `Schema.load <marshmallow.Schema.load>` with ``many=True`` still raises.
+
 4.4.0 (2026-11-03)
 ------------------
 

@@ -31,6 +31,7 @@ from marshmallow.decorators import (
 )
 from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.load_result import LoadResult, RowResult
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -770,6 +771,174 @@ class Schema(metaclass=SchemaMeta):
         data = self.opts.render_module.loads(s, **kwargs)
         return self.load(data, many=many, partial=partial, unknown=unknown)
 
+    def load_many(
+        self,
+        data: Sequence[Mapping[str, typing.Any]],
+        *,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+    ) -> LoadResult:
+        """Deserialize a collection one row at a time, collecting errors instead of raising.
+
+        Unlike :meth:`load` with ``many=True``, this never raises a
+        :exc:`ValidationError` when individual rows are invalid. Each row is
+        loaded independently and recorded as a `RowResult
+        <marshmallow.load_result.RowResult>` that keeps its original index,
+        the (possibly partially) deserialized value, and its error messages.
+
+        ``pre_load`` / ``post_load`` hooks declared without
+        ``pass_collection`` (the default) are invoked once per row, with each
+        hook seeing a single row. Hooks declared with ``pass_collection=True``
+        are invoked once for the whole collection; an error they raise cannot
+        be attributed to a row and is exposed on
+        `LoadResult.batch_errors <marshmallow.load_result.LoadResult.batch_errors>`
+        (also under the `BATCH <marshmallow.load_result.BATCH>` key of
+        `LoadResult.errors <marshmallow.load_result.LoadResult.errors>`).
+        Likewise, ``@validates_schema(pass_collection=True)`` validates the
+        whole collection and its errors are batch errors, whereas
+        ``@validates_schema(pass_collection=False)`` and ``@validates`` run
+        once per row and their errors are attributed to that row.
+
+        :param data: Sequence of rows to deserialize. A non-sequence input
+            produces a batch error instead of being split into rows.
+        :param partial: Same as for :meth:`load`.
+        :param unknown: Same as for :meth:`load`.
+        :return: A `LoadResult <marshmallow.load_result.LoadResult>` holding
+            one `RowResult <marshmallow.load_result.RowResult>` per input row.
+
+        .. versionadded:: 4.5.0
+        """
+        if not is_sequence_but_not_string(data):
+            return LoadResult(batch_errors={SCHEMA: [self.error_messages["type"]]})
+
+        if partial is None:
+            partial = self.partial
+        if unknown is None:
+            unknown = self.unknown
+
+        # Collection-level pre_load hooks run once for the whole batch.
+        # Their errors cannot be attributed to a row, so they are batch errors.
+        try:
+            batch_input = self._invoke_processors(
+                PRE_LOAD,
+                pass_collection=True,
+                data=data,
+                many=True,
+                original_data=data,
+                partial=partial,
+                unknown=unknown,
+            )
+        except ValidationError as err:
+            return LoadResult(batch_errors=err.normalized_messages())
+
+        if not is_sequence_but_not_string(batch_input):
+            return LoadResult(batch_errors={SCHEMA: [self.error_messages["type"]]})
+
+        result = LoadResult()
+        # Per-row pre_load hooks, deserialization, field validation,
+        # per-row schema validation, and per-row post_load hooks all run
+        # within _do_load, once for each row.
+        for index, row in enumerate(batch_input):
+            result.rows.append(
+                self._load_one(index, row, partial, unknown, original=data[index])
+            )
+
+        valid_values = [row.data for row in result.valid_rows]
+        valid_originals = [row.original for row in result.valid_rows]
+        # Collection-level schema validators run once for the whole batch.
+        if self._hooks[VALIDATES_SCHEMA] and any(
+            hook_many for _, hook_many, _ in self._hooks[VALIDATES_SCHEMA]
+        ):
+            # pass_original validators get the raw rows that produced the
+            # valid values; other collection validators get the whole batch.
+            collection_original = (
+                valid_originals
+                if any(
+                    hook_many
+                    and kwargs.get("pass_original")
+                    for _, hook_many, kwargs in self._hooks[VALIDATES_SCHEMA]
+                )
+                else data
+            )
+            error_store = ErrorStore()
+            self._invoke_schema_validators(
+                error_store=error_store,
+                pass_collection=True,
+                data=valid_values,
+                original_data=collection_original,
+                many=True,
+                partial=partial,
+                unknown=unknown,
+                field_errors=bool(result.invalid_rows),
+            )
+            result.batch_errors = error_store.errors
+
+        # Collection-level post_load hooks run once for the whole batch of
+        # valid rows. An error here is likewise not attributable to a row.
+        if self._hooks[POST_LOAD]:
+            post_original = (
+                valid_originals
+                if any(
+                    hook_many
+                    and kwargs.get("pass_original")
+                    for _, hook_many, kwargs in self._hooks[POST_LOAD]
+                )
+                else data
+            )
+            try:
+                processed = self._invoke_processors(
+                    POST_LOAD,
+                    pass_collection=True,
+                    data=valid_values,
+                    many=True,
+                    original_data=post_original,
+                    partial=partial,
+                    unknown=unknown,
+                )
+            except ValidationError as err:
+                result.batch_errors = err.normalized_messages()
+            else:
+                for row, processed_value in zip_longest(
+                    result.valid_rows, processed, fillvalue=missing
+                ):
+                    if processed_value is missing:
+                        break
+                    row.data = processed_value
+
+        return result
+
+    def _load_one(
+        self,
+        index: int,
+        row: Mapping[str, typing.Any],
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption | None,
+        *,
+        original: typing.Any,
+    ) -> RowResult:
+        """Load a single row for :meth:`load_many`, returning a `RowResult`.
+
+        Per-row pre/post processors and validators run exactly once with a
+        single row as their data.
+        """
+        try:
+            loaded = self._do_load(
+                row,
+                many=False,
+                partial=partial,
+                unknown=unknown,
+                postprocess=True,
+                include_collection_processors=False,
+            )
+        except ValidationError as err:
+            return RowResult(
+                index=index,
+                original=original,
+                data=err.valid_data,
+                errors=typing.cast("dict[str, typing.Any]", err.messages),
+            )
+        return RowResult(index=index, original=original, data=loaded, errors={})
+
     def _run_validator(
         self,
         validator_func: types.SchemaValidator,
@@ -847,6 +1016,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        include_collection_processors: bool = True,  # noqa: FBT001
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -862,6 +1032,9 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
         :param postprocess: Whether to run post_load methods.
+        :param include_collection_processors: Whether to run ``pass_collection``
+            pre/post processors and schema validators. Set to `False` by
+            :meth:`load_many`, which runs those once for the whole batch.
         :return: Deserialized data
         """
         error_store = ErrorStore()
@@ -873,14 +1046,25 @@ class Schema(metaclass=SchemaMeta):
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
             try:
-                processed_data = self._invoke_load_processors(
-                    PRE_LOAD,
-                    data,
-                    many=many,
-                    original_data=data,
-                    partial=partial,
-                    unknown=unknown,
-                )
+                if include_collection_processors:
+                    processed_data = self._invoke_load_processors(
+                        PRE_LOAD,
+                        data,
+                        many=many,
+                        original_data=data,
+                        partial=partial,
+                        unknown=unknown,
+                    )
+                else:
+                    processed_data = self._invoke_processors(
+                        PRE_LOAD,
+                        pass_collection=False,
+                        data=data,
+                        many=many,
+                        original_data=data,
+                        partial=partial,
+                        unknown=unknown,
+                    )
             except ValidationError as err:
                 errors = err.normalized_messages()
                 result: list | dict | None = None
@@ -902,16 +1086,17 @@ class Schema(metaclass=SchemaMeta):
             # Run schema-level validation
             if self._hooks[VALIDATES_SCHEMA]:
                 field_errors = bool(error_store.errors)
-                self._invoke_schema_validators(
-                    error_store=error_store,
-                    pass_collection=True,
-                    data=result,
-                    original_data=data,
-                    many=many,
-                    partial=partial,
-                    unknown=unknown,
-                    field_errors=field_errors,
-                )
+                if include_collection_processors:
+                    self._invoke_schema_validators(
+                        error_store=error_store,
+                        pass_collection=True,
+                        data=result,
+                        original_data=data,
+                        many=many,
+                        partial=partial,
+                        unknown=unknown,
+                        field_errors=field_errors,
+                    )
                 self._invoke_schema_validators(
                     error_store=error_store,
                     pass_collection=False,
@@ -926,14 +1111,25 @@ class Schema(metaclass=SchemaMeta):
             # Run post processors
             if not errors and postprocess and self._hooks[POST_LOAD]:
                 try:
-                    result = self._invoke_load_processors(
-                        POST_LOAD,
-                        result,
-                        many=many,
-                        original_data=data,
-                        partial=partial,
-                        unknown=unknown,
-                    )
+                    if include_collection_processors:
+                        result = self._invoke_load_processors(
+                            POST_LOAD,
+                            result,
+                            many=many,
+                            original_data=data,
+                            partial=partial,
+                            unknown=unknown,
+                        )
+                    else:
+                        result = self._invoke_processors(
+                            POST_LOAD,
+                            pass_collection=False,
+                            data=result,
+                            many=many,
+                            original_data=data,
+                            partial=partial,
+                            unknown=unknown,
+                        )
                 except ValidationError as err:
                     errors = err.normalized_messages()
         if errors:
