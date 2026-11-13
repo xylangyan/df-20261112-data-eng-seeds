@@ -53,9 +53,36 @@ RESTORE_PANIC_FMT = 'UNABLE TO RESTORE {0} MESSAGES: {1}'
 logger = get_logger(__name__)
 
 #: Key format used for queue argument lookups in BrokerState.bindings.
-binding_key_t = namedtuple('binding_key_t', (
-    'queue', 'exchange', 'routing_key',
-))
+binding_key_t = namedtuple(
+    'binding_key_t',
+    ('queue', 'exchange', 'routing_key', 'arguments'),
+    defaults=(None,),
+)
+
+
+def freeze_binding_arguments(arguments):
+    """Convert binding arguments into a hashable, order-independent key.
+
+    An empty or missing arguments table is normalised to :const:`None` so
+    that bindings without arguments collapse to the same key regardless of
+    how the caller represented them.
+    """
+    if not arguments:
+        return None
+
+    def freeze(value):
+        if isinstance(value, dict):
+            return frozenset(
+                (key, freeze(item)) for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(freeze(item) for item in value)
+        return value
+
+    return frozenset(
+        (key, freeze(value)) for key, value in arguments.items()
+    )
+
 
 #: BrokerState.queue_bindings generates tuples in this format.
 queue_binding_t = namedtuple('queue_binding_t', (
@@ -93,7 +120,7 @@ class BrokerState:
     #: structure::
     #:
     #:     {
-    #:         (queue, exchange, routing_key): arguments,
+    #:         (queue, exchange, routing_key, arguments): arguments,
     #:         # ...,
     #:     }
     bindings = None
@@ -103,7 +130,7 @@ class BrokerState:
     #:
     #:     {
     #:         queue: {
-    #:             (queue, exchange, routing_key),
+    #:             (queue, exchange, routing_key, arguments),
     #:             # ...,
     #:         },
     #:         # ...,
@@ -120,16 +147,26 @@ class BrokerState:
         self.bindings.clear()
         self.queue_index.clear()
 
-    def has_binding(self, queue, exchange, routing_key):
-        return (queue, exchange, routing_key) in self.bindings
+    def has_binding(self, queue, exchange, routing_key, arguments=None):
+        key = binding_key_t(
+            queue, exchange, routing_key,
+            freeze_binding_arguments(arguments),
+        )
+        return key in self.bindings
 
     def binding_declare(self, queue, exchange, routing_key, arguments):
-        key = binding_key_t(queue, exchange, routing_key)
+        key = binding_key_t(
+            queue, exchange, routing_key,
+            freeze_binding_arguments(arguments),
+        )
         self.bindings.setdefault(key, arguments)
         self.queue_index[queue].add(key)
 
-    def binding_delete(self, queue, exchange, routing_key):
-        key = binding_key_t(queue, exchange, routing_key)
+    def binding_delete(self, queue, exchange, routing_key, arguments=None):
+        key = binding_key_t(
+            queue, exchange, routing_key,
+            freeze_binding_arguments(arguments),
+        )
         try:
             del self.bindings[key]
         except KeyError:
@@ -573,7 +610,9 @@ class Channel(AbstractChannel, base.StdChannel):
                    arguments=None, **kwargs):
         """Bind `queue` to `exchange` with `routing key`."""
         exchange = exchange or 'amq.direct'
-        if self.state.has_binding(queue, exchange, routing_key):
+        if self.state.has_binding(
+            queue, exchange, routing_key, arguments
+        ):
             return
         # Add binding:
         self.state.binding_declare(queue, exchange, routing_key, arguments)
@@ -589,7 +628,7 @@ class Channel(AbstractChannel, base.StdChannel):
     def queue_unbind(self, queue, exchange=None, routing_key='',
                      arguments=None, **kwargs):
         # Remove queue binding:
-        self.state.binding_delete(queue, exchange, routing_key)
+        self.state.binding_delete(queue, exchange, routing_key, arguments)
         try:
             table = self.get_table(exchange)
         except KeyError:
@@ -714,7 +753,7 @@ class Channel(AbstractChannel, base.StdChannel):
             type = default
         return self.exchange_types[type]
 
-    def _lookup(self, exchange, routing_key, default=None):
+    def _lookup(self, exchange, routing_key, default=None, headers=None):
         """Find all queues matching `routing_key` for the given `exchange`.
 
         Returns
@@ -730,7 +769,7 @@ class Channel(AbstractChannel, base.StdChannel):
         try:
             R = self.typeof(exchange).lookup(
                 self.get_table(exchange),
-                exchange, routing_key, default,
+                exchange, routing_key, default, headers=headers,
             )
         except KeyError:
             R = []
@@ -750,7 +789,9 @@ class Channel(AbstractChannel, base.StdChannel):
         message['redelivered'] = True
         for queue in self._lookup(
             delivery_info['exchange'],
-                delivery_info['routing_key']):
+            delivery_info['routing_key'],
+            headers=message.get('headers'),
+        ):
             self._put(queue, message)
 
     def _restore_at_beginning(self, message):
@@ -939,7 +980,7 @@ class Transport(base.Transport):
 
     implements = base.Transport.implements.extend(
         asynchronous=False,
-        exchange_type=frozenset(['direct', 'topic']),
+        exchange_type=frozenset(['direct', 'topic', 'headers']),
         heartbeats=False,
     )
 

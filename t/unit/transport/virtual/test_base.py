@@ -37,6 +37,35 @@ def test_BrokerState():
     assert t.exchanges == 16
 
 
+def test_BrokerState_bindings_distinguished_by_arguments():
+    s = virtual.BrokerState()
+    s.binding_declare('q', 'ex', '', {'x-match': 'all', 'source': 'a'})
+    s.binding_declare('q', 'ex', '', {'x-match': 'all', 'source': 'b'})
+    # Exactly the same arguments must not create another binding.
+    s.binding_declare('q', 'ex', '', {'source': 'a', 'x-match': 'all'})
+
+    assert len(s.queue_index['q']) == 2
+    assert s.has_binding('q', 'ex', '', {'x-match': 'all', 'source': 'a'})
+    assert s.has_binding('q', 'ex', '', {'x-match': 'all', 'source': 'b'})
+    assert not s.has_binding('q', 'ex', '', {'x-match': 'all', 'source': 'c'})
+    assert sorted(b.arguments['source'] for b in s.queue_bindings('q')) == [
+        'a', 'b',
+    ]
+
+
+def test_BrokerState_binding_delete_keeps_other_arguments():
+    s = virtual.BrokerState()
+    args_a = {'x-match': 'all', 'source': 'a'}
+    args_b = {'x-match': 'all', 'source': 'b'}
+    s.binding_declare('q', 'ex', '', args_a)
+    s.binding_declare('q', 'ex', '', args_b)
+
+    s.binding_delete('q', 'ex', '', args_b)
+
+    assert s.has_binding('q', 'ex', '', args_a)
+    assert not s.has_binding('q', 'ex', '', args_b)
+
+
 class test_QoS:
 
     def setup_method(self):
@@ -602,6 +631,39 @@ class test_Channel:
         c.queue_bind(queue='q', exchange='unique_name', routing_key='rk')
 
         assert ('q', 'unique_name', 'rk') in list(c.list_bindings())
+
+    def test_list_bindings_headers_exchange(self):
+        c = self.channel
+        c.exchange_declare(exchange='hx', type='headers')
+        c.queue_declare(queue='hq')
+        c.queue_bind(
+            queue='hq', exchange='hx', routing_key='',
+            arguments={'x-match': 'all', 'source': 'a'},
+        )
+
+        assert ('hq', 'hx', '') in list(c.list_bindings())
+
+    def test_queue_bind_and_unbind_with_arguments(self):
+        c = self.channel
+        c.exchange_declare(exchange='hx', type='headers')
+        c.queue_declare(queue='hq')
+        args_a = {'x-match': 'all', 'source': 'a'}
+        args_b = {'x-match': 'all', 'source': 'b'}
+
+        c.queue_bind('hq', 'hx', '', arguments=args_a)
+        c.queue_bind('hq', 'hx', '', arguments=args_b)
+
+        # Same queue/exchange/routing key but different arguments must be
+        # kept as separate bindings.
+        assert len(c.get_table('hx')) == 2
+        assert c.state.has_binding('hq', 'hx', '', args_a)
+        assert c.state.has_binding('hq', 'hx', '', args_b)
+
+        c.queue_unbind('hq', 'hx', '', arguments=args_b)
+
+        assert len(c.get_table('hx')) == 1
+        assert c.state.has_binding('hq', 'hx', '', args_a)
+        assert not c.state.has_binding('hq', 'hx', '', args_b)
 
     def test_after_reply_message_received(self):
         c = self.channel

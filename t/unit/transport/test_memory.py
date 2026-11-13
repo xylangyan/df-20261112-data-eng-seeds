@@ -165,6 +165,84 @@ class test_MemoryTransport:
         assert x
         assert chan._queue_for('foo') is x
 
+    def test_headers_exchange_routes_on_message_headers(self):
+        channel = self.c.channel()
+        headers_exchange = Exchange('test_transport_memory_headers',
+                                    type='headers')
+
+        # all: every header must match exactly (type and value).
+        q_all = Queue(
+            'test_headers_all', exchange=headers_exchange,
+            binding_arguments={
+                'x-match': 'all', 'source': 'billing', 'env': 'prod',
+            },
+        )
+        # any: a single matching header is enough.
+        q_any = Queue(
+            'test_headers_any', exchange=headers_exchange,
+            binding_arguments={
+                'x-match': 'any', 'source': 'audit', 'env': 'prod',
+            },
+        )
+        # explicit empty value: only a header that is present with None
+        # matches; a missing header never does.
+        q_empty = Queue(
+            'test_headers_empty', exchange=headers_exchange,
+            binding_arguments={'x-match': 'all', 'trace_id': None},
+        )
+        # Second binding on q_any with different arguments: messages
+        # matching both must still arrive only once.
+        q_any_second_binding = Queue(
+            'test_headers_any', exchange=headers_exchange,
+            binding_arguments={
+                'x-match': 'all', 'source': 'audit', 'env': 'prod',
+            },
+        )
+        for queue in (q_all, q_any, q_empty, q_any_second_binding):
+            queue(channel).declare()
+
+        producer = Producer(channel)
+        messages = [
+            ('m1_billing_prod', {'source': 'billing', 'env': 'prod'}),
+            ('m2_audit_prod', {'source': 'audit', 'env': 'prod'}),
+            ('m3_billing_dev', {'source': 'billing', 'env': 'dev'}),
+            ('m4_explicit_none',
+             {'source': 'billing', 'env': 'prod', 'trace_id': None}),
+            ('m5_missing_trace', {'source': 'billing', 'env': 'prod'}),
+            ('m6_wrong_type',
+             {'source': 'billing', 'env': 'prod', 'trace_id': 1}),
+        ]
+        for label, headers in messages:
+            producer.publish(
+                label, exchange=headers_exchange, routing_key='',
+                headers=headers, serializer=None, content_type='text/plain',
+            )
+
+        def received(queue):
+            bodies = []
+            while True:
+                message = queue(channel).get()
+                if message is None:
+                    break
+                bodies.append(message.payload)
+            return bodies
+
+        assert received(q_all) == [
+            'm1_billing_prod',
+            'm4_explicit_none',
+            'm5_missing_trace',
+            'm6_wrong_type',
+        ]
+        # m2 matches both bindings of this queue and must appear once.
+        assert received(q_any) == [
+            'm1_billing_prod',
+            'm2_audit_prod',
+            'm4_explicit_none',
+            'm5_missing_trace',
+            'm6_wrong_type',
+        ]
+        assert received(q_empty) == ['m4_explicit_none']
+
     # see the issue
     # https://github.com/celery/kombu/issues/1050
     def test_producer_on_return(self):

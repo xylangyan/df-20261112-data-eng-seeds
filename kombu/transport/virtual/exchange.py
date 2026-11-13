@@ -1,7 +1,6 @@
 """Virtual AMQ Exchange.
 
-Implementations of the standard exchanges defined
-by the AMQ protocol  (excluding the `headers` exchange).
+Implementations of the standard exchanges defined by the AMQ protocol.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ class ExchangeType:
     def __init__(self, channel):
         self.channel = channel
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         """Lookup all queues matching `routing_key` in `exchange`.
 
         Returns
@@ -62,7 +61,7 @@ class DirectExchange(ExchangeType):
 
     type = 'direct'
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         return {
             queue for rkey, _, queue in table
             if rkey == routing_key
@@ -92,7 +91,7 @@ class TopicExchange(ExchangeType):
     #: compiled regex cache
     _compiled = {}
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         return {
             queue for rkey, pattern, queue in table
             if self._match(pattern, routing_key)
@@ -147,7 +146,7 @@ class FanoutExchange(ExchangeType):
 
     type = 'fanout'
 
-    def lookup(self, table, exchange, routing_key, default):
+    def lookup(self, table, exchange, routing_key, default, headers=None):
         return {queue for _, _, queue in table}
 
     def deliver(self, message, exchange, routing_key, **kwargs):
@@ -156,9 +155,94 @@ class FanoutExchange(ExchangeType):
                 exchange, message, routing_key, **kwargs)
 
 
+class HeadersExchange(ExchangeType):
+    """Headers exchange.
+
+    The `headers` exchange routes messages based on their message headers,
+    ignoring the routing key.  A queue is bound with an arguments table
+    describing the header names and values it expects, plus a special
+    ``x-match`` entry that selects how the entries are combined:
+
+    * ``all`` (default): every header named in the binding arguments must be
+      present on the message with the exact same type and value.
+    * ``any``: at least one of the named headers must be present with the
+      exact same type and value.
+
+    Matching is exact on both type and value: a bound value of the string
+    ``'1'`` does not match a message header value of the integer ``1``.
+
+    A header that is absent from the message and a header present with an
+    explicit empty value (``None``, ``''``, ``[]`` ...) are different
+    things: the former is never a match, while the latter matches an equally
+    empty bound value of the same type.  ``x-match`` itself is never used as
+    a matching criterion.
+    """
+
+    type = 'headers'
+
+    #: binding argument selecting the matching algorithm.
+    MATCH_HEADER = 'x-match'
+
+    MATCH_ALL = 'all'
+    MATCH_ANY = 'any'
+
+    def prepare_bind(self, queue, exchange, routing_key, arguments):
+        # The second slot of a binding triple normally holds the routing
+        # pattern (as for the topic exchange); for headers exchanges it holds
+        # the arguments table used to match message headers.
+        return routing_key, dict(arguments or {}), queue
+
+    def lookup(self, table, exchange, routing_key, default, headers=None):
+        headers = headers or {}
+        return {
+            queue
+            for _, arguments, queue in table
+            if self._match_binding(arguments, headers)
+        }
+
+    def deliver(self, message, exchange, routing_key, **kwargs):
+        _lookup = self.channel._lookup
+        _put = self.channel._put
+        for queue in _lookup(
+            exchange, routing_key, headers=message.get('headers')
+        ):
+            _put(queue, message, **kwargs)
+
+    def _match_binding(self, arguments, headers):
+        match = (arguments.get(self.MATCH_HEADER)
+                 or self.MATCH_ALL).lower()
+        criteria = [
+            (name, value)
+            for name, value in (arguments or {}).items()
+            if name != self.MATCH_HEADER
+        ]
+        if not criteria:
+            # Nothing to match on, mirroring RabbitMQ, which does not route
+            # messages to bindings without any header criteria.
+            return False
+        if match == self.MATCH_ANY:
+            return any(
+                self._match_header(headers, name, value)
+                for name, value in criteria
+            )
+        return all(
+            self._match_header(headers, name, value)
+            for name, value in criteria
+        )
+
+    @staticmethod
+    def _match_header(headers, name, value):
+        # ``in`` distinguishes a missing header from a header that is
+        # explicitly present with an empty/``None`` value.
+        if name not in headers:
+            return False
+        return headers[name] == value and type(headers[name]) is type(value)
+
+
 #: Map of standard exchange types and corresponding classes.
 STANDARD_EXCHANGE_TYPES = {
     'direct': DirectExchange,
     'topic': TopicExchange,
     'fanout': FanoutExchange,
+    'headers': HeadersExchange,
 }
