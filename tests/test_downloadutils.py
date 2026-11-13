@@ -221,3 +221,224 @@ def test_tee_to_bytearray(streamed_response):
 def test_tee_to_bytearray_only_accepts_bytearrays():
     with pytest.raises(TypeError):
         tee.tee_to_bytearray(None, object())
+
+
+class TrackedTarget(object):
+    def __init__(self, name, failure_chunk=None):
+        self.name = name
+        self.failure_chunk = failure_chunk
+        self.data = bytearray()
+        self.closed = 0
+        self.write_calls = 0
+
+    @property
+    def mode(self):
+        return 'wb'
+
+    def write(self, data):
+        self.write_calls += 1
+        should_fail = (
+            self.failure_chunk is not None and
+            self.write_calls == self.failure_chunk
+        )
+        if should_fail:
+            raise IOError('target {} failed'.format(self.name))
+        self.data.extend(data)
+        return len(data)
+
+    def close(self):
+        self.closed += 1
+
+
+class ShortWriteTarget(TrackedTarget):
+    def __init__(self, name, failure_chunk):
+        super(ShortWriteTarget, self).__init__(name, failure_chunk)
+
+    def write(self, data):
+        self.write_calls += 1
+        if self.write_calls == self.failure_chunk:
+            return 0
+        self.data.extend(data)
+        return len(data)
+
+
+class FakeRaw(object):
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.stream_calls = 0
+
+    def stream(self, amt, decode_content=None):
+        self.stream_calls += 1
+        for chunk in self.chunks:
+            yield chunk
+
+
+class FakeResponse(object):
+    def __init__(self, chunks):
+        self.raw = FakeRaw(chunks)
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+def _failing_fanout_response():
+    return FakeResponse([b'one', b'two', b'three'])
+
+
+def test_tee_to_targets_stop_on_first_failure():
+    response = _failing_fanout_response()
+    first_target = TrackedTarget('first')
+    second_target = TrackedTarget('second', failure_chunk=2)
+    receipt = tee.TeeReceipt()
+
+    with pytest.raises(IOError, match='target second failed') as error:
+        list(tee.tee_to_targets(
+            response,
+            {'first': first_target, 'second': second_target},
+            chunksize=3,
+            receipt=receipt,
+        ))
+
+    assert error.value is receipt.failures['second']
+    assert bytes(first_target.data) == b'onetwo'
+    assert bytes(second_target.data) == b'one'
+    assert receipt.confirmed_bytes == {'first': 6, 'second': 3}
+    assert response.raw.stream_calls == 1
+    assert response.closed == 0
+    assert first_target.closed == 0
+    assert second_target.closed == 0
+
+
+def test_tee_to_targets_continue_after_failure():
+    response = _failing_fanout_response()
+    first_target = TrackedTarget('first')
+    second_target = TrackedTarget('second', failure_chunk=2)
+    receipt = tee.TeeReceipt()
+
+    consumed = list(tee.tee_to_targets(
+        response,
+        {'first': first_target, 'second': second_target},
+        chunksize=3,
+        receipt=receipt,
+        on_target_failure=tee.CONTINUE_ON_FAILURE,
+    ))
+
+    assert consumed == [b'one', b'two', b'three']
+    assert bytes(first_target.data) == b'onetwothree'
+    assert bytes(second_target.data) == b'one'
+    assert receipt.confirmed_bytes == {'first': 11, 'second': 3}
+    assert isinstance(receipt.failures['second'], IOError)
+    assert response.raw.stream_calls == 1
+    assert response.closed == 0
+    assert first_target.closed == 0
+    assert second_target.closed == 0
+
+
+def test_tee_to_targets_short_write_is_explicit_and_continue_policy_works():
+    response = _failing_fanout_response()
+    first_target = TrackedTarget('first')
+    second_target = ShortWriteTarget('second', 2)
+    receipt = tee.TeeReceipt()
+
+    consumed = list(tee.tee_to_targets(
+        response,
+        [first_target, second_target],
+        chunksize=3,
+        receipt=receipt,
+        on_target_failure=tee.CONTINUE_ON_FAILURE,
+    ))
+
+    assert consumed == [b'one', b'two', b'three']
+    assert bytes(first_target.data) == b'onetwothree'
+    assert bytes(second_target.data) == b'one'
+    assert receipt.confirmed_bytes == {0: 11, 1: 3}
+    assert isinstance(receipt.failures[1], OSError)
+    assert 'short write' in str(receipt.failures[1])
+
+
+def test_tee_to_targets_only_closes_failed_targets_when_requested():
+    response = _failing_fanout_response()
+    first_target = TrackedTarget('first')
+    second_target = TrackedTarget('second', failure_chunk=2)
+    receipt = tee.TeeReceipt()
+
+    with pytest.raises(IOError):
+        list(tee.tee_to_targets(
+            response,
+            {'first': first_target, 'second': second_target},
+            chunksize=3,
+            receipt=receipt,
+            close_targets_on_failure=True,
+        ))
+
+    assert first_target.closed == 0
+    assert second_target.closed == 1
+    assert receipt.closed_targets == {'second'}
+    assert response.closed == 0
+
+
+def test_tee_to_targets_rejects_non_binary_target():
+    response = _failing_fanout_response()
+    target = mock.MagicMock()
+    target.mode = 'w'
+
+    with pytest.raises(TypeError):
+        list(tee.tee_to_targets(response, {'text': target}))
+
+    assert response.raw.stream_calls == 0
+
+
+def test_tee_to_targets_rejects_invalid_failure_policy():
+    response = _failing_fanout_response()
+    target = TrackedTarget('first')
+
+    with pytest.raises(ValueError):
+        list(tee.tee_to_targets(
+            response,
+            [target],
+            on_target_failure='unknown',
+        ))
+
+    assert response.raw.stream_calls == 0
+    assert target.write_calls == 0
+
+
+def test_tee_to_targets_requires_at_least_one_target():
+    response = _failing_fanout_response()
+
+    with pytest.raises(ValueError):
+        list(tee.tee_to_targets(response, []))
+
+    assert response.raw.stream_calls == 0
+
+
+def test_tee_to_targets_rejects_invalid_receipt():
+    response = _failing_fanout_response()
+    target = TrackedTarget('first')
+
+    with pytest.raises(TypeError):
+        list(tee.tee_to_targets(response, [target], receipt={}))
+
+    assert response.raw.stream_calls == 0
+    assert target.write_calls == 0
+    assert target.closed == 0
+
+
+def test_tee_to_targets_accepts_none_write_result():
+    response = FakeResponse([b'one'])
+
+    class NoneWriter(TrackedTarget):
+        def write(self, data):
+            self.write_calls += 1
+            self.data.extend(data)
+            return None
+
+    target = NoneWriter('first')
+    receipt = tee.TeeReceipt()
+
+    assert list(tee.tee_to_targets(response, [target], receipt=receipt)) == [
+        b'one'
+    ]
+    assert receipt.confirmed_bytes == {0: 3}
+    assert receipt.has_failures() is False

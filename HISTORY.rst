@@ -4,6 +4,13 @@ History
 1.1.0 -- 2024-xx-yy
 -------------------
 
+New Features
+~~~~~~~~~~~~
+
+- Add ``tee_to_targets`` for writing one streamed response to multiple
+  destinations with an optional per-target byte receipt and configurable
+  stop/continue failure handling.
+
 Fixed Bugs
 ~~~~~~~~~~
 
