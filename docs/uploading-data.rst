@@ -170,3 +170,80 @@ contents of the file without relying on chunking.
                       headers={'Content-Type': content_type})
 
 .. autoclass:: requests_toolbelt.streaming_iterator.StreamingIterator
+
+Replaying an Upload Body
+------------------------
+
+A :class:`~requests_toolbelt.streaming_iterator.StreamingIterator` wraps a
+one-pass source: once it has been consumed, a second attempt at sending the
+request can only transmit whatever bytes are left. Some proxies and servers
+ask the client to resubmit a request after they have only read part of the
+body, which makes this a real problem.
+
+The
+:class:`~requests_toolbelt.streaming_iterator.ReplayableStreamingIterator`
+solves this without buffering the whole upload in memory. Instead of the
+data itself, you hand it a callable that opens a fresh source of the same
+data every time it is called:
+
+.. code-block:: python
+
+    import requests
+    from requests_toolbelt import ReplayableStreamingIterator
+
+    def reopen():
+        return open('/tmp/collection-result.bin', 'rb')
+
+    streamer = ReplayableStreamingIterator(size, reopen)
+    r = requests.post(url, data=streamer)
+
+The callable must return a binary file-like object with ``read`` and
+``close`` methods, positioned at the first byte of the data. Before the
+body is sent again, call ``streamer.reset()``: the source consumed so far
+is closed and a new one is opened. The declared size of the new source is
+checked against the original size, and the number of bytes actually read
+from a source is accounted for when it ends. If a source cannot be
+re-opened or no longer matches the declared length, a
+:class:`~requests_toolbelt.exceptions.SourceNotReplayableError` explains
+why instead of silently sending a truncated body. When you are done with
+the body, call ``streamer.close()`` to release the source currently held.
+
+.. autoclass:: requests_toolbelt.streaming_iterator.ReplayableStreamingIterator
+
+Replaying a Multipart Body
+--------------------------
+
+The :class:`~requests_toolbelt.multipart.encoder.MultipartEncoder` can be
+rewound as well, provided every part body can be replayed. Parts built from
+plain strings or seekable files rewind themselves; a part whose value is a
+:class:`~requests_toolbelt.streaming_iterator.ReplayableStreamingIterator`
+re-opens its source; a part backed by a one-pass source (a generator, a
+:class:`~requests_toolbelt.streaming_iterator.StreamingIterator`, a socket)
+raises :class:`~requests_toolbelt.exceptions.SourceNotReplayableError` with
+the concrete reason:
+
+.. code-block:: python
+
+    import requests
+    from requests_toolbelt import (
+        MultipartEncoder, ReplayableStreamingIterator,
+        )
+
+    streamer = ReplayableStreamingIterator(size, reopen)
+    encoder = MultipartEncoder(
+        fields={'file': ('collection.bin', streamer,
+                         'application/octet-stream')}
+        )
+
+    r = requests.post(url, data=encoder,
+                      headers={'Content-Type': encoder.content_type})
+    if r.status_code == 409:  # proxy asks for the body again
+        encoder.reset()
+        r = requests.post(url, data=encoder,
+                          headers={'Content-Type': encoder.content_type})
+    encoder.close()
+
+``encoder.reset()`` rewinds every part and the encoder's internal buffer,
+so the next read returns the body from its first byte while ``encoder.len``
+keeps reporting the same declared length. ``encoder.close()`` closes every
+part body that can be closed, releasing the sources opened for the upload.

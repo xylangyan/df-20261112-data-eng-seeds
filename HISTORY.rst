@@ -4,6 +4,13 @@ History
 1.1.0 -- 2024-xx-yy
 -------------------
 
+Added Features
+~~~~~~~~~~~~~~
+
+- Added ``ReplayableStreamingIterator`` and ``MultipartEncoder.reset()`` to
+  re-send an upload body from its first byte without buffering it in memory.
+  ``SourceNotReplayableError`` explains why a one-pass source cannot be replayed.
+
 Fixed Bugs
 ~~~~~~~~~~
 

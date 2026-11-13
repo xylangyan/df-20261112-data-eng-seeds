@@ -15,6 +15,7 @@ from uuid import uuid4
 import requests
 
 from .._compat import fields
+from ..exceptions import SourceNotReplayableError
 
 
 class FileNotSupportedError(Exception):
@@ -296,6 +297,37 @@ class MultipartEncoder(object):
 
         return self.read()
 
+    def reset(self):
+        """Rewind the whole encoder so the body can be sent again.
+
+        Every part is reset, which re-opens any replayable source it wraps,
+        the internal buffer and part iterator are rebuilt and the opening
+        boundary is written again. After calling this, :meth:`read` returns
+        the body from its first byte while :attr:`len` keeps reporting the
+        same, previously declared body length.
+        """
+        for part in self.parts:
+            part.reset()
+
+        self.finished = False
+        self._current_part = None
+        self._iter_parts = iter(self.parts)
+        self._buffer.seek(0, 0)
+        self._buffer.truncate()
+        self._write_boundary()
+
+    def close(self):
+        """Release any source held by the parts of this encoder.
+
+        Parts whose body exposes a ``close`` method (for example a
+        replayable streaming iterator) have it called so file descriptors
+        opened for the upload are not leaked between attempts.
+        """
+        for part in self.parts:
+            close_method = getattr(part.body, 'close', None)
+            if callable(close_method):
+                close_method()
+
     def read(self, size=-1):
         """Read data from the streaming encoder.
 
@@ -493,6 +525,47 @@ class Part(object):
         headers = encode_with(field.render_headers(), encoding)
         body = coerce_data(field.data, encoding)
         return cls(headers, body)
+
+    def reset(self):
+        """Rewind this part's body so it can be written again.
+
+        A body that provides its own ``reset`` method (for example a
+        replayable streaming iterator) is asked to re-open its source.
+        Bodies that can seek are rewound to their start. Anything else is
+        a one-pass source and raises
+        :class:`~requests_toolbelt.exceptions.SourceNotReplayableError`
+        explaining why the part cannot be replayed.
+        """
+        body = self.body
+        reset_method = getattr(body, 'reset', None)
+
+        if callable(reset_method):
+            reset_method()
+        elif hasattr(body, 'seek') and hasattr(body, 'tell'):
+            try:
+                body.seek(0, 0)
+            except (io.UnsupportedOperation, OSError, ValueError) as exc:
+                raise SourceNotReplayableError(
+                    'The multipart part body cannot be rewound to its first '
+                    'byte: {0}'.format(exc)
+                    )
+        elif hasattr(body, 'fd') and hasattr(body.fd, 'seek'):
+            try:
+                body.fd.seek(0, 0)
+            except (io.UnsupportedOperation, OSError, ValueError) as exc:
+                raise SourceNotReplayableError(
+                    'The multipart part body cannot be rewound to its first '
+                    'byte: {0}'.format(exc)
+                    )
+        else:
+            raise SourceNotReplayableError(
+                'The multipart part body is a one-pass source ({0!r}) with '
+                'no reset method and no seek support, so it cannot be '
+                'replayed; provide a replayable source or a new encoder '
+                'instead'.format(body)
+                )
+
+        self.headers_unread = True
 
     def bytes_left_to_write(self):
         """Determine if there are bytes left to write.

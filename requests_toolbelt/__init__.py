@@ -15,7 +15,10 @@ from .multipart import (
     MultipartEncoder, MultipartEncoderMonitor, MultipartDecoder,
     ImproperBodyPartContentException, NonMultipartContentTypeException
     )
-from .streaming_iterator import StreamingIterator
+from .exceptions import SourceNotReplayableError
+from .streaming_iterator import (
+    ReplayableStreamingIterator, StreamingIterator
+    )
 from .utils.user_agent import user_agent
 
 __title__ = 'requests-toolbelt'
@@ -27,8 +30,9 @@ __version_info__ = tuple(int(i) for i in __version__.split('.'))
 
 __all__ = [
     'GuessAuth', 'MultipartEncoder', 'MultipartEncoderMonitor',
-    'MultipartDecoder', 'SSLAdapter', 'SourceAddressAdapter',
-    'StreamingIterator', 'user_agent', 'ImproperBodyPartContentException',
+    'MultipartDecoder', 'ReplayableStreamingIterator', 'SSLAdapter',
+    'SourceAddressAdapter', 'SourceNotReplayableError', 'StreamingIterator',
+    'user_agent', 'ImproperBodyPartContentException',
     'NonMultipartContentTypeException', '__title__', '__authors__',
     '__license__', '__copyright__', '__version__', '__version_info__',
 ]

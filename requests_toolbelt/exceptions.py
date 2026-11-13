@@ -23,3 +23,16 @@ class RequestsVersionTooOld(Warning):
     this warning to the user.
     """
     pass
+
+
+class SourceNotReplayableError(Exception):
+    """Used to indicate that an upload body cannot be replayed.
+
+    This is raised by
+    :class:`requests_toolbelt.streaming_iterator.ReplayableStreamingIterator`
+    when re-sending a request would require a fresh source of the data but the
+    caller cannot provide one, or the re-opened source does not match the
+    originally declared length. The message explains the concrete reason
+    instead of silently truncating the upload.
+    """
+    pass
