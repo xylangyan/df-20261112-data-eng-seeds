@@ -94,6 +94,50 @@ class ExpressionParseError(ParseError, ExpressionError):
     pass
 
 
+# Categories of issues found when validating a license expression with
+# Licensing.validate(). Each category is reported as the ``kind`` of a
+# ValidationIssue.
+
+# a license symbol that is not known to the Licensing object
+ISSUE_UNKNOWN_SYMBOL = "unknown-symbol"
+
+# an exception symbol (on the right side of a "WITH" statement) that is not a
+# known exception
+ISSUE_UNKNOWN_EXCEPTION = "unknown-exception"
+
+# a syntax boundary beyond which parsing cannot continue
+ISSUE_SYNTAX_BOUNDARY = "syntax-boundary"
+
+
+class ValidationIssue(namedtuple("ValidationIssue", "kind message start end string")):
+    """
+    A ValidationIssue describes a single problem found in a license expression
+    string when validating it with Licensing.validate().
+
+    It has the following fields:
+
+    - kind: str. One of the ISSUE_* category constants.
+
+    - message: str. A human-readable description of the problem.
+
+    - start: int. The zero-based index of the first character of the offending
+      substring in the original expression string, or -1 if not applicable.
+
+    - end: int. The zero-based index of the last character of the offending
+      substring in the original expression string, or -1 if not applicable.
+      ``original_expression[start:end + 1]`` yields the offending substring.
+
+    - string: str. The offending substring of the original expression.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, kind, message, start=-1, end=-1, string=""):
+        return super(ValidationIssue, cls).__new__(
+            cls, kind, message, start, end, string
+        )
+
+
 # Used for tokenizing
 Keyword = namedtuple("Keyword", "value type")
 Keyword.__len__ = lambda self: len(self.value)
@@ -151,10 +195,15 @@ class ExpressionInfo:
     - normalized_expression: str.
         - If a valid license expression has been passed into `validate()`,
           then the license expression string will be set in this field.
+          It is left empty when the expression cannot be fully parsed.
+
+    - issues: list of ValidationIssue
+        - All the issues found when validating the expression, in the order of
+          their position in the original expression string. Each issue carries
+          the original string indexes of the offending substring.
 
     - errors: list
-        - If there were errors validating a license expression,
-          the error messages will be appended here.
+        - The messages of the issues found when validating the expression.
 
     - invalid_symbols: list
         - If the license expression that has been passed into `validate()` has
@@ -169,11 +218,33 @@ class ExpressionInfo:
         normalized_expression=None,
         errors=None,
         invalid_symbols=None,
+        issues=None,
     ):
         self.original_expression = original_expression
         self.normalized_expression = normalized_expression
+        self.issues = issues or []
         self.errors = errors or []
         self.invalid_symbols = invalid_symbols or []
+
+    def add_issue(self, issue):
+        """
+        Append a ValidationIssue ``issue`` keeping the legacy ``errors`` and
+        ``invalid_symbols`` lists in sync. Ignore an exactly similar issue if it
+        was already recorded.
+        """
+        same = (
+            issue.kind == other.kind
+            and issue.start == other.start
+            and issue.end == other.end
+            and issue.string == other.string
+            for other in self.issues
+        )
+        if any(same):
+            return
+        self.issues.append(issue)
+        self.errors.append(issue.message)
+        if issue.string and issue.string not in self.invalid_symbols:
+            self.invalid_symbols.append(issue.string)
 
     def __repr__(self):
         return (
@@ -181,7 +252,8 @@ class ExpressionInfo:
             f"    original_expression={self.original_expression!r},\n"
             f"    normalized_expression={self.normalized_expression!r},\n"
             f"    errors={self.errors!r},\n"
-            f"    invalid_symbols={self.invalid_symbols!r}\n"
+            f"    invalid_symbols={self.invalid_symbols!r},\n"
+            f"    issues={self.issues!r}\n"
             ")"
         )
 
@@ -785,53 +857,273 @@ class Licensing(boolean.BooleanAlgebra):
 
     def validate(self, expression, strict=True, **kwargs):
         """
-        Return a ExpressionInfo object that contains information about
-        the validation of an ``expression``  license expression string.
+        Return an ExpressionInfo object that contains information about the
+        validation of an ``expression`` license expression string.
 
-        If the syntax and license keys of ``expression`` is valid, then
-        `ExpressionInfo.normalized_license_expression` is set.
+        Validation is performed in a single pass over the expression tokens so
+        that all the problems that can be determined from one expression are
+        reported together instead of stopping at the first unknown identifier.
+        Each problem is an ExpressionInfo.issues ValidationIssue carrying the
+        original string indexes of the offending substring. Issues are split in
+        three categories:
 
-        If an error was encountered when validating ``expression``,
-        `ExpressionInfo.errors` will be populated with strings containing the
-        error message that has occured. If an error has occured due to unknown
-        license keys or an invalid license symbol, the offending keys or symbols
-        will be present in `ExpressionInfo.invalid_symbols`
+        - unknown license symbols
+        - unknown (or misused) license exceptions in a "WITH" statement
+        - syntax boundaries beyond which parsing cannot continue
 
-        If ``strict`` is True, validation error messages will be included if in
-        a "WITH" expression such as "XXX with ZZZ" if the XXX symbol has
-        `is_exception` set to True or the YYY symbol has `is_exception` set to
-        False. This checks that exception symbols are used strictly as intended
-        on the right side of a "WITH" statement.
+        If the whole expression can be parsed, ExpressionInfo.normalized_expression
+        is set to the normalized expression even if some symbols are unknown.
+        When a syntax boundary is hit, no normalized expression is returned even
+        if a prefix of the expression could be parsed.
+
+        The legacy ``errors`` and ``invalid_symbols`` lists are kept in sync
+        with the collected issues.
+
+        If ``strict`` is True, validation issues are also reported for a "WITH"
+        expression such as "XXX with ZZZ" if the XXX symbol has `is_exception`
+        set to True or the ZZZ symbol has `is_exception` set to False.
         """
-        expression_info = ExpressionInfo(original_expression=str(expression))
+        original_expression = str(expression)
+        expression_info = ExpressionInfo(original_expression=original_expression)
 
-        # Check `expression` type and syntax
+        # An empty expression is not an error: it just has no content.
+        if not expression:
+            return expression_info
+
+        # Tokenize the whole expression first. Tokenization never aborts on an
+        # unknown symbol: unknown pieces become regular LicenseSymbol tokens.
+        # It can still fail on a syntax boundary such as a dangling "WITH".
         try:
-            parsed_expression = self.parse(expression, strict=strict)
-        except ExpressionParseError as e:
-            expression_info.errors.append(str(e))
-            expression_info.invalid_symbols.append(e.token_string)
+            tokens = get_raw_tokens(self, expression)
+        except ParseError as parse_error:
+            expression_info.add_issue(
+                self._build_syntax_issue(
+                    parse_error,
+                    original_expression=original_expression,
+                )
+            )
             return expression_info
-        except ExpressionError as e:
-            expression_info.errors.append(str(e))
-            expression_info.invalid_symbols.append(str(expression))
+        except ExpressionError as expression_error:
+            expression_info.add_issue(
+                self._build_syntax_issue_from_expression_error(
+                    expression_error,
+                    original_expression=original_expression,
+                )
+            )
             return expression_info
 
-        # Check `expression` keys (validate)
+        # Collect every unknown symbol and "WITH" misuse in one pass, keeping
+        # the original token positions.
+        for token_group in build_token_groups_for_with_subexpression(tokens):
+            if len(token_group) == 3:
+                self._check_with_subexpression(
+                    token_group,
+                    expression_info=expression_info,
+                    strict=strict,
+                )
+                continue
+
+            for token in token_group:
+                token_value = token.value
+                if isinstance(token_value, LicenseSymbol):
+                    if token_value.key not in self.known_symbols:
+                        expression_info.add_issue(
+                            ValidationIssue(
+                                kind=ISSUE_UNKNOWN_SYMBOL,
+                                message=f"Unknown license key: {token_value.key}",
+                                start=token.start,
+                                end=token.end,
+                                string=token.string,
+                            )
+                        )
+                    elif strict and token_value.is_exception:
+                        expression_info.add_issue(
+                            ValidationIssue(
+                                kind=ISSUE_SYNTAX_BOUNDARY,
+                                message=PARSE_ERRORS[PARSE_INVALID_EXCEPTION]
+                                + f' for token: "{token.string}"'
+                                + f" at position: {token.start}",
+                                start=token.start,
+                                end=token.end,
+                                string=token.string,
+                            )
+                        )
+
+        # Parse the tokens to detect syntax boundaries. The parser is fed the
+        # same tokens regardless of the unknown symbols found above. "WITH"
+        # subexpressions are merged with strict=False: strict misuse has already
+        # been reported as a syntax issue above.
+        parser_tokens = replace_with_subexpression_by_license_symbol(tokens, strict=False)
         try:
-            self.validate_license_keys(expression)
-        except ExpressionError as e:
-            expression_info.errors.append(str(e))
-            unknown_keys = self.unknown_license_keys(expression)
-            expression_info.invalid_symbols.extend(unknown_keys)
+            parsed_expression = super(Licensing, self).parse(
+                tokens_as_parser_tuples(parser_tokens)
+            )
+        except ParseError as parse_error:
+            syntax_issue = self._build_syntax_issue(
+                parse_error,
+                original_expression=original_expression,
+            )
+            # A syntax boundary dominates: discard unknown-symbol issues that
+            # point at the same unreadable substring.
+            expression_info.issues = [
+                issue
+                for issue in expression_info.issues
+                if not (
+                    issue.kind == ISSUE_UNKNOWN_SYMBOL
+                    and issue.start == syntax_issue.start
+                    and issue.end == syntax_issue.end
+                )
+            ]
+            expression_info.issues.append(syntax_issue)
+            expression_info.issues.sort(key=lambda issue: issue.start)
+            expression_info.errors = [issue.message for issue in expression_info.issues]
+            expression_info.invalid_symbols = [
+                issue.string
+                for issue in expression_info.issues
+                if issue.string
+            ]
+            return expression_info
+        except ExpressionError as expression_error:
+            expression_info.add_issue(
+                self._build_syntax_issue_from_expression_error(
+                    expression_error,
+                    original_expression=original_expression,
+                    tokens=tokens,
+                )
+            )
             return expression_info
 
-        # If we have not hit an exception, set `normalized_expression` in
-        # `expression_info` only if we did not encounter any errors
-        # along the way
-        if not expression_info.errors and not expression_info.invalid_symbols:
+        if not expression_info.issues:
             expression_info.normalized_expression = str(parsed_expression)
+        else:
+            # The expression is syntactically parseable but references unknown
+            # symbols: the parse result still gives a usable normalized value.
+            if not any(
+                issue.kind == ISSUE_SYNTAX_BOUNDARY for issue in expression_info.issues
+            ):
+                expression_info.normalized_expression = str(parsed_expression)
+
+        expression_info.issues.sort(key=lambda issue: issue.start)
         return expression_info
+
+    def _check_with_subexpression(self, token_group, expression_info, strict=True):
+        """
+        Record unknown symbol and strict "WITH" misuse issues on
+        ``expression_info`` for a "license WITH exception" ``token_group`` of
+        three original Token objects.
+        """
+        license_token, _with_token, exception_token = token_group
+        license_symbol = license_token.value
+        exception_symbol = exception_token.value
+
+        if license_symbol.key not in self.known_symbols:
+            expression_info.add_issue(
+                ValidationIssue(
+                    kind=ISSUE_UNKNOWN_SYMBOL,
+                    message=f"Unknown license key: {license_symbol.key}",
+                    start=license_token.start,
+                    end=license_token.end,
+                    string=license_token.string,
+                )
+            )
+
+        if strict and license_symbol.is_exception:
+            expression_info.add_issue(
+                ValidationIssue(
+                    kind=ISSUE_SYNTAX_BOUNDARY,
+                    message=PARSE_ERRORS[PARSE_INVALID_EXCEPTION]
+                    + f' for token: "{license_token.string}"'
+                    + f" at position: {license_token.start}",
+                    start=license_token.start,
+                    end=license_token.end,
+                    string=license_token.string,
+                )
+            )
+
+        if exception_symbol.key not in self.known_symbols:
+            expression_info.add_issue(
+                ValidationIssue(
+                    kind=ISSUE_UNKNOWN_EXCEPTION,
+                    message=f"Unknown license exception: {exception_symbol.key}",
+                    start=exception_token.start,
+                    end=exception_token.end,
+                    string=exception_token.string,
+                )
+            )
+        elif strict and not exception_symbol.is_exception:
+            expression_info.add_issue(
+                ValidationIssue(
+                    kind=ISSUE_SYNTAX_BOUNDARY,
+                    message=PARSE_ERRORS[PARSE_INVALID_SYMBOL_AS_EXCEPTION]
+                    + f' for token: "{exception_token.string}"'
+                    + f" at position: {exception_token.start}",
+                    start=exception_token.start,
+                    end=exception_token.end,
+                    string=exception_token.string,
+                )
+            )
+
+    @staticmethod
+    def _build_syntax_issue(parse_error, original_expression):
+        """
+        Return a syntax-boundary ValidationIssue built from a ParseError.
+        """
+        start = parse_error.position if parse_error.position is not None else -1
+        token_string = parse_error.token_string or ""
+        if start < 0 or not token_string:
+            end = -1
+        else:
+            end = start + len(token_string) - 1
+            # the reported position always points inside the original string
+            if original_expression and end >= len(original_expression):
+                end = len(original_expression) - 1
+        return ValidationIssue(
+            kind=ISSUE_SYNTAX_BOUNDARY,
+            message=str(parse_error),
+            start=start,
+            end=end,
+            string=token_string,
+        )
+
+    @staticmethod
+    def _build_syntax_issue_from_expression_error(
+        expression_error, original_expression, tokens=()
+    ):
+        """
+        Return a syntax-boundary ValidationIssue built from an ExpressionError
+        raised while parsing (e.g. an invalid license key character or an
+        operator without two operands).
+
+        Operator-arity errors do not carry a position: locate the last AND/OR
+        keyword token instead so the range stays clickable.
+        """
+        message = str(expression_error)
+        keyword_token = None
+        if message.startswith(("AND requires", "OR requires")):
+            wanted = TOKEN_AND if message.startswith("AND") else TOKEN_OR
+            for token in tokens:
+                if isinstance(token.value, Keyword) and token.value.type == wanted:
+                    keyword_token = token
+
+        if keyword_token is not None:
+            return ValidationIssue(
+                kind=ISSUE_SYNTAX_BOUNDARY,
+                message=message,
+                start=keyword_token.start,
+                end=keyword_token.end,
+                string=keyword_token.string,
+            )
+
+        token_string = original_expression or ""
+        start = 0 if token_string else -1
+        end = len(token_string) - 1 if token_string else -1
+        return ValidationIssue(
+            kind=ISSUE_SYNTAX_BOUNDARY,
+            message=message,
+            start=start,
+            end=end,
+            string=token_string,
+        )
 
 
 def get_scancode_licensing(license_index_location=vendored_scancode_licensedb_index_location):
@@ -1140,6 +1432,45 @@ def replace_with_subexpression_by_license_symbol(tokens, strict=False):
             value=lic_exc_sym,
         )
         yield token
+
+
+def get_raw_tokens(licensing, expression):
+    """
+    Return a list of Token objects produced from an ``expression`` string using
+    the same pipeline as Licensing.tokenize() but before "WITH" subexpressions
+    are merged and without the strict checks performed on these subexpressions.
+
+    The returned tokens keep their original ``start`` and ``end`` indexes in the
+    expression string. Unknown (unmatched) symbols are included as regular
+    LicenseSymbol tokens.
+    """
+    if not expression:
+        return []
+
+    if not isinstance(expression, str):
+        raise ParseError(error_code=PARSE_EXPRESSION_NOT_UNICODE)
+
+    tokens = licensing.get_advanced_tokenizer().tokenize(expression)
+    tokens = build_symbols_from_unknown_tokens(tokens)
+    tokens = (token for token in tokens if token.string and token.string.strip())
+    return list(tokens)
+
+
+def tokens_as_parser_tuples(tokens):
+    """
+    Yield the (token, token string, position) 3-tuples expected by the boolean
+    parser from a sequence of Token objects, skipping any Token whose value is
+    not a BaseSymbol or a Keyword.
+    """
+    for token in tokens:
+        token_value = token.value
+        if isinstance(token_value, BaseSymbol):
+            token_obj = token_value
+        elif isinstance(token_value, Keyword):
+            token_obj = token_value.type
+        else:
+            continue
+        yield token_obj, token.string, token.start
 
 
 class Renderable(object):

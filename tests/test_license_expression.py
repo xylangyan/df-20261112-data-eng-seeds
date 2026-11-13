@@ -24,6 +24,9 @@ from license_expression import PARSE_INVALID_SYMBOL_AS_EXCEPTION
 from license_expression import PARSE_INVALID_OPERATOR_SEQUENCE
 
 from license_expression import ExpressionError
+from license_expression import ISSUE_SYNTAX_BOUNDARY
+from license_expression import ISSUE_UNKNOWN_EXCEPTION
+from license_expression import ISSUE_UNKNOWN_SYMBOL
 from license_expression import Keyword
 from license_expression import Licensing
 from license_expression import LicenseExpression
@@ -2474,8 +2477,9 @@ class LicensingValidateTest(TestCase):
     def test_validation_invalid_license_key(self):
         result = self.licensing.validate("cool-license")
         assert result.original_expression == "cool-license"
-        assert not result.normalized_expression
-        assert result.errors == ["Unknown license key(s): cool-license"]
+        # the expression is fully parseable even if the symbol is unknown
+        assert result.normalized_expression == "cool-license"
+        assert result.errors == ["Unknown license key: cool-license"]
         assert result.invalid_symbols == ["cool-license"]
 
     def test_validation_invalid_license_key_chara(self):
@@ -2575,6 +2579,82 @@ class LicensingValidateTest(TestCase):
         assert result.original_expression == "AND OR"
         assert not result.normalized_expression
         assert len(result.errors) == 1
+
+    def test_validate_reports_all_issues_with_positions_in_one_pass(self):
+        # A four-row component list: one row has two unknown symbols, one row
+        # breaks in the middle, one row has an unknown exception and one row is
+        # valid. Each row is validated independently and every determinable
+        # issue is reported with its original string range.
+        rows = [
+            "MIT AND foo-license OR bar-license",
+            "MIT AND (GPL-2.0-or-later OR ) Apache-2.0",
+            "MIT OR GPL-2.0-or-later WITH no-such-exception",
+            "MIT OR Apache-2.0",
+        ]
+
+        results = [self.licensing.validate(row) for row in rows]
+
+        # row 1: two unknown symbols reported together with clickable ranges
+        result = results[0]
+        assert result.original_expression == rows[0]
+        assert result.normalized_expression == "(MIT AND foo-license) OR bar-license"
+        assert [(issue.kind, issue.start, issue.end) for issue in result.issues] == [
+            (ISSUE_UNKNOWN_SYMBOL, 8, 18),
+            (ISSUE_UNKNOWN_SYMBOL, 23, 33),
+        ]
+        assert [issue.string for issue in result.issues] == [
+            "foo-license",
+            "bar-license",
+        ]
+        assert result.invalid_symbols == ["foo-license", "bar-license"]
+
+        # row 2: a syntax boundary in the middle, no normalized expression
+        result = results[1]
+        assert result.original_expression == rows[1]
+        assert not result.normalized_expression
+        assert [(issue.kind, issue.start, issue.end) for issue in result.issues] == [
+            (ISSUE_SYNTAX_BOUNDARY, 29, 29),
+        ]
+        assert [issue.string for issue in result.issues] == [")"]
+
+        # row 3: an unknown exception with its original range
+        result = results[2]
+        assert result.original_expression == rows[2]
+        assert (
+            result.normalized_expression
+            == "MIT OR GPL-2.0-or-later WITH no-such-exception"
+        )
+        assert [(issue.kind, issue.start, issue.end) for issue in result.issues] == [
+            (ISSUE_UNKNOWN_EXCEPTION, 29, 45),
+        ]
+        assert [issue.string for issue in result.issues] == ["no-such-exception"]
+
+        # row 4: a valid expression, no issue
+        result = results[3]
+        assert result.original_expression == rows[3]
+        assert result.normalized_expression == "MIT OR Apache-2.0"
+        assert result.issues == []
+        assert result.errors == []
+        assert result.invalid_symbols == []
+
+        # each issue range points back to the offending substring of its row
+        for row, result in zip(rows, results):
+            for issue in result.issues:
+                assert row[issue.start : issue.end + 1] == issue.string
+
+    def test_validate_keeps_unknown_issues_alongside_a_syntax_boundary(self):
+        result = self.licensing.validate("MIT AND foo-license OR ) bar-license")
+        assert not result.normalized_expression
+        assert [(issue.kind, issue.start, issue.end) for issue in result.issues] == [
+            (ISSUE_UNKNOWN_SYMBOL, 8, 18),
+            (ISSUE_SYNTAX_BOUNDARY, 23, 23),
+            (ISSUE_UNKNOWN_SYMBOL, 25, 35),
+        ]
+        assert [issue.string for issue in result.issues] == [
+            "foo-license",
+            ")",
+            "bar-license",
+        ]
 
 
 class UtilTest(TestCase):

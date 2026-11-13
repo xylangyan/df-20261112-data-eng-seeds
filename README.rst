@@ -139,9 +139,10 @@ Create an SPDX Licensing and parse expressions::
     >>> licensing.validate('foo and MIT and GPL-2.0+')
     ExpressionInfo(
         original_expression='foo and MIT and GPL-2.0+',
-        normalized_expression=None,
-        errors=['Unknown license key(s): foo'],
-        invalid_symbols=['foo']
+        normalized_expression='foo AND MIT AND GPL-2.0-or-later',
+        errors=['Unknown license key: foo'],
+        invalid_symbols=['foo'],
+        issues=[ValidationIssue(kind='unknown-symbol', message='Unknown license key: foo', start=0, end=2, string='foo')]
     )
 
 

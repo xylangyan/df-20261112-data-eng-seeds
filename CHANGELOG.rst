@@ -1,6 +1,20 @@
 Changelog
 =========
 
+unreleased
+----------
+
+- validate() now collects every issue that can be determined from one
+  expression in a single pass instead of stopping at the first unknown
+  identifier. ExpressionInfo gains an ``issues`` list of ValidationIssue
+  objects distinguishing unknown symbols, unknown exceptions and syntax
+  boundaries, each with the original string indexes and substring of the
+  offending text. A normalized expression is still returned when the whole
+  expression parses, including when it references unknown symbols; a syntax
+  boundary leaves the normalized expression empty. The single-record
+  validate() API and the legacy ``errors`` and ``invalid_symbols`` lists are
+  preserved.
+
 v30.4.5 - 2026-03-03
 --------------------
 
