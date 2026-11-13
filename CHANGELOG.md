@@ -15,6 +15,10 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.FieldMigrator` for phased renames of an event-dict field (e.g. `job` → `run_id`): it reads both names, dual-writes or writes only the new name depending on configuration, distinguishes missing fields from explicit `None` values, resolves conflicts deterministically while recording the rule used, and raises a clear `TypeError` when placed after a renderer.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

@@ -56,6 +56,7 @@ __all__ = [
     "CallsiteParameterAdder",
     "EventRenamer",
     "ExceptionPrettyPrinter",
+    "FieldMigrator",
     "JSONRenderer",
     "KeyValueRenderer",
     "LogfmtRenderer",
@@ -1004,5 +1005,171 @@ class EventRenamer:
             replace_by = event_dict.pop(self.replace_by, None)
             if replace_by is not None:
                 event_dict["event"] = replace_by
+
+        return event_dict
+
+
+# Sentinel used internally to distinguish "key absent" from an explicit
+# ``None`` value.
+_MISSING: Final = object()
+
+
+class FieldMigrator:
+    r"""
+    Rename one event-dict field from *old_key* to *new_key* in phases.
+
+    It supports a gradual migration where old consumers only understand
+    *old_key* while new consumers expect *new_key*:
+
+    1. **Read** both names on every call.  Event dicts that already use
+       *new_key* pass through unchanged, so the processor is idempotent.
+    2. **Write** according to *mode*:
+
+       - ``"dual"`` keeps both names in sync, so old and new consumers
+         keep working in parallel.
+       - ``"new-only"`` removes *old_key* and writes only *new_key*,
+         completing the migration.
+
+    The processor distinguishes three situations that a naive
+    ``event_dict.get(key)`` based implementation would conflate:
+
+    - **Missing**: neither key is present.  Nothing is written and no
+      marker is added.
+    - **Explicit null**: a key is present with the value `None`.  `None`
+      is treated as a real value and is migrated like any other.
+    - **Conflict**: both keys are present with different values.  One
+      value never silently overwrites the other; *on_conflict* decides
+      deterministically and the applied rule is recorded in the event
+      dict under *marker_key*.
+
+    The recorded marker values are:
+
+    =========================  ===========================================
+    Marker value               Rule used to normalize the field
+    =========================  ===========================================
+    ``"old_only"``             only *old_key* was present
+    ``"conflict_new_wins"``    both present, *new_key* value kept
+    ``"conflict_old_wins"``    both present, *old_key* value kept
+    =========================  ===========================================
+
+    Once written, markers are left untouched on subsequent calls, which
+    keeps repeated processing stable.
+
+    Args:
+        old_key: Name of the field used by old consumers.
+
+        new_key: Name of the field expected by new consumers.
+
+        mode: ``"dual"`` writes both names, ``"new-only"`` writes only
+            *new_key* and removes *old_key*.
+
+        on_conflict: What to do when both keys are present with
+            different values: ``"new"`` keeps the *new_key* value,
+            ``"old"`` keeps the *old_key* value, ``"error"`` raises a
+            `ValueError`.
+
+        marker_key: Key under which the normalization rule is recorded.
+            Set to `None` to disable recording.
+
+    Raises:
+        TypeError: If the event dict is not a `dict`, which means this
+            processor was placed after a renderer in the processor
+            chain.
+
+        ValueError: If *on_conflict* is ``"error"`` and the two values
+            conflict.
+    """
+
+    MODE_DUAL: ClassVar = "dual"
+    MODE_NEW_ONLY: ClassVar = "new-only"
+
+    def __init__(
+        self,
+        old_key: str,
+        new_key: str,
+        mode: str = "dual",
+        on_conflict: str = "new",
+        marker_key: str | None = "_field_migration",
+    ):
+        if mode not in (self.MODE_DUAL, self.MODE_NEW_ONLY):
+            msg = f"mode must be 'dual' or 'new-only', got {mode!r}"
+            raise ValueError(msg)
+        if on_conflict not in ("new", "old", "error"):
+            msg = (
+                "on_conflict must be one of 'new', 'old' or 'error', "
+                f"got {on_conflict!r}"
+            )
+            raise ValueError(msg)
+
+        self.old_key = old_key
+        self.new_key = new_key
+        self.mode = mode
+        self.on_conflict = on_conflict
+        self.marker_key = marker_key
+
+    def _record(self, event_dict: EventDict, rule: str) -> None:
+        if self.marker_key is not None:
+            event_dict[self.marker_key] = {
+                "old_key": self.old_key,
+                "new_key": self.new_key,
+                "rule": rule,
+            }
+
+    def __call__(
+        self,
+        logger: logging.Logger,
+        name: str,
+        event_dict: EventDict,
+    ) -> EventDict:
+        if not isinstance(event_dict, dict):
+            msg = (
+                f"{type(self).__name__} received a "
+                f"{type(event_dict).__name__} instead of an event dict: "
+                "the event has already been "
+                "rendered. Place FieldMigrator before the renderer in the "
+                "processor chain (and before "
+                "ProcessorFormatter.remove_processors_meta when using "
+                "ProcessorFormatter)."
+            )
+            raise TypeError(msg)
+
+        old_present = self.old_key in event_dict
+        new_present = self.new_key in event_dict
+
+        if not old_present and not new_present:
+            return event_dict
+
+        old_value = event_dict[self.old_key] if old_present else _MISSING
+        new_value = event_dict[self.new_key] if new_present else _MISSING
+
+        if old_present and new_present:
+            if old_value == new_value:
+                return event_dict
+
+            if self.on_conflict == "error":
+                msg = (
+                    f"Conflicting values for {self.old_key!r}={old_value!r} "
+                    f"and {self.new_key!r}={new_value!r}"
+                )
+                raise ValueError(msg)
+
+            if self.on_conflict == "new":
+                chosen = new_value
+                rule = "conflict_new_wins"
+            else:
+                chosen = old_value
+                rule = "conflict_old_wins"
+        elif old_present:
+            chosen = old_value
+            rule = "old_only"
+        else:
+            return event_dict
+
+        if self.mode == self.MODE_NEW_ONLY:
+            event_dict.pop(self.old_key, None)
+        else:
+            event_dict[self.old_key] = chosen
+        event_dict[self.new_key] = chosen
+        self._record(event_dict, rule)
 
         return event_dict

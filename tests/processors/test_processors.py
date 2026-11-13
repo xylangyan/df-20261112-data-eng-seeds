@@ -27,6 +27,7 @@ from structlog.processors import (
     CallsiteParameterAdder,
     EventRenamer,
     ExceptionPrettyPrinter,
+    FieldMigrator,
     JSONRenderer,
     StackInfoRenderer,
     UnicodeDecoder,
@@ -762,3 +763,229 @@ class TestRenameKey:
         assert {"msg": "hi", "foo": "bar"} == EventRenamer("msg", "missing")(
             None, None, {"event": "hi", "foo": "bar"}
         )
+
+
+def _migrate(event_dict, **kwargs):
+    defaults = dict(old_key="job", new_key="run_id")
+    defaults.update(kwargs)
+    return FieldMigrator(**defaults)(None, "info", dict(event_dict))
+
+
+def _run_twice(event_dict, **kwargs):
+    once = _migrate(event_dict, **kwargs)
+    twice = _migrate(once, **kwargs)
+    return once, twice
+
+
+class TestFieldMigrator:
+    def test_missing_field_is_left_alone(self):
+        """
+        Events without either key are not touched and get no marker.
+        """
+        event_dict = {"event": "hi"}
+
+        assert {"event": "hi"} == _migrate(event_dict)
+
+    @pytest.mark.parametrize("mode", ["dual", "new-only"])
+    def test_explicit_null_is_a_real_value(self, mode):
+        """
+        An explicit None is migrated and never conflated with missing.
+        """
+        once, twice = _run_twice(
+            {"event": "hi", "job": None}, mode=mode
+        )
+
+        assert once["run_id"] is None
+        assert once["_field_migration"]["rule"] == "old_only"
+        assert twice == once
+
+    def test_old_only_dual_writes_both_names(self):
+        """
+        In dual mode the value is written under both names.
+        """
+        once, twice = _run_twice({"event": "hi", "job": "job-1"})
+
+        assert once == {
+            "event": "hi",
+            "job": "job-1",
+            "run_id": "job-1",
+            "_field_migration": {
+                "old_key": "job",
+                "new_key": "run_id",
+                "rule": "old_only",
+            },
+        }
+        assert twice == once
+
+    def test_old_only_new_only_drops_old_name(self):
+        """
+        In new-only mode the old name is removed.
+        """
+        once, twice = _run_twice(
+            {"event": "hi", "job": "job-1"}, mode="new-only"
+        )
+
+        assert once == {
+            "event": "hi",
+            "run_id": "job-1",
+            "_field_migration": {
+                "old_key": "job",
+                "new_key": "run_id",
+                "rule": "old_only",
+            },
+        }
+        assert twice == once
+
+    def test_new_only_input_passes_through_unchanged(self):
+        """
+        Logs already in the new format don't change, no marker added.
+        """
+        event_dict = {"event": "hi", "run_id": "run-1"}
+
+        once, twice = _run_twice(event_dict)
+
+        assert once == event_dict
+        assert twice == event_dict
+
+    def test_mixed_equal_values_pass_through_unchanged(self):
+        """
+        Both names with the same value need no normalization.
+        """
+        event_dict = {"event": "hi", "job": "x", "run_id": "x"}
+
+        assert _migrate(event_dict) == event_dict
+
+    @pytest.mark.parametrize("mode", ["dual", "new-only"])
+    def test_conflict_new_wins_and_marks_rule(self, mode):
+        """
+        Conflicts are resolved deterministically and the rule recorded.
+        """
+        once, twice = _run_twice(
+            {"event": "hi", "job": "old-1", "run_id": "new-1"},
+            mode=mode,
+        )
+
+        assert once["run_id"] == "new-1"
+        assert once["_field_migration"]["rule"] == "conflict_new_wins"
+        if mode == "dual":
+            assert once["job"] == "new-1"
+        else:
+            assert "job" not in once
+        assert twice == once
+
+    def test_conflict_old_wins(self):
+        """
+        on_conflict='old' keeps the old value and marks the rule.
+        """
+        once, twice = _run_twice(
+            {"job": "old-1", "run_id": "new-1"}, on_conflict="old"
+        )
+
+        assert once["run_id"] == "old-1"
+        assert once["job"] == "old-1"
+        assert once["_field_migration"]["rule"] == "conflict_old_wins"
+        assert twice == once
+
+    def test_conflict_error_raises(self):
+        """
+        on_conflict='error' raises instead of picking a side.
+        """
+        with pytest.raises(ValueError, match="Conflicting values"):
+            _migrate({"job": "old-1", "run_id": "new-1"}, on_conflict="error")
+
+    def test_conflict_between_null_and_value_is_still_conflict(self):
+        """
+        An explicit None next to a real value is a conflict, not missing.
+        """
+        once = _migrate({"job": None, "run_id": "new-1"})
+
+        assert once["run_id"] == "new-1"
+        assert once["_field_migration"]["rule"] == "conflict_new_wins"
+
+    def test_marker_can_be_disabled(self):
+        """
+        marker_key=None disables recording without changing migration.
+        """
+        once = _migrate({"job": "job-1"}, marker_key=None)
+
+        assert once == {"job": "job-1", "run_id": "job-1"}
+
+    def test_invalid_constructor_args(self):
+        with pytest.raises(ValueError, match="mode"):
+            FieldMigrator("job", "run_id", mode="sideways")
+        with pytest.raises(ValueError, match="on_conflict"):
+            FieldMigrator("job", "run_id", on_conflict="coin-flip")
+
+    def test_rendered_event_raises_helpful_type_error(self):
+        """
+        Placing the processor after a renderer gives a clear hint.
+        """
+        chain = [FieldMigrator("job", "run_id"), JSONRenderer()]
+        rendered = chain[1](None, "info", {"event": "hi", "job": "j"})
+
+        with pytest.raises(TypeError, match="before the renderer"):
+            chain[0](None, "info", rendered)
+
+    def test_structlog_logger_chain(self):
+        """
+        Works end to end through a configured structlog logger.
+        """
+        cf = CapturingLoggerFactory()
+        structlog.configure(
+            processors=[
+                FieldMigrator("job", "run_id", mode="new-only"),
+                JSONRenderer(),
+            ],
+            logger_factory=cf,
+        )
+        try:
+            structlog.get_logger().info("hi", job="job-1")
+        finally:
+            structlog.reset_defaults()
+
+        payload = json.loads(cf.logger.calls[0].args[0])
+        assert payload["run_id"] == "job-1"
+        assert "job" not in payload
+        assert payload["_field_migration"]["rule"] == "old_only"
+
+    def test_structlog_and_processor_formatter_agree(self):
+        """
+        structlog and stdlib records get identical processed output.
+        """
+        migrator = FieldMigrator("job", "run_id", mode="new-only")
+        formatter = ProcessorFormatter(
+            foreign_pre_chain=[structlog.stdlib.ExtraAdder(allow=["job"])],
+            processors=[
+                migrator,
+                ProcessorFormatter.remove_processors_meta,
+                JSONRenderer(),
+            ],
+        )
+        structlog.configure(
+            processors=[
+                migrator,
+                ProcessorFormatter.wrap_for_formatter,
+            ],
+            logger_factory=structlog.stdlib.LoggerFactory(),
+        )
+        stdlib_logger = logging.getLogger("field-migration-test")
+        stream = StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(formatter)
+        stdlib_logger.addHandler(handler)
+        stdlib_logger.setLevel(logging.INFO)
+
+        try:
+            structlog.get_logger("field-migration-test").info(
+                "hi", job="job-1"
+            )
+            structlog_payload = json.loads(stream.getvalue())
+            stream.seek(0)
+            stream.truncate()
+            stdlib_logger.info("hi", extra={"job": "job-1"})
+            foreign_payload = json.loads(stream.getvalue())
+        finally:
+            stdlib_logger.removeHandler(handler)
+            structlog.reset_defaults()
+
+        assert structlog_payload == foreign_payload
