@@ -1,6 +1,16 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add the ``load_aliases`` field argument for accepting read-only historical
+  external names while loading. Dumping always uses the current ``data_key``
+  (or field name). If a field arrives under multiple accepted names with
+  different raw values, a ``ValidationError`` is raised on the current key.
+
 4.4.0 (2026-11-03)
 ------------------
 

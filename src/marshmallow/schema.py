@@ -43,6 +43,16 @@ if typing.TYPE_CHECKING:
     from marshmallow.fields import Field
 
 
+def _values_equal(left: typing.Any, right: typing.Any) -> bool:
+    """Compare two raw input values, treating uncomparable values as unequal."""
+    if left is right:
+        return True
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
 def _get_fields(attrs) -> list[tuple[str, Field]]:
     """Get fields from a class
 
@@ -314,6 +324,9 @@ class Schema(metaclass=SchemaMeta):
     opts: typing.Any
     _declared_fields: dict[str, Field] = {}
     _hooks: dict[str, list[tuple[str, bool, dict]]] = {}
+    # Load-only alias index, built in _init_fields
+    _load_alias_map: dict[str, str]
+    _load_key_to_field: dict[str, Field]
 
     class Meta:
         """Options object for a Schema.
@@ -594,6 +607,60 @@ class Schema(metaclass=SchemaMeta):
         serialized = self.dump(obj, many=many)
         return self.opts.render_module.dumps(serialized, *args, **kwargs)
 
+    def _resolve_load_aliases(
+        self,
+        data: Mapping[str, typing.Any],
+        *,
+        error_store: ErrorStore,
+        index=None,
+    ) -> tuple[Mapping[str, typing.Any], set[str]]:
+        """Rename historical ``load_aliases`` keys to the current external key.
+
+        Returns the (possibly rewritten) input mapping and the set of canonical
+        external keys whose alias values conflicted. A conflict occurs when a
+        field is supplied under more than one of its accepted names (current key
+        and/or aliases) with *different raw values*. Comparison happens on the
+        raw input values, before any field-level transformation, so that a
+        conflict is reported deterministically even when one side would fail
+        deserialization. On conflict the field is skipped entirely (no
+        ``load_default``/required handling) and the error is reported on the
+        field's current external key, listing every name involved.
+        """
+        if not self._load_alias_map:
+            return data, set()
+        present_aliases = [key for key in data if key in self._load_alias_map]
+        if not present_aliases:
+            return data, set()
+        normalized = dict(data)
+        conflicted: set[str] = set()
+        # Group all present names (current key + aliases) per canonical key.
+        by_canonical: dict[str, list[str]] = {}
+        for alias in present_aliases:
+            canonical = self._load_alias_map[alias]
+            by_canonical.setdefault(canonical, []).append(alias)
+        for canonical, aliases in by_canonical.items():
+            names = [canonical, *aliases] if canonical in data else aliases
+            if len(names) > 1:
+                values = [data[name] for name in names]
+                if any(not _values_equal(value, values[0]) for value in values[1:]):
+                    conflicted.add(canonical)
+                    field_obj = self._load_key_to_field[canonical]
+                    error = field_obj.make_error(
+                        "alias_conflict", aliases=", ".join(names)
+                    )
+                    error_store.store_error(error.messages, canonical, index=index)
+                    normalized.pop(canonical, None)
+                    for alias in aliases:
+                        normalized.pop(alias, None)
+                    continue
+            # All present names agree (or only aliases are present): keep the
+            # current key and drop the consumed aliases.
+            if canonical not in normalized:
+                normalized[canonical] = data[aliases[0]]
+            for alias in aliases:
+                normalized.pop(alias, None)
+        return normalized, conflicted
+
     def _deserialize(
         self,
         data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
@@ -643,6 +710,9 @@ class Schema(metaclass=SchemaMeta):
         if not isinstance(data, Mapping):
             error_store.store_error([self.error_messages["type"]], index=index)
         else:
+            data, conflicted_fields = self._resolve_load_aliases(
+                data, error_store=error_store, index=index
+            )
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
                 field_name = (
@@ -654,6 +724,10 @@ class Schema(metaclass=SchemaMeta):
                     if partial is True or (
                         partial_is_collection and attr_name in partial
                     ):
+                        continue
+                    # A conflicting alias value must not be masked by
+                    # load_default or a required-field error.
+                    if field_name in conflicted_fields:
                         continue
                 d_kwargs = {}
                 # Allow partial loading of nested schemas.
@@ -692,6 +766,7 @@ class Schema(metaclass=SchemaMeta):
                     field_obj.data_key if field_obj.data_key is not None else field_name
                     for field_name, field_obj in self.load_fields.items()
                 }
+                fields |= set(self._load_alias_map)
                 for key in set(data) - fields:
                     value = data[key]
                     if unknown == INCLUDE:
@@ -1047,6 +1122,35 @@ class Schema(metaclass=SchemaMeta):
                 "Check the following field names and "
                 f"attribute arguments: {list(attributes_duplicates)}"
             )
+
+        # Build the read-only alias index used at load time. Aliases must not
+        # shadow any canonical external key or another field's alias, otherwise
+        # resolution would be ambiguous. Dump keys are intentionally left out of
+        # this machinery so serialized output always uses the current name.
+        canonical_load_keys = {
+            obj.data_key if obj.data_key is not None else name
+            for name, obj in load_fields.items()
+        }
+        alias_map: dict[str, str] = self.dict_class()
+        for field_name, field_obj in load_fields.items():
+            canonical_key = (
+                field_obj.data_key if field_obj.data_key is not None else field_name
+            )
+            for alias in field_obj.load_aliases:
+                if alias == canonical_key:
+                    continue
+                if alias in canonical_load_keys or alias in alias_map:
+                    raise ValueError(
+                        f"The load alias {alias!r} collides with another "
+                        "field's name, data_key, or load_aliases. "
+                        "Load aliases must be unique within a schema."
+                    )
+                alias_map[alias] = canonical_key
+        self._load_alias_map = alias_map
+        self._load_key_to_field = {
+            obj.data_key if obj.data_key is not None else name: obj
+            for name, obj in load_fields.items()
+        }
 
         self.fields = fields_dict
         self.dump_fields = dump_fields

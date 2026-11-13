@@ -80,6 +80,7 @@ class _BaseFieldKwargs(typing.TypedDict, total=False):
     load_default: typing.Any
     dump_default: typing.Any
     data_key: str | None
+    load_aliases: types.StrSequenceOrSet | None
     attribute: str | None
     validate: types.Validator | typing.Iterable[types.Validator] | None
     pre_load: types.PreLoadCallable | typing.Iterable[types.PreLoadCallable] | None
@@ -118,6 +119,13 @@ class Field(typing.Generic[_InternalT]):
     :param data_key: The name of the dict key in the external representation, i.e.
         the input of `load` and the output of `dump`.
         If `None`, the key will match the name of the field.
+    :param load_aliases: Additional historical names accepted *only* when loading.
+        Each alias behaves like the field's current external key (``data_key`` or
+        the field name) during deserialization, but is never emitted by `dump`.
+        If the same field is supplied under both its current key and an alias (or
+        under several aliases), the raw values must be equal, otherwise a
+        validation error is reported on the field.
+        If `None` or empty, no aliases are registered.
     :param attribute: The name of the key/attribute in the internal representation, i.e.
         the output of `load` and the input of `dump`.
         If `None`, the key/attribute will match the name of the field.
@@ -161,6 +169,8 @@ class Field(typing.Generic[_InternalT]):
         Remove ``context`` property.
     .. versionchanged:: 4.3.0
         Add ``pre_load`` and ``post_load``.
+    .. versionchanged:: 4.5.0
+        Add ``load_aliases`` for read-only historical external names.
     """
 
     # Some fields, such as Method fields and Function fields, are not expected
@@ -175,6 +185,10 @@ class Field(typing.Generic[_InternalT]):
         "required": "Missing data for required field.",
         "null": "Field may not be null.",
         "validator_failed": "Invalid value.",
+        "alias_conflict": (
+            "Conflicting values received under the current name "
+            "and/or its load aliases: {aliases}."
+        ),
     }
 
     def __init__(
@@ -183,6 +197,7 @@ class Field(typing.Generic[_InternalT]):
         load_default: typing.Any = missing_,
         dump_default: typing.Any = missing_,
         data_key: str | None = None,
+        load_aliases: types.StrSequenceOrSet | None = None,
         attribute: str | None = None,
         validate: types.Validator | typing.Iterable[types.Validator] | None = None,
         pre_load: (
@@ -203,6 +218,15 @@ class Field(typing.Generic[_InternalT]):
 
         self.attribute = attribute
         self.data_key = data_key
+        self.load_aliases: tuple[str, ...]
+        if load_aliases is None:
+            self.load_aliases = ()
+        elif isinstance(load_aliases, str):
+            self.load_aliases = (load_aliases,)
+        else:
+            self.load_aliases = tuple(dict.fromkeys(load_aliases))
+            if not all(isinstance(alias, str) for alias in self.load_aliases):
+                raise ValueError("'load_aliases' must contain strings only.")
         self.validate = validate
         self.validators = self._normalize_processors(validate, param="validate")
         self.pre_load = self._normalize_processors(pre_load, param="pre_load")

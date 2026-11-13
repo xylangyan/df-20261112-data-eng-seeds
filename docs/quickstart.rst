@@ -552,6 +552,50 @@ If you are consuming and producing data that does not match your schema, you can
     # {'name': u'Mike',
     # 'email': 'foo@bar.com'}
 
+Accepting historical names while loading
+----------------------------------------
+
+When a key is renamed but old producers keep sending the former name for a
+transition period, declare those read-only historical names with
+``load_aliases``. Aliases are accepted only by `Schema.load`;
+`Schema.dump` always emits the current key (the field name or its
+``data_key``).
+
+.. code-block:: python
+
+    class StationSchema(Schema):
+        station_id = fields.Int(load_aliases=("stationId", "sid"))
+
+    schema = StationSchema()
+
+    schema.load({"station_id": 7})   # {"station_id": 7}
+    schema.load({"stationId": 7})    # {"station_id": 7}
+    schema.load({"sid": 7})          # {"station_id": 7}
+    schema.dump({"station_id": 7})   # {"station_id": 7}  -- aliases never appear
+
+If the same field arrives under several of its accepted names, the *raw*
+values must be equal. Equal values collapse onto the current key; different
+values raise a `ValidationError <marshmallow.exceptions.ValidationError>`
+reported on the current key and listing every name involved. The comparison
+is performed on the raw input, before any field conversion or validation, so
+that a conflict is always surfaced even when one side would fail
+deserialization.
+
+.. code-block:: python
+
+    schema.load({"station_id": 7, "sid": 7})
+    # {"station_id": 7}
+    schema.load({"station_id": 7, "sid": 8})
+    # ValidationError: {"station_id": ["Conflicting values received under
+    #                   the current name and/or its load aliases:
+    #                   station_id, sid."]}
+
+Consumed alias keys are not treated as unknown fields, but genuinely unknown
+keys still follow the schema's ``unknown`` option. Aliases must be unique
+within a schema: an alias that equals another field's name, ``data_key``, or
+alias raises ``ValueError`` when the schema is built. Aliases work with
+nested schemas, ``many``, and ``partial`` just like regular keys.
+
 
 Next steps
 ----------
