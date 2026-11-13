@@ -1,3 +1,4 @@
+import enum
 import random
 from collections.abc import Callable, Iterator, MutableMapping, Sequence
 from contextlib import AbstractContextManager
@@ -21,6 +22,7 @@ __all__: Final = (
     "FIFOCache",
     "LFUCache",
     "LRUCache",
+    "RemovalReason",
     "RRCache",
     "TLRUCache",
     "TTLCache",
@@ -37,6 +39,12 @@ _T = TypeVar("_T")
 _KT = TypeVar("_KT")
 _VT = TypeVar("_VT")
 _TT = TypeVar("_TT", default=float)
+
+class RemovalReason(enum.Enum):
+    EXPIRED = "expired"
+    EVICTED = "evicted"
+    DELETED = "deleted"
+    CLEARED = "cleared"
 
 class Cache(MutableMapping[_KT, _VT]):
     def __init__(
@@ -85,6 +93,7 @@ class _TimedCache(Cache[_KT, _VT], Generic[_KT, _VT, _TT]):
         maxsize: float,
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
+        on_evict: Callable[[_KT, _VT, RemovalReason], None] | None = None,
     ) -> None: ...
 
     class _Timer(AbstractContextManager[_T]):
@@ -105,6 +114,7 @@ class TTLCache(_TimedCache[_KT, _VT, _TT]):
         ttl: float,
         *,
         getsizeof: Callable[[_VT], float] | None = None,
+        on_evict: Callable[[_KT, _VT, RemovalReason], None] | None = None,
     ) -> None: ...
     @overload
     def __init__(
@@ -113,6 +123,7 @@ class TTLCache(_TimedCache[_KT, _VT, _TT]):
         ttl: Any,  # must be "addable" to _TT
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
+        on_evict: Callable[[_KT, _VT, RemovalReason], None] | None = None,
     ) -> None: ...
     @property
     def ttl(self) -> Any: ...
@@ -126,6 +137,7 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
         ttu: Callable[[_KT, _VT, float], float],
         *,
         getsizeof: Callable[[_VT], float] | None = None,
+        on_evict: Callable[[_KT, _VT, RemovalReason], None] | None = None,
     ) -> None: ...
     @overload
     def __init__(
@@ -134,6 +146,7 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
         ttu: Callable[[_KT, _VT, _TT], _TT],
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
+        on_evict: Callable[[_KT, _VT, RemovalReason], None] | None = None,
     ) -> None: ...
     @property
     def ttu(self) -> Callable[[_KT, _VT, _TT], _TT]: ...

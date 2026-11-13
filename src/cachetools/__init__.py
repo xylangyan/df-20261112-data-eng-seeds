@@ -6,6 +6,7 @@ __all__ = (
     "FIFOCache",
     "LFUCache",
     "LRUCache",
+    "RemovalReason",
     "RRCache",
     "TLRUCache",
     "TTLCache",
@@ -17,12 +18,22 @@ __version__ = "8.0.0"
 
 import collections
 import collections.abc
+import enum
 import functools
 import heapq
 import random
 import time
 
 from . import keys
+
+
+class RemovalReason(enum.Enum):
+    """Reason why an item was removed from a timed cache."""
+
+    EXPIRED = "expired"
+    EVICTED = "evicted"
+    DELETED = "deleted"
+    CLEARED = "cleared"
 
 
 class Cache(collections.abc.MutableMapping):
@@ -413,9 +424,21 @@ class _TimedCache(Cache):
         def __getattr__(self, name):
             return getattr(self.__timer, name)
 
-    def __init__(self, maxsize, timer, getsizeof=None):
+    def __init__(self, maxsize, timer, getsizeof=None, on_evict=None):
         Cache.__init__(self, maxsize, getsizeof)
         self.__timer = _TimedCache._Timer(timer)
+        self.__on_evict = on_evict
+
+    def _notify_eviction(self, key, value, reason):
+        on_evict = self.__on_evict
+        if on_evict is not None:
+            on_evict(key, value, reason)
+
+    def _notify_clear(self, items):
+        on_evict = self.__on_evict
+        if on_evict is not None:
+            for key, value in items:
+                on_evict(key, value, RemovalReason.CLEARED)
 
     def __repr__(self, cache_repr=Cache.__repr__):
         with self.__timer as time:
@@ -479,8 +502,10 @@ class TTLCache(_TimedCache):
             prev.next = next
             next.prev = prev
 
-    def __init__(self, maxsize, ttl, timer=time.monotonic, getsizeof=None):
-        _TimedCache.__init__(self, maxsize, timer, getsizeof)
+    def __init__(
+        self, maxsize, ttl, timer=time.monotonic, getsizeof=None, on_evict=None
+    ):
+        _TimedCache.__init__(self, maxsize, timer, getsizeof, on_evict)
         self.__root = root = TTLCache._Link()
         root.prev = root.next = root
         self.__links = collections.OrderedDict()
@@ -523,11 +548,17 @@ class TTLCache(_TimedCache):
         link.prev = prev = root.prev
         prev.next = root.prev = link
 
-    def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+    def __delitem__(
+        self, key, reason=RemovalReason.DELETED, cache_delitem=Cache.__delitem__
+    ):
+        value = Cache.__getitem__(self, key)
         cache_delitem(self, key)
         link = self.__links.pop(key)
         link.unlink()
         if not (self.timer() < link.expires):
+            reason = RemovalReason.EXPIRED
+        self._notify_eviction(key, value, reason)
+        if reason is RemovalReason.EXPIRED:
             raise KeyError(key)
 
     def __iter__(self):
@@ -571,12 +602,15 @@ class TTLCache(_TimedCache):
         cache_delitem = Cache.__delitem__
         cache_getitem = Cache.__getitem__
         while curr is not root and not (time < curr.expires):
-            expired.append((curr.key, cache_getitem(self, curr.key)))
-            cache_delitem(self, curr.key)
-            del links[curr.key]
+            key = curr.key
+            value = cache_getitem(self, key)
+            expired.append((key, value))
+            cache_delitem(self, key)
+            del links[key]
             next = curr.next
             curr.unlink()
             curr = next
+            self._notify_eviction(key, value, RemovalReason.EXPIRED)
         return expired
 
     def popitem(self):
@@ -592,14 +626,23 @@ class TTLCache(_TimedCache):
                 raise KeyError("%s is empty" % type(self).__name__) from None
             else:
                 value = Cache.__getitem__(self, key)
-                del self[key]
+                self.__delitem__(key, RemovalReason.EVICTED)
                 return (key, value)
 
     def clear(self):
-        _TimedCache.clear(self)
         root = self.__root
+        link = root.next
+        removed = None
+        if link is not root:
+            removed = []
+            while link is not root:
+                removed.append((link.key, Cache.__getitem__(self, link.key)))
+                link = link.next
+        _TimedCache.clear(self)
         root.prev = root.next = root
         self.__links.clear()
+        if removed is not None:
+            self._notify_clear(removed)
 
 
 class TLRUCache(_TimedCache):
@@ -619,8 +662,10 @@ class TLRUCache(_TimedCache):
         def __lt__(self, other):
             return self.expires < other.expires
 
-    def __init__(self, maxsize, ttu, timer=time.monotonic, getsizeof=None):
-        _TimedCache.__init__(self, maxsize, timer, getsizeof)
+    def __init__(
+        self, maxsize, ttu, timer=time.monotonic, getsizeof=None, on_evict=None
+    ):
+        _TimedCache.__init__(self, maxsize, timer, getsizeof, on_evict)
         self.__items = collections.OrderedDict()
         self.__order = []
         self.__ttu = ttu
@@ -652,7 +697,7 @@ class TLRUCache(_TimedCache):
             if not (time < expires):
                 # updating an existing item with an already expired
                 # one should remove the existing item
-                return self.__delitem(key)
+                return self.__delitem(key, RemovalReason.EXPIRED)
             cache_setitem(self, key, value)
         # removing an existing item would break the heap structure, so
         # only mark it as removed for now
@@ -664,13 +709,19 @@ class TLRUCache(_TimedCache):
         items[key] = item = TLRUCache._Item(key, expires)
         heapq.heappush(self.__order, item)
 
-    def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+    def __delitem__(
+        self, key, reason=RemovalReason.DELETED, cache_delitem=Cache.__delitem__
+    ):
+        value = Cache.__getitem__(self, key)
         with self.timer as time:
             # no self.expire() for performance reasons, e.g. self.clear() [#67]
             cache_delitem(self, key)
         item = self.__items.pop(key)
         item.removed = True
         if not (time < item.expires):
+            reason = RemovalReason.EXPIRED
+        self._notify_eviction(key, value, reason)
+        if reason is RemovalReason.EXPIRED:
             raise KeyError(key)
 
     def __iter__(self):
@@ -706,9 +757,12 @@ class TLRUCache(_TimedCache):
         while order and (order[0].removed or not (time < order[0].expires)):
             item = heapq.heappop(order)
             if not item.removed:
-                expired.append((item.key, cache_getitem(self, item.key)))
-                cache_delitem(self, item.key)
-                del items[item.key]
+                key = item.key
+                value = cache_getitem(self, key)
+                expired.append((key, value))
+                cache_delitem(self, key)
+                del items[key]
+                self._notify_eviction(key, value, RemovalReason.EXPIRED)
         return expired
 
     def popitem(self):
@@ -724,21 +778,28 @@ class TLRUCache(_TimedCache):
                 raise KeyError("%s is empty" % type(self).__name__) from None
             else:
                 value = Cache.__getitem__(self, key)
-                del self[key]
+                self.__delitem__(key, RemovalReason.EVICTED)
                 return (key, value)
 
     def clear(self):
+        removed = None
+        if self.__items:
+            removed = [(key, Cache.__getitem__(self, key)) for key in self.__items]
         _TimedCache.clear(self)
         self.__items.clear()
         del self.__order[:]
+        if removed is not None:
+            self._notify_clear(removed)
 
-    def __delitem(self, key, cache_delitem=Cache.__delitem__):
+    def __delitem(self, key, reason, cache_delitem=Cache.__delitem__):
         try:
-            self.__items.pop(key).removed = True
+            item = self.__items.pop(key)
         except KeyError:
-            pass
-        else:
-            cache_delitem(self, key)
+            return
+        item.removed = True
+        value = Cache.__getitem__(self, key)
+        cache_delitem(self, key)
+        self._notify_eviction(key, value, reason)
 
 
 class CacheInfo(collections.namedtuple("CacheInfo", "hits misses maxsize currsize")):

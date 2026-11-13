@@ -131,7 +131,7 @@ inserted into the cache.
    an alternative function that returns an arbitrary element from a
    non-empty sequence.
 
-.. autoclass:: TTLCache(maxsize, ttl, timer=time.monotonic, getsizeof=None)
+.. autoclass:: TTLCache(maxsize, ttl, timer=time.monotonic, getsizeof=None, on_evict=None)
    :members: popitem, timer, ttl
 
    This class associates a time-to-live value with each item.  Items
@@ -172,7 +172,11 @@ inserted into the cache.
 
       :returns: An iterable of expired `(key, value)` pairs.
 
-.. autoclass:: TLRUCache(maxsize, ttu, timer=time.monotonic, getsizeof=None)
+   .. versionchanged:: 8.0
+      Items may also be reported individually to an `on_evict`
+      callback, see :ref:`removal-notifications`.
+
+.. autoclass:: TLRUCache(maxsize, ttu, timer=time.monotonic, getsizeof=None, on_evict=None)
    :members: popitem, timer, ttu
 
    Similar to :class:`TTLCache`, this class also associates an
@@ -298,6 +302,75 @@ Note, though, that such a class does not really behave like a *cache*
 any more, and will lead to surprising results when used with any of
 the memoizing decorators described below.  However, it may be useful
 in its own right.
+
+
+Removal notifications
+=====================
+
+.. _removal-notifications:
+
+:class:`TTLCache` and :class:`TLRUCache` accept an optional `on_evict`
+callable.  If set, it is called with the `key`, the `value` and a
+:class:`RemovalReason` for every item that is removed from the cache::
+
+   on_evict(key, value, reason)
+
+:class:`RemovalReason` is an :class:`enum.Enum` with the members
+
+- ``RemovalReason.EXPIRED`` for items whose time-to-live or
+  time-to-use has elapsed;
+
+- ``RemovalReason.EVICTED`` for items discarded by :meth:`popitem`
+  to make room for a new item;
+
+- ``RemovalReason.DELETED`` for items removed explicitly via
+  :meth:`__delitem__` or :meth:`pop`;
+
+- ``RemovalReason.CLEARED`` for items removed by :meth:`clear`.
+
+.. autoclass:: RemovalReason
+   :members:
+
+Every removed item is reported exactly once.  An insertion that fails
+with :exc:`ValueError` because the new value is too large does not
+remove any item and therefore never triggers the callback.  An item
+whose time-to-live has elapsed but that has not yet been removed
+lazily is reported as ``EXPIRED`` when it finally leaves the cache,
+not as ``EVICTED``, even if this happens while another item is
+inserted.
+
+The callback is invoked *after* the cache's internal state has been
+updated for the removal.  If it raises an exception, that exception
+propagates to the caller, but the removal itself has already been
+committed and is not undone or reported again; for a failed
+insertion, the rejected value is never stored.  The cache remains
+usable afterwards.  For :meth:`clear`, all items are removed first
+and reported afterwards in their previous order, so a raising
+callback still leaves an empty cache.
+
+State is inspected without reading any values through
+:meth:`__getitem__`, so reporting a removal never counts as a use and
+never changes the cache's replacement order.
+
+.. testcode::
+
+   from collections import Counter
+
+   from cachetools import RemovalReason, TTLCache
+
+   counts = Counter()
+
+   def on_evict(key, value, reason):
+       counts[reason] += 1
+
+   cache = TTLCache(maxsize=2, ttl=60, on_evict=on_evict)
+
+If `on_evict` is :const:`None` (the default), no callback is invoked
+and behavior is unchanged.
+
+.. versionadded:: 8.0
+
+   The `on_evict` parameter and :class:`RemovalReason`.
 
 
 Memoizing decorators

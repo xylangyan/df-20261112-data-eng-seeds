@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from cachetools import TTLCache
+from cachetools import RemovalReason, TTLCache
 
 from . import CacheTestMixin
 
@@ -273,6 +273,152 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
         cache.timer.tick()  # past TTL
         self.assertNotIn(42, cache)
 
+    def test_ttl_eviction_notification(self):
+        # an expired item, a live item and a new value compete for capacity
+        record = []
+        cache = TTLCache[int, str, int](
+            maxsize=2,
+            ttl=2,
+            timer=Timer(),
+            getsizeof=lambda value: 2 if value == "incoming" else 1,
+            on_evict=lambda key, value, reason: record.append((key, value, reason)),
+        )
+        cache[1] = "expired"  # expires at t=2
+        cache.timer.tick()
+        cache[2] = "active"  # expires at t=3
+        cache.timer.tick()  # t=2: key 1 is stale but still resident
+        self.assertEqual([], record)
+
+        cache[3] = "incoming"  # size 2: stale key leaves, live key must go
+        self.assertEqual(
+            [
+                (1, "expired", RemovalReason.EXPIRED),
+                (2, "active", RemovalReason.EVICTED),
+            ],
+            record,
+        )
+        self.assertEqual([3], list(cache))
+        self.assertEqual(2, cache.currsize)
+
+    def test_ttl_eviction_reasons(self):
+        record = []
+        cache = TTLCache[int, int, int](
+            maxsize=2,
+            ttl=2,
+            timer=Timer(),
+            on_evict=lambda key, value, reason: record.append((key, value, reason)),
+        )
+
+        cache[1] = 1
+        del cache[1]
+        self.assertEqual([(1, 1, RemovalReason.DELETED)], record)
+
+        record.clear()
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        self.assertEqual([(1, 1, RemovalReason.EVICTED)], record)
+        self.assertEqual({2, 3}, set(cache))
+
+        cache.timer.tick()
+        cache.timer.tick()
+        record.clear()
+        cache[4] = 4  # lazily expires keys 2 and 3 before inserting
+        self.assertEqual(
+            [
+                (2, 2, RemovalReason.EXPIRED),
+                (3, 3, RemovalReason.EXPIRED),
+            ],
+            record,
+        )
+        self.assertEqual([4], list(cache))
+
+    def test_ttl_clear_notification(self):
+        record = []
+        cache = TTLCache[int, int, int](
+            maxsize=4,
+            ttl=10,
+            timer=Timer(),
+            on_evict=lambda key, value, reason: record.append((key, value, reason)),
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        order_before = list(cache)
+        cache.clear()
+        self.assertEqual(
+            [
+                (1, 1, RemovalReason.CLEARED),
+                (2, 2, RemovalReason.CLEARED),
+                (3, 3, RemovalReason.CLEARED),
+            ],
+            record,
+        )
+        self.assertEqual(order_before, [key for key, _, _ in record])
+        self.assertEqual(0, len(cache))
+
+        # an empty clear sends no notifications
+        record.clear()
+        cache.clear()
+        self.assertEqual([], record)
+
+    def test_ttl_eviction_failed_insert(self):
+        record = []
+        cache = TTLCache[int, str, int](
+            maxsize=2,
+            ttl=10,
+            timer=Timer(),
+            getsizeof=len,
+            on_evict=lambda key, value, reason: record.append((key, value, reason)),
+        )
+        cache[1] = "a"
+        cache[2] = "b"
+        with self.assertRaises(ValueError):
+            cache[3] = "too large"
+        # the rejected value never counts as a successful removal
+        self.assertEqual([], record)
+        self.assertEqual({1, 2}, set(cache))
+
+    def test_ttl_eviction_callback_exception(self):
+        def callback(key, value, reason):
+            raise RuntimeError("callback failed")
+
+        # the state change is committed before the callback is invoked
+        cache = TTLCache[int, int, int](
+            maxsize=1, ttl=10, timer=Timer(), on_evict=callback
+        )
+        cache[1] = 1
+        with self.assertRaises(RuntimeError):
+            cache[2] = 2
+        self.assertEqual([], list(cache))
+        cache[3] = 3  # the cache remains usable afterwards
+        self.assertEqual([3], list(cache))
+
+        cache = TTLCache[int, int, int](
+            maxsize=4, ttl=1, timer=Timer(), on_evict=callback
+        )
+        cache[1] = 1
+        cache.timer.tick()
+        cache.timer.tick()
+        with self.assertRaises(RuntimeError):
+            cache[2] = 2
+        self.assertEqual([], list(cache))
+
+        cache = TTLCache[int, int, int](
+            maxsize=4, ttl=10, timer=Timer(), on_evict=callback
+        )
+        cache[1] = 1
+        with self.assertRaises(RuntimeError):
+            cache.clear()
+        self.assertEqual(0, len(cache))
+
+    def test_ttl_eviction_default(self):
+        # without on_evict, behavior is unchanged
+        cache = TTLTestCache(maxsize=1)
+        cache[1] = 1
+        cache[2] = 2
+        self.assertEqual([2], list(cache))
+
     def test_ttl_default_timer_stubs(self):
         # type stubs must infer key and value types with the default timer
         cache: TTLCache[str, int] = TTLCache(maxsize=2, ttl=math.inf)
@@ -287,3 +433,22 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
         sized["abc"] = "abc"
         self.assertEqual("abc", sized["abc"])
         self.assertEqual(3, sized.currsize)
+
+    def test_ttl_on_evict_stubs(self):
+        # type stubs must accept the typed on_evict callback
+        def on_evict(key: int, value: int, reason: RemovalReason) -> None:
+            self.assertIsInstance(reason, RemovalReason)
+
+        cache: TTLCache[int, int] = TTLCache(maxsize=2, ttl=60, on_evict=on_evict)
+        cache[1] = 1
+
+        from datetime import datetime, timedelta
+
+        timed: TTLCache[int, int, datetime] = TTLCache(
+            maxsize=2,
+            ttl=timedelta(hours=1),
+            timer=datetime.now,
+            on_evict=on_evict,
+        )
+        timed[1] = 1
+        self.assertEqual(1, timed[1])
