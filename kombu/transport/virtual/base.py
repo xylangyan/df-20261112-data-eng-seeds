@@ -243,6 +243,27 @@ class QoS:
         """Acknowledge message and remove from transactional state."""
         self._quick_ack(delivery_tag)
 
+    def ack_multiple(self, delivery_tag):
+        """Acknowledge ``delivery_tag`` and every earlier delivered message.
+
+        Tags are walked in delivery order up to and including ``delivery_tag``,
+        matching AMQP ``basic_ack(multiple=True)`` semantics. Tags that were
+        already acknowledged (late or duplicate acks) are skipped. If the
+        referenced tag is no longer tracked, the call degrades to a plain ack
+        instead of raising, mirroring :meth:`ack`.
+        """
+        if delivery_tag not in self._delivered or delivery_tag in self._dirty:
+            # The tag was already acked or is no longer tracked: behave like
+            # a plain (idempotent) ack instead of touching other deliveries.
+            self._quick_ack(delivery_tag)
+            return
+        for tag in self._delivered:
+            if tag in self._dirty:
+                continue
+            self._quick_ack(tag)
+            if tag == delivery_tag:
+                break
+
     def reject(self, delivery_tag, requeue=False):
         """Remove from transactional state and requeue message."""
         if requeue:
@@ -250,16 +271,28 @@ class QoS:
         self._quick_ack(delivery_tag)
 
     def restore_unacked(self):
-        """Restore all unacknowledged messages."""
+        """Restore all unacknowledged messages.
+
+        Messages are restored in delivery order (FIFO), so that another
+        consumer sees them in the same order they were originally delivered,
+        with the already acknowledged messages removed.
+        """
         self._flush()
         delivered = self._delivered
         errors = []
         restore = self.channel._restore
-        pop_message = delivered.popitem
 
         while delivered:
             try:
-                key, message = pop_message()
+                # Pop the oldest delivery, preserving the order in which the
+                # messages were originally received. A plain ``dict`` (e.g.
+                # used by tests or subclasses) does not accept ``last``, so
+                # its insertion-order head is removed explicitly instead.
+                if isinstance(delivered, OrderedDict):
+                    key, message = delivered.popitem(last=False)
+                else:
+                    key = next(iter(delivered))
+                    message = delivered.pop(key)
             except KeyError:  # pragma: no cover
                 break
 
@@ -676,8 +709,16 @@ class Channel(AbstractChannel, base.StdChannel):
             pass
 
     def basic_ack(self, delivery_tag, multiple=False):
-        """Acknowledge message."""
-        self.qos.ack(delivery_tag)
+        """Acknowledge message.
+
+        With ``multiple=True`` the message and every message delivered before
+        it on this channel are acknowledged as well (AMQP multiple-ack
+        semantics).
+        """
+        if multiple:
+            self.qos.ack_multiple(delivery_tag)
+        else:
+            self.qos.ack(delivery_tag)
 
     def basic_recover(self, requeue=False):
         """Recover unacked messages."""
@@ -748,6 +789,8 @@ class Channel(AbstractChannel, base.StdChannel):
         delivery_info = message.delivery_info
         message = message.serializable()
         message['redelivered'] = True
+        message['properties']['delivery_info']['redelivered'] = True
+        message['headers']['redelivered'] = True
         for queue in self._lookup(
             delivery_info['exchange'],
                 delivery_info['routing_key']):

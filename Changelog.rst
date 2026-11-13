@@ -5,6 +5,24 @@
 ================
 
 
+.. _version-unreleased:
+
+Unreleased
+==========
+
+What's Changed
+~~~~~~~~~~~~~~
+- fix(virtual): restore unacknowledged messages in their original delivery
+  order (FIFO) instead of most-recent-first, and flag redeliveries in both
+  message headers and ``delivery_info``.
+- fix(virtual): implement ``basic_ack(delivery_tag, multiple=True)``,
+  acknowledging the message and every earlier unacked delivery on the
+  channel; late or duplicate acks for unknown tags stay idempotent.
+- fix(memory): requeue a closed channel's unacknowledged messages instead of
+  dropping them, and stop resetting the shared queue registry on channel
+  close so sibling channels are not disturbed; the registry is cleared when
+  the connection closes.
+
 .. _version-5.7.0:
 
 5.7.0

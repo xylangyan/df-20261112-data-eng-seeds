@@ -35,7 +35,7 @@ class Channel(virtual.Channel):
 
     events = defaultdict(set)
     queues = {}
-    do_restore = False
+    do_restore = True
     supports_fanout = True
 
     def _has_queue(self, queue, **kwargs):
@@ -76,10 +76,12 @@ class Channel(virtual.Channel):
         return size
 
     def close(self):
+        # The queue registry is shared between every channel on the transport
+        # (it is the in-memory broker state), so it must not be reset here:
+        # doing so would discard messages visible to sibling channels. The
+        # base implementation requeues this channel's unacknowledged messages
+        # back onto those shared queues instead.
         super().close()
-        for queue in self.queues.values():
-            queue.empty()
-        self.queues = {}
 
     def after_reply_message_received(self, queue):
         pass
@@ -101,6 +103,13 @@ class Transport(virtual.Transport):
     def __init__(self, client, **kwargs):
         super().__init__(client, **kwargs)
         self.state = self.global_state
+
+    def close_connection(self, connection):
+        # A closing connection drops the shared in-memory queue registry after
+        # every channel has had a chance to requeue its unacknowledged
+        # messages, restoring the clean state a fresh connection expects.
+        super().close_connection(connection)
+        self.Channel.queues.clear()
 
     def driver_version(self):
         return 'N/A'

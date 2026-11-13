@@ -90,7 +90,9 @@ class test_QoS:
         assert self.q._delivered
         assert not self.q._delivered.restored
         self.q.restore_unacked_once(stderr=stderr)
-        assert _restored == [11, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+        # 11 was requeued first by reject(requeue=True); the remaining
+        # unacked messages are restored in original delivery order (FIFO).
+        assert _restored == [11, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         assert self.q._delivered.restored
         assert not self.q._delivered
 
@@ -107,6 +109,70 @@ class test_QoS:
     def test_get(self):
         self.q._delivered['foo'] = 1
         assert self.q.get('foo') == 1
+
+    def test_restore_unacked_preserves_delivery_order(self):
+        restored = []
+
+        class RestoreChannel(virtual.Channel):
+            do_restore = True
+
+            def _restore(self, message):
+                restored.append(message)
+
+        self.q.channel = RestoreChannel(self.q.channel.connection)
+        tags = []
+        for seq in range(1, 5):
+            tag = uuid()
+            self.q.append(seq, tag)
+            tags.append(tag)
+
+        # Acknowledge only the middle message: it must not be redelivered.
+        self.q.ack(tags[1])
+
+        errors = self.q.restore_unacked()
+
+        assert not errors
+        assert restored == [1, 3, 4]
+        assert not self.q._delivered
+
+    def test_ack_multiple_marks_up_to_and_including_tag(self):
+        tags = []
+        for seq in range(1, 5):
+            tag = uuid()
+            self.q.append(seq, tag)
+            tags.append(tag)
+
+        self.q.ack_multiple(tags[2])
+
+        assert self.q._dirty == set(tags[:3])
+        assert tags[3] not in self.q._dirty
+
+        self.q._flush()
+        assert list(self.q._delivered) == [tags[3]]
+
+    def test_ack_multiple_skips_already_acked_tags(self):
+        tags = []
+        for seq in range(1, 4):
+            tag = uuid()
+            self.q.append(seq, tag)
+            tags.append(tag)
+
+        self.q.ack(tags[0])  # late ack flushed in via append's _flush
+        self.q._flush()
+        self.q.ack_multiple(tags[2])
+
+        assert self.q._dirty == set(tags[1:3])
+        self.q._flush()
+        assert not self.q._delivered
+
+    def test_ack_multiple_unknown_tag_does_not_raise(self):
+        tag = uuid()
+        self.q.append(1, uuid())
+        # A late/duplicate ack for an untracked tag degrades to a plain ack.
+        self.q.ack_multiple(tag)
+        assert tag in self.q._dirty
+        self.q._flush()
+        assert len(self.q._delivered) == 1
 
     @pytest.mark.parametrize('compression', [None, 'gzip'])
     def test_restore_unacked_once_dumps_message_body(self, tmp_path, monkeypatch, compression):
@@ -411,10 +477,16 @@ class test_Channel:
             c.drain_events()
         c.basic_cancel(consumer_tag)
 
+        assert not r2.delivery_info.get('redelivered')
+        assert not r2.headers.get('redelivered')
+
         c._restore(r2)
         r3 = c.message_to_python(c.basic_get(n))
         assert r3
         assert r3.body == b'nthex quick brown fox...'
+        assert r3._raw['redelivered'] is True
+        assert r3.delivery_info['redelivered'] is True
+        assert r3.headers['redelivered'] is True
         assert c.basic_get(n) is None
 
     def test_basic_ack(self):
@@ -428,6 +500,24 @@ class test_Channel:
         self.channel._qos = MockQoS(self.channel)
         self.channel.basic_ack('foo')
         assert self.channel._qos.was_acked
+
+    def test_basic_ack_multiple(self):
+        q = self.channel.qos
+        tags = []
+        for seq in range(4):
+            tag = uuid()
+            q.append(seq, tag)
+            tags.append(tag)
+
+        self.channel.basic_ack(tags[2], multiple=True)
+        q._flush()
+
+        assert list(q._delivered) == [tags[3]]
+
+    def test_basic_ack_multiple_unknown_tag(self):
+        # A late ack for a tag the channel no longer tracks must not raise.
+        self.channel.basic_ack(uuid(), multiple=True)
+        assert not self.channel.qos._delivered
 
     def test_basic_recover__requeue(self):
 
