@@ -13,7 +13,7 @@ from kombu import Connection, Consumer, Exchange, Producer, Queue
 from kombu.exceptions import MessageStateError, OperationalError
 from kombu.utils import json
 from kombu.utils.functional import ChannelPromise
-from t.mocks import Transport
+from t.mocks import RecordingTransport, Transport
 
 
 class BaseErrorsTransport(Transport):
@@ -723,6 +723,109 @@ class test_Producer:
         p = Producer(chan, on_return=on_return)
         assert on_return in chan.events['basic_return']
         assert p.on_return
+
+
+class test_DeclarationCacheScope:
+    """Declaration cache is scoped to a single channel.
+
+    A fresh channel (e.g. after a reconnect) must re-declare its entities
+    in dependency order before publishing, while repeated publishes on one
+    channel skip the redundant declarations.
+    """
+
+    def setup_method(self):
+        self.exchange = Exchange('events', 'direct')
+        self.queue = Queue('events.q', self.exchange, routing_key='events.q')
+        self.connection = Connection(transport=RecordingTransport)
+        self.connection.connect()
+        self.producer = Producer(
+            self.connection, exchange=self.exchange, routing_key='events.q')
+
+    def _declare_ops(self, channel):
+        return [op for op in channel.ops()
+                if op in ('exchange_declare', 'queue_declare', 'queue_bind')]
+
+    def test_redeclare_after_disconnect_and_channel_switch(self):
+        # Generation 1: connection drops during the first declaration,
+        # then the retry machinery reconnects and finishes on a channel.
+        gen1 = self.connection.channel()
+        self.producer.revive(gen1)
+        gen1.fail_next('exchange_declare',
+                       OperationalError('connection lost'))
+        self.producer.publish({'n': 1}, declare=[self.queue],
+                              retry=True, retry_policy={'max_retries': 2})
+
+        # Generation 2: reconnect handed us a different, fresh channel.
+        gen2 = self.connection.channel()
+        self.producer.revive(gen2)
+        self.producer.publish({'n': 2}, declare=[self.queue],
+                              retry=True, retry_policy={'max_retries': 2})
+
+        # The new channel re-declares in exchange -> queue -> bind order
+        # before publishing; it does not trust the old channel's cache.
+        assert self._declare_ops(gen2)[:3] == [
+            'exchange_declare', 'queue_declare', 'queue_bind']
+        assert gen2.count('basic_publish') == 1
+        assert gen1.count('basic_publish') == 1
+
+    def test_same_channel_declares_once(self):
+        channel = self.connection.channel()
+        self.producer.revive(channel)
+        self.producer.publish({'n': 1}, declare=[self.queue])
+        declares_after_first = len(self._declare_ops(channel))
+
+        self.producer.publish({'n': 2}, declare=[self.queue])
+
+        # No extra declaration round-trips on the same channel.
+        assert len(self._declare_ops(channel)) == declares_after_first
+        assert channel.count('basic_publish') == 2
+
+    def test_publish_never_precedes_declaration(self):
+        channel = self.connection.channel()
+        self.producer.revive(channel)
+        self.producer.publish({'n': 1}, declare=[self.queue])
+
+        ops = channel.ops()
+        last_declare = max(
+            i for i, op in enumerate(ops)
+            if op in ('exchange_declare', 'queue_declare', 'queue_bind'))
+        assert ops.index('basic_publish') > last_declare
+
+    def test_declaration_failure_without_retry_raises_and_skips_publish(self):
+        channel = self.connection.channel()
+        self.producer.revive(channel)
+        channel.fail_next('exchange_declare',
+                          OperationalError('connection lost'))
+
+        with pytest.raises(OperationalError, match='connection lost'):
+            self.producer.publish({'n': 1}, declare=[self.queue])
+
+        assert channel.count('basic_publish') == 0
+
+    def test_declaration_failure_reports_original_error_on_retry(self):
+        # Every channel (including the ones created while reconnecting)
+        # fails its first declaration.
+        self.connection.transport.fail_new_channels(
+            'exchange_declare', OperationalError('connection lost'))
+        channel = self.connection.channel()
+        self.producer.revive(channel)
+        errback = Mock()
+
+        try:
+            self.producer.publish(
+                {'n': 1}, declare=[self.queue], retry=True,
+                retry_policy={'max_retries': 1, 'errback': errback})
+        except OperationalError:
+            pass
+
+        # The original connection error stays visible to the caller, and
+        # the channel whose declaration failed never published.
+        assert errback.call_count >= 1
+        assert str(errback.call_args[0][0]) == 'connection lost'
+        failed = [ch for ch in self.connection.transport.channels
+                  if ch.count('exchange_declare') == 0]
+        assert failed
+        assert all(ch.count('basic_publish') == 0 for ch in failed)
 
 
 class test_Consumer:

@@ -23,6 +23,8 @@ What's Changed
 - fix(sqlalchemy): raise when a published message cannot be stored (#2793).
 - Update tzdata version constraint for Windows platform (#2808).
 - fix(common): publish(retry=True) fails after a reconnect with a named exchange (#2797).
+- fix(common): scope the declaration cache to a single channel so entities are
+  re-declared after a channel switch.
 - Update amqp version to 5.4.2 (#2810).
 - fix(sqlalchemy): raise when a purge cannot be committed (#2811).
 

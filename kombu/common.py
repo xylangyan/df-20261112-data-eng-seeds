@@ -103,8 +103,34 @@ class Broadcast(Queue):
         )
 
 
+def _declared_entities(channel):
+    """Return the set of entity hashes declared on this channel.
+
+    The declaration cache is scoped to a single channel: declarations do
+    not survive the channel being closed or replaced, so a fresh channel
+    (e.g. after a reconnect) must re-declare its entities.  Declaring the
+    same entity twice on one channel is still a no-op.
+    """
+    declared = getattr(channel, '_declared_entities', None)
+    if not isinstance(declared, set):
+        declared = set()
+        try:
+            channel._declared_entities = declared
+        except (AttributeError, TypeError):
+            # Some test doubles (e.g. unittest.mock.Mock) create arbitrary
+            # attributes and cannot hold a real set.  Fall back to the
+            # connection-scoped cache they explicitly provide, or a local
+            # cache that simply preserves the one-shot call semantics.
+            client = getattr(getattr(channel, 'connection', None),
+                             'client', None)
+            if client is not None and isinstance(
+                    getattr(client, 'declared_entities', None), set):
+                declared = client.declared_entities
+    return declared
+
+
 def declaration_cached(entity, channel):
-    return entity in channel.connection.client.declared_entities
+    return entity in _declared_entities(channel)
 
 
 def maybe_declare(entity, channel=None, retry=False, **retry_policy):
@@ -146,7 +172,7 @@ def _maybe_declare(entity, channel):
 
     declared = ident = None
     if channel.connection and entity.can_cache_declaration:
-        declared = channel.connection.client.declared_entities
+        declared = _declared_entities(channel)
         ident = hash(entity)
         if ident in declared:
             return False

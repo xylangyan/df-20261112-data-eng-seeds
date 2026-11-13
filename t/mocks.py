@@ -5,6 +5,7 @@ from itertools import count
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
+from kombu.exceptions import OperationalError
 from kombu.transport import base
 from kombu.utils import json
 
@@ -203,6 +204,116 @@ class Transport(base.Transport):
 
     def close_connection(self, connection):
         connection.connected = False
+
+
+class RecordingChannel(base.StdChannel):
+    """Channel double recording every operation, with injectable failures.
+
+    Each instance keeps its own ordered ``calls`` log and its own
+    declaration cache (``_declared_entities``), mirroring how a real
+    transport channel scopes declarations to a single channel.  Use
+    :meth:`fail_next` to make the next matching operation raise, e.g. to
+    simulate a connection drop mid-declaration.
+    """
+    _ids = count(1)
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.channel_id = next(self._ids)
+        self.calls = []
+        self.events = {'basic_return': set()}
+        self._declared_entities = set()
+        self._failures = []
+
+    def fail_next(self, op, error):
+        """Raise ``error`` the next time operation ``op`` is invoked."""
+        self._failures.append((op, error))
+
+    def _record(self, op, *args):
+        self.calls.append((op, args))
+        for index, (failed_op, error) in enumerate(self._failures):
+            if failed_op == op:
+                del self._failures[index]
+                raise error
+
+    def ops(self):
+        return [op for op, _ in self.calls]
+
+    def count(self, op):
+        return self.ops().count(op)
+
+    def exchange_declare(self, exchange=None, **kwargs):
+        self._record('exchange_declare', exchange)
+
+    def queue_declare(self, queue=None, **kwargs):
+        self._record('queue_declare', queue)
+        return queue, 0, 0
+
+    def queue_bind(self, queue=None, exchange=None, routing_key='',
+                   **kwargs):
+        self._record('queue_bind', queue, exchange, routing_key)
+
+    def prepare_message(self, body, priority=0, content_type=None,
+                        content_encoding=None, headers=None, properties=None):
+        return {'body': body, 'properties': properties or {}}
+
+    def basic_publish(self, message, exchange='', routing_key='', **kwargs):
+        self._record('basic_publish', exchange, routing_key)
+
+    def close(self):
+        self._record('close')
+
+
+class RecordingBrokerConnection:
+    """In-process broker connection whose channels record their calls."""
+    connected = True
+
+    def __init__(self, client):
+        self.client = client
+
+    def channel(self):
+        return self.client.transport.make_channel(self)
+
+
+class RecordingTransport(base.Transport):
+    """Transport producing :class:`RecordingChannel` instances.
+
+    Connection drops are surfaced as recoverable connection errors so the
+    :meth:`kombu.Connection.ensure` retry machinery reconnects and revives
+    the producer onto a fresh channel.
+    """
+    recoverable_connection_errors = (OperationalError,)
+    recoverable_channel_errors = ()
+    connection_errors = (OperationalError,)
+    channel_errors = ()
+
+    def __init__(self, *args, **kwargs):
+        self.channel_failures = []
+        self.channels = []
+        super().__init__(*args, **kwargs)
+
+    def fail_new_channels(self, op, error):
+        """Make every channel created from now on fail operation ``op``."""
+        self.channel_failures.append((op, error))
+
+    def make_channel(self, connection):
+        channel = RecordingChannel(connection)
+        for op, error in self.channel_failures:
+            channel.fail_next(op, error)
+        self.channels.append(channel)
+        return channel
+
+    def establish_connection(self):
+        return RecordingBrokerConnection(self.client)
+
+    def create_channel(self, connection):
+        return self.make_channel(connection)
+
+    def close_connection(self, connection):
+        connection.connected = False
+
+    def drain_events(self, connection, **kwargs):
+        return 'event'
 
 
 class TimeoutingTransport(Transport):

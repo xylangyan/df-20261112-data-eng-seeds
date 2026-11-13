@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 from amqp import RecoverableConnectionError
 
-from kombu import Exchange, common
+from kombu import Connection, Exchange, common
 from kombu.common import (PREFETCH_COUNT_MAX, Broadcast, QoS, collect_replies,
                           declaration_cached, generate_oid, ignore_errors,
                           maybe_declare, send_reply)
@@ -146,13 +146,21 @@ class test_declaration_cached:
 
     def test_when_cached(self):
         chan = Mock()
-        chan.connection.client.declared_entities = ['foo']
+        chan._declared_entities = {'foo'}
         assert declaration_cached('foo', chan)
 
     def test_when_not_cached(self):
         chan = Mock()
-        chan.connection.client.declared_entities = ['bar']
+        chan._declared_entities = {'bar'}
         assert not declaration_cached('foo', chan)
+
+    def test_cache_is_scoped_to_one_channel(self):
+        first = Mock()
+        first._declared_entities = {'foo'}
+        second = Mock()
+        second._declared_entities = set()
+        assert declaration_cached('foo', first)
+        assert not declaration_cached('foo', second)
 
 
 class test_Broadcast:
@@ -223,7 +231,7 @@ class test_maybe_declare:
 
         # Then: It called declare on the entity queue and added it to list
         assert entity.declare.call_count == 1
-        assert hash(entity) in channel.connection.client.declared_entities
+        assert hash(entity) in channel._declared_entities
 
         # When: Calling maybe_declare default (again)
         maybe_declare(entity, channel)
@@ -313,6 +321,22 @@ class test_maybe_declare:
         channel.exchange_declare.assert_called_once()
         old_channel.exchange_declare.assert_not_called()
         assert exchange.channel is channel
+
+    def test_declaration_cache_is_scoped_to_the_channel(self):
+        conn = Connection('memory://')
+        exchange = Exchange('scope', 'direct')
+        first = conn.channel()
+        second = conn.channel()
+
+        # Declared once on the first channel, then cached there.
+        assert maybe_declare(exchange, first) is True
+        assert maybe_declare(exchange, first) is False
+
+        # A different channel has its own (empty) cache, so the entity is
+        # declared again instead of inheriting the first channel's state.
+        assert maybe_declare(exchange, second) is True
+        assert maybe_declare(exchange, second) is False
+        assert first._declared_entities is not second._declared_entities
 
 
 class test_replies:

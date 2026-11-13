@@ -182,8 +182,10 @@ class Connection:
     _logger = False
     uri_prefix = None
 
-    #: The cache of declared entities is per connection,
-    #: in case the server loses data.
+    #: Connection-scoped declaration cache.  Active caching now lives on the
+    #: channel (see ``kombu.common._declared_entities``) so that a replaced
+    #: channel re-declares its entities; this set is retained as a fallback
+    #: for channels that cannot hold their own cache and for compatibility.
     declared_entities = None
 
     #: Iterator returning the next broker URL to try in the event
