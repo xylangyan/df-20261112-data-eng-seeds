@@ -59,7 +59,22 @@ values of a :class:`dict`.  It is the user's responsibility to take
 care that cached values are not accidentally modified.  This is
 especially important when using a custom `getsizeof` function, since
 the size of an item's value will only be computed when the item is
-inserted into the cache.
+inserted into the cache.  If a cached value does change its size in
+place, call :meth:`~Cache.remeasure` to recompute its size and update
+the cache's bookkeeping, so that the capacity released or consumed by
+the change becomes available to other items.
+
+:meth:`~Cache.remeasure` raises :exc:`KeyError` if `key` is not in the
+cache, including a key that has already expired in a timed cache, and
+leaves the cache unchanged in that case.  If `getsizeof` raises, the
+exception propagates and the cache is likewise left unchanged.  A
+recomputed size that is negative raises :exc:`ValueError`, as does a
+size exceeding :attr:`~Cache.maxsize`; in both cases the item is kept
+with its previous size.  Otherwise, the stored size and
+:attr:`~Cache.currsize` are adjusted, and if the item grew, other
+items are evicted following the cache's own policy, honouring the
+item's existing position in the eviction order.  The item's position
+is not changed.
 
 .. note::
 
@@ -69,7 +84,7 @@ inserted into the cache.
    suitable `lock` object.
 
 .. autoclass:: Cache(maxsize, getsizeof=None)
-   :members: currsize, getsizeof, maxsize
+   :members: currsize, getsizeof, maxsize, remeasure
 
    This class discards arbitrary items using :meth:`popitem` to make
    space when necessary.  Derived classes may override :meth:`popitem`

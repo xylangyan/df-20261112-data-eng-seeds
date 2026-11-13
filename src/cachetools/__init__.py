@@ -101,6 +101,50 @@ class Cache(collections.abc.MutableMapping):
             del self.__data[key]
             self.__currsize -= itemsize
 
+    def remeasure(self, key):
+        """Recompute the size of the item stored under `key`.
+
+        Call this after mutating a cached value in place so that the
+        cache's bookkeeping catches up.  The value is not replaced, so
+        subclass eviction order is left untouched.  If the recomputed
+        size would exceed `maxsize`, other items are evicted to make
+        room.  A missing or expired `key` raises :exc:`KeyError`, and a
+        size that is negative or does not fit raises :exc:`ValueError`,
+        leaving the item and `currsize` unchanged in each case.
+
+        """
+        size = self.__size
+        if size is None:
+            # With the default getsizeof, every item keeps its size of 1,
+            # so there is nothing to re-measure.
+            if key not in self.__data:
+                raise KeyError(key)
+            return
+        data = self.__data
+        try:
+            oldsize = size[key]
+        except KeyError:
+            raise KeyError(key) from None
+        value = data[key]
+        itemsize = self.getsizeof(value)  # may raise; state is untouched
+        if itemsize < 0:
+            raise ValueError("value size must be non-negative")
+        if itemsize > self.__maxsize:
+            # like __setitem__, refuse before touching the cache so the
+            # item and currsize stay exactly as they were
+            raise ValueError("value too large")
+        diffsize = itemsize - oldsize
+        while self.__currsize + diffsize > self.__maxsize:
+            self.popitem()
+            if key not in data:
+                # the re-measured item itself was evicted; unlike
+                # __setitem__ the value is not re-inserted, and the
+                # eviction already subtracted its old size, so the
+                # remaining bookkeeping is already consistent
+                return
+        size[key] = itemsize
+        self.__currsize += diffsize
+
     def __contains__(self, key):
         return key in self.__data
 
@@ -449,6 +493,11 @@ class _TimedCache(Cache):
     def setdefault(self, *args, **kwargs):
         with self.__timer:
             return Cache.setdefault(self, *args, **kwargs)
+
+    def remeasure(self, key):
+        with self.__timer as time:
+            self.expire(time)
+            return Cache.remeasure(self, key)
 
     def clear(self):
         # Subclasses must override to also reset their own time-tracking

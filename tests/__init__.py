@@ -398,6 +398,130 @@ class CacheTestMixin(SimplifiedTestCaseProtocol):
         self.assertEqual(0, len(cache))
         self.assertEqual(0, cache.currsize)
 
+    def _remeasure_cache(self, maxsize=10):
+        values = {key: [key] for key in (1, 2, 3)}
+        cache = self.Cache(maxsize=maxsize, getsizeof=len)
+        for key in (1, 2, 3):
+            cache[key] = values[key]
+        self.assertEqual(3, len(cache))
+        self.assertEqual(3, cache.currsize)
+        return cache, values
+
+    def test_remeasure_grow(self):
+        cache, values = self._remeasure_cache()
+
+        values[2].extend([0] * 3)  # size 1 -> 4
+        cache.remeasure(2)
+
+        self.assertEqual(3, len(cache))
+        self.assertEqual(6, cache.currsize)
+        self.assertEqual([1, 2, 3], list(cache))
+
+    def test_remeasure_shrink_releases_capacity(self):
+        cache, values = self._remeasure_cache()
+
+        values[3].append(0)
+        cache[3] = values[3]
+        self.assertEqual(4, cache.currsize)
+        values[3].clear()  # size 2 -> 0 in place
+        cache.remeasure(3)
+
+        self.assertEqual(2, cache.currsize)
+        # the released capacity is available again
+        cache[9] = [0] * 8
+        self.assertIn(9, cache)
+        self.assertEqual(10, cache.currsize)
+
+    def test_remeasure_grow_evicts_other_items(self):
+        cache, values = self._remeasure_cache()
+
+        values[2].extend([0] * 8)  # size 1 -> 9
+        cache.remeasure(2)
+
+        # whichever item the policy chooses to evict, the bookkeeping
+        # must stay in sync and within capacity
+        self.assertLessEqual(cache.currsize, cache.maxsize)
+        self.assertEqual(cache.currsize, sum(len(cache[key]) for key in list(cache)))
+
+    def test_remeasure_preserves_eviction_order(self):
+        cache, values = self._remeasure_cache()
+
+        before = list(cache)
+        values[2].extend([0] * 3)
+        cache.remeasure(2)
+
+        # remeasuring does not itself count as an access: order is untouched
+        self.assertEqual(before, list(cache))
+
+    def test_remeasure_missing_key(self):
+        cache, _ = self._remeasure_cache()
+        snapshot = (list(cache), cache.currsize)
+
+        with self.assertRaises(KeyError):
+            cache.remeasure(99)
+
+        self.assertEqual(snapshot, (list(cache), cache.currsize))
+
+    def test_remeasure_too_large(self):
+        cache, values = self._remeasure_cache()
+        snapshot = (list(cache), cache.currsize)
+
+        values[2].extend([0] * cache.maxsize)  # size 1 -> maxsize + 1
+        new_length = len(values[2])
+        with self.assertRaises(ValueError):
+            cache.remeasure(2)
+
+        # the item is kept but its stored size stays at the old value,
+        # and neither the item set nor currsize changed
+        self.assertEqual(snapshot, (list(cache), cache.currsize))
+        self.assertIn(2, cache)
+        self.assertEqual(new_length, len(cache[2]))
+
+    def test_remeasure_negative_size(self):
+        cache, values = self._remeasure_cache()
+        snapshot = (list(cache), cache.currsize)
+
+        original = cache.getsizeof
+
+        def getsizeof(value):
+            return -1 if value is values[2] else original(value)
+
+        cache.getsizeof = getsizeof
+        with self.assertRaises(ValueError):
+            cache.remeasure(2)
+
+        self.assertEqual(snapshot, (list(cache), cache.currsize))
+
+    def test_remeasure_getsizeof_error(self):
+        cache, values = self._remeasure_cache()
+        snapshot = (list(cache), cache.currsize)
+        original = cache.getsizeof
+
+        def getsizeof(value):
+            if value is values[2]:
+                raise RuntimeError("boom")
+            return original(value)
+
+        cache.getsizeof = getsizeof
+        values[2].extend([0] * 3)
+        with self.assertRaises(RuntimeError):
+            cache.remeasure(2)
+
+        # currsize and the item set stay exactly as they were
+        self.assertEqual(snapshot, (list(cache), cache.currsize))
+        self.assertIn(2, cache)
+
+    def test_remeasure_default_getsizeof(self):
+        cache = self.Cache(maxsize=3)
+        cache[1] = 1
+        cache[2] = 2
+
+        cache.remeasure(2)
+        self.assertEqual(2, cache.currsize)
+
+        with self.assertRaises(KeyError):
+            cache.remeasure(99)
+
     def test_getsizeof_subclass(self):
         class Cache(self.Cache):
             @staticmethod

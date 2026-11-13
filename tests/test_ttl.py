@@ -273,6 +273,117 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
         cache.timer.tick()  # past TTL
         self.assertNotIn(42, cache)
 
+    def test_ttl_remeasure_grow_evicts_lru_items(self):
+        timer = Timer()
+        weights = {1: 1, 2: 2, 3: 3}
+        cache = TTLCache[int, int, int](
+            maxsize=10, ttl=10, timer=timer, getsizeof=weights.get
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        self.assertEqual([1, 2, 3], list(cache))
+        self.assertEqual(6, cache.currsize)
+
+        # the middle item grows in place without advancing the clock
+        weights[2] = 9
+        cache.remeasure(2)
+
+        self.assertEqual(0, timer.time)
+        self.assertEqual([3], list(cache))
+        self.assertEqual(3, cache.currsize)
+        self.assertNotIn(1, cache)
+        self.assertNotIn(2, cache)
+        self.assertEqual(3, cache[3])
+
+    def test_ttl_remeasure_grow_respects_access_order(self):
+        timer = Timer()
+        weights = {1: 1, 2: 2, 3: 3}
+        cache = TTLCache[int, int, int](
+            maxsize=10, ttl=10, timer=timer, getsizeof=weights.get
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        cache[1]  # make item 1 the most recently used
+        self.assertEqual([2, 3, 1], list(cache._TTLCache__links))
+
+        weights[2] = 9
+        cache.remeasure(2)
+
+        # item 2 itself is the LRU head and gets evicted; that alone
+        # frees enough capacity, so the recently used item 1 and item 3
+        # survive with their original weights
+        self.assertEqual([1, 3], list(cache))
+        self.assertEqual([3, 1], list(cache._TTLCache__links))
+        self.assertEqual(4, cache.currsize)
+        self.assertEqual(1, cache[1])
+        self.assertEqual(3, cache[3])
+
+    def test_ttl_remeasure_does_not_change_order(self):
+        timer = Timer()
+        weights = {1: 1, 2: 2, 3: 3}
+        cache = TTLCache[int, int, int](
+            maxsize=10, ttl=10, timer=timer, getsizeof=weights.get
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        cache[1]
+        before = list(cache._TTLCache__links)
+
+        weights[2] = 3
+        cache.remeasure(2)
+
+        self.assertEqual(before, list(cache._TTLCache__links))
+        self.assertEqual(7, cache.currsize)
+
+    def test_ttl_remeasure_expired_key(self):
+        timer = Timer()
+        cache = TTLCache[int, int, int](
+            maxsize=10, ttl=1, timer=timer, getsizeof=lambda value: value
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        timer.tick()  # every item has now expired
+        self.assertEqual(0, len(cache))
+
+        with self.assertRaises(KeyError):
+            cache.remeasure(2)
+
+        # lazy expiry leaves currsize and the item set consistent
+        self.assertEqual(0, cache.currsize)
+        self.assertEqual(set(), set(cache))
+
+    def test_ttl_remeasure_getsizeof_error_keeps_state(self):
+        timer = Timer()
+        weights = {1: 1, 2: 2, 3: 3}
+        fail = {"on": False}
+
+        def getsizeof(key):
+            if fail["on"] and key == 2:
+                raise RuntimeError("boom")
+            return weights[key]
+
+        cache = TTLCache[int, int, int](
+            maxsize=10, ttl=10, timer=timer, getsizeof=getsizeof
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        snapshot_items = list(cache)
+        snapshot_size = cache.currsize
+        fail["on"] = True
+
+        with self.assertRaises(RuntimeError):
+            cache.remeasure(2)
+
+        self.assertEqual(snapshot_items, list(cache))
+        self.assertEqual(snapshot_size, cache.currsize)
+        self.assertEqual({1, 2, 3}, set(cache))
+        self.assertEqual(0, timer.time)
+
     def test_ttl_default_timer_stubs(self):
         # type stubs must infer key and value types with the default timer
         cache: TTLCache[str, int] = TTLCache(maxsize=2, ttl=math.inf)
