@@ -8,6 +8,13 @@ Fixed Bugs
 ~~~~~~~~~~
 
 - Save and recover ``base_url`` in ``BaseUrlSession`` during pickle and unpickle
+- Made ``MultipartEncoderMonitor`` report accurate ``bytes_read`` progress:
+  zero-length reads no longer fire the callback, and the terminal state (EOF
+  or a read error) is announced exactly once so repeated EOF probes cannot
+  signal completion twice
+- Added ``MultipartEncoder.exhausted`` to distinguish "all parts loaded"
+  (``finished``) from "fully consumed by the reader", and exposed the monitor
+  lifecycle via ``MonitorReadState`` and the ``state``/``error`` attributes
 
 1.0.0 -- 2023-05-01
 -------------------

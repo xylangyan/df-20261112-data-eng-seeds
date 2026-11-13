@@ -12,7 +12,8 @@ See https://toolbelt.readthedocs.io/ for documentation
 from .adapters import SSLAdapter, SourceAddressAdapter
 from .auth.guess import GuessAuth
 from .multipart import (
-    MultipartEncoder, MultipartEncoderMonitor, MultipartDecoder,
+    MultipartEncoder, MultipartEncoderMonitor, MonitorReadState,
+    MultipartDecoder,
     ImproperBodyPartContentException, NonMultipartContentTypeException
     )
 from .streaming_iterator import StreamingIterator
@@ -27,7 +28,8 @@ __version_info__ = tuple(int(i) for i in __version__.split('.'))
 
 __all__ = [
     'GuessAuth', 'MultipartEncoder', 'MultipartEncoderMonitor',
-    'MultipartDecoder', 'SSLAdapter', 'SourceAddressAdapter',
+    'MonitorReadState', 'MultipartDecoder', 'SSLAdapter',
+    'SourceAddressAdapter',
     'StreamingIterator', 'user_agent', 'ImproperBodyPartContentException',
     'NonMultipartContentTypeException', '__title__', '__authors__',
     '__license__', '__copyright__', '__version__', '__version_info__',

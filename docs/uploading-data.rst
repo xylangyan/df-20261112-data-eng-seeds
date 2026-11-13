@@ -60,7 +60,28 @@ exactly like the encoder. It provides a similar API with some additions:
   an argument.
 
 - The monitor tracks how many bytes have been read in the course of the
-  upload.
+  upload. ``bytes_read`` only grows by the length actually returned by a
+  ``read`` call, so it never exceeds the declared length.
+
+Zero-length probes such as ``read(0)`` read no data, do not change
+``bytes_read``, and do not invoke the callback.
+
+The monitor reports its lifecycle through the ``state`` attribute, using the
+values defined on
+:class:`~requests_toolbelt.multipart.encoder.MonitorReadState`:
+
+- ``reading`` while data is still being read. The callback fires for each
+  non-empty read, including the final non-empty chunk.
+- ``finished`` once the encoder has been fully consumed (EOF). This is a
+  terminal state, announced to the callback exactly once.
+- ``failed`` if reading raised an exception. The exception is stored on
+  ``error`` and re-raised to the caller; this is also terminal and announced
+  exactly once.
+
+Repeated EOF probes (further ``read`` calls after completion) return empty
+bytes and do not fire the callback again, so completion is never signalled
+twice. The ``finished`` boolean on the monitor is ``True`` for either terminal
+state; use ``state`` to tell them apart.
 
 You might use the monitor to create a progress bar for the upload. Here is `an
 example using clint`_ which displays the progress bar.
@@ -107,6 +128,8 @@ If you have a very simple use case you can also do:
 
 
 .. autoclass:: requests_toolbelt.multipart.encoder.MultipartEncoderMonitor
+
+.. autoclass:: requests_toolbelt.multipart.encoder.MonitorReadState
 
 .. _an example using clint:
     https://github.com/requests/toolbelt/blob/master/examples/monitor/progress_bar.py

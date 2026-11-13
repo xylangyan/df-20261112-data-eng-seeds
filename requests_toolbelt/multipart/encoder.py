@@ -296,6 +296,19 @@ class MultipartEncoder(object):
 
         return self.read()
 
+    @property
+    def exhausted(self):
+        """Whether the encoder has been fully consumed by the reader.
+
+        This is ``True`` only once every part (including the closing
+        boundary) has been loaded into the buffer *and* the buffer has been
+        drained by reads. It is the terminal condition for consumers of the
+        encoder, unlike :attr:`finished` which becomes ``True`` as soon as
+        all parts have been loaded into the internal buffer, potentially
+        before the consumer has read the trailing bytes.
+        """
+        return self.finished and total_len(self._buffer) == 0
+
     def read(self, size=-1):
         """Read data from the streaming encoder.
 
@@ -317,6 +330,25 @@ class MultipartEncoder(object):
 
 def IDENTITY(monitor):
     return monitor
+
+
+class MonitorReadState(object):
+    """Lifecycle states reported by a :class:`MultipartEncoderMonitor`.
+
+    The monitor starts in :attr:`READING`, and transitions exactly once into
+    one of the terminal states :attr:`FINISHED` or :attr:`FAILED`. The
+    terminal transition is announced to the callback a single time; further
+    reads (e.g. repeated EOF probes) do not re-announce it.
+    """
+
+    #: Data is still being read from the encoder.
+    READING = 'reading'
+
+    #: The encoder was fully consumed (EOF reached). Terminal state.
+    FINISHED = 'finished'
+
+    #: Reading from the encoder raised an exception. Terminal state.
+    FAILED = 'failed'
 
 
 class MultipartEncoderMonitor(object):
@@ -384,6 +416,19 @@ class MultipartEncoderMonitor(object):
         #: Avoid the same problem in bug #80
         self.len = self.encoder.len
 
+        #: Current lifecycle state, one of the :class:`MonitorReadState`
+        #: values. Starts as ``reading`` and transitions exactly once to
+        #: ``finished`` or ``failed``.
+        self.state = MonitorReadState.READING
+
+        #: Exception raised by the encoder while reading, if any. Only set
+        #: when :attr:`state` is ``failed``.
+        self.error = None
+
+        # Whether the terminal state has already been announced to the
+        # callback. Guards against re-announcing on repeated EOF probes.
+        self._terminal_announced = False
+
     @classmethod
     def from_fields(cls, fields, boundary=None, encoding='utf-8',
                     callback=None):
@@ -394,14 +439,63 @@ class MultipartEncoderMonitor(object):
     def content_type(self):
         return self.encoder.content_type
 
+    @property
+    def finished(self):
+        """Whether the monitor has reached a terminal state.
+
+        This is ``True`` once the encoder has been fully consumed
+        (``finished``) or a read has failed (``failed``). Inspect
+        :attr:`state` to distinguish the two.
+        """
+        return self.state != MonitorReadState.READING
+
     def to_string(self):
         return self.read()
 
     def read(self, size=-1):
-        string = self.encoder.read(size)
+        """Read from the encoder, tracking progress for the callback.
+
+        The callback is invoked once per actual read attempt, except for
+        zero-length probes (``read(0)``) and for reads made after a terminal
+        state has already been announced. The terminal state (``finished``
+        on EOF, ``failed`` on error) is announced exactly once, so repeated
+        EOF probes do not produce duplicate completion callbacks.
+
+        :param int size: (optional) number of bytes to read
+        :returns: bytes
+        """
+        if size == 0:
+            # A zero-length probe reads nothing and must not disturb the
+            # accounting or fire the callback.
+            return self.encoder.read(0)
+
+        try:
+            string = self.encoder.read(size)
+        except Exception as exc:
+            self.error = exc
+            self._transition_to(MonitorReadState.FAILED)
+            raise
+
         self.bytes_read += len(string)
-        self.callback(self)
+        # The body is fully read once the bytes actually returned to the
+        # caller reach the declared length. This also handles the final
+        # non-empty read (e.g. a single read(-1) that exhausts the encoder)
+        # without requiring a trailing empty read. The exhausted check is a
+        # fallback for bodies whose length cannot be determined in advance.
+        if self.bytes_read >= self.len or (
+                not string and self.encoder.exhausted):
+            self._transition_to(MonitorReadState.FINISHED)
+        elif not self._terminal_announced:
+            self.callback(self)
         return string
+
+    def _transition_to(self, state):
+        """Move to a terminal state, announcing it to the callback once."""
+        if self._terminal_announced:
+            return
+        self.state = state
+        self._terminal_announced = True
+        self.callback(self)
 
 
 def encode_with(string, encoding):

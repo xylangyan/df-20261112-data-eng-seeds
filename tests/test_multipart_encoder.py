@@ -319,5 +319,24 @@ class TestMultipartEncoder(unittest.TestCase):
         output = m.read().decode('utf-8')
         assert output == '----90967316f8404798963cce746a4f4ef9--\r\n'
 
+    def test_exhausted_only_when_fully_consumed(self):
+        m = MultipartEncoder({'a': 'x' * 200}, boundary=self.boundary)
+        assert m.exhausted is False
+        seen_finished_but_not_exhausted = False
+        read_so_far = 0
+        while True:
+            chunk = m.read(16)
+            read_so_far += len(chunk)
+            if not chunk:
+                break
+            if m.finished and not m.exhausted:
+                seen_finished_but_not_exhausted = True
+        assert read_so_far == m.len
+        assert m.finished is True
+        assert m.exhausted is True
+        # finished (loaded) must be reachable while bytes remain unread
+        assert seen_finished_but_not_exhausted is True
+
+
 if __name__ == '__main__':
     unittest.main()

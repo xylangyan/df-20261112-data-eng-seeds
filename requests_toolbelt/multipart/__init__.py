@@ -8,7 +8,9 @@ See https://toolbelt.readthedocs.io/ for documentation
 :license: Apache v2.0, see LICENSE for more details
 """
 
-from .encoder import MultipartEncoder, MultipartEncoderMonitor
+from .encoder import (
+    MultipartEncoder, MultipartEncoderMonitor, MonitorReadState
+    )
 from .decoder import MultipartDecoder
 from .decoder import ImproperBodyPartContentException
 from .decoder import NonMultipartContentTypeException
@@ -21,6 +23,7 @@ __copyright__ = 'Copyright 2014 Ian Cordasco, Cory Benfield'
 __all__ = [
     'MultipartEncoder',
     'MultipartEncoderMonitor',
+    'MonitorReadState',
     'MultipartDecoder',
     'ImproperBodyPartContentException',
     'NonMultipartContentTypeException',
