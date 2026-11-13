@@ -25,6 +25,9 @@ What's Changed
 - fix(common): publish(retry=True) fails after a reconnect with a named exchange (#2797).
 - Update amqp version to 5.4.2 (#2810).
 - fix(sqlalchemy): raise when a purge cannot be committed (#2811).
+- feat(filesystem): optionally quarantine undecodable message files
+  (``quarantine_bad_files``), preserving their raw content for auditing while
+  valid messages queued behind them continue to be consumed.
 
 
 

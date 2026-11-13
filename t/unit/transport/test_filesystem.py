@@ -16,6 +16,7 @@ from kombu import Connection, Consumer, Exchange, Producer, Queue
 from kombu.exceptions import ChannelError
 from kombu.transport.filesystem import Channel as FilesystemChannel
 from kombu.transport.virtual import Channel
+from kombu.utils.encoding import str_to_bytes
 from kombu.utils.json import dumps
 
 
@@ -606,3 +607,194 @@ class test_FilesystemOpenErrors(WithJanitorMixin):
                 self.channel._get("q")
         assert isinstance(excinfo.value.__cause__, OSError)
         broken.return_value.__exit__.assert_called_once()
+
+
+@t.skip.if_win32
+class test_FilesystemQuarantine(WithJanitorMixin):
+    # A batch consumer stuck behind a half-written message file (e.g. left
+    # over by a power failure) should be able to set the bad file aside and
+    # keep consuming the valid messages queued behind it, while keeping the
+    # original bytes for auditing.
+
+    def setup_method(self):
+        try:
+            self.data_folder_in = tempfile.mkdtemp()
+            self.data_folder_out = tempfile.mkdtemp()
+            self.control_folder = tempfile.mkdtemp()
+            self.quarantine_folder = tempfile.mkdtemp()
+            # a private staging folder keeps these tests independent of the
+            # global temp dir, where shutil.move would collide with leftovers
+            self.staging_folder = tempfile.mkdtemp()
+        except Exception:
+            pytest.skip('filesystem transport: cannot create tempfiles')
+        self.conn = Connection(
+            transport='filesystem',
+            transport_options={
+                'data_folder_in': self.data_folder_in,
+                'data_folder_out': self.data_folder_out,
+                'control_folder': self.control_folder,
+                'quarantine_bad_files': True,
+                'quarantine_folder': self.quarantine_folder,
+            })
+        self.channel = self.conn.default_channel
+        self._staging_patch = patch(
+            'kombu.transport.filesystem.tempfile.gettempdir',
+            return_value=self.staging_folder)
+        self._staging_patch.start()
+
+    def teardown_method(self):
+        self._staging_patch.stop()
+        self.conn.close()
+        self._remove_temporary_folders()
+        for folder in (self.quarantine_folder, self.staging_folder):
+            try:
+                shutil.rmtree(folder)
+            except OSError:
+                pass
+
+    def _put_message_file(self, name, payload):
+        path = os.path.join(self.data_folder_in, name)
+        with open(path, 'wb') as f:
+            f.write(payload if isinstance(payload, bytes)
+                    else str_to_bytes(dumps(payload)))
+
+    def _message_file(self, seq, name, queue='q'):
+        return f'{seq}_{name}.{queue}.msg'
+
+    def test_truncated_file_quarantined_and_valid_messages_consumed(
+            self, caplog):
+        # a half-written file (as left by a power failure) sorts before the
+        # two valid messages queued behind it
+        bad_name = self._message_file(1, 'a')
+        self._put_message_file(bad_name, b'{"body": "x"')
+        self._put_message_file(self._message_file(2, 'b'), {'body': 'one'})
+        self._put_message_file(self._message_file(3, 'c'), {'body': 'two'})
+
+        assert self.channel._get('q') == {'body': 'one'}
+        assert self.channel._get('q') == {'body': 'two'}
+        with pytest.raises(Empty):
+            self.channel._get('q')
+
+        # the bad file is gone from the queue, kept byte-for-byte in the
+        # quarantine folder, and nothing else ended up there
+        assert os.listdir(self.data_folder_in) == []
+        assert os.listdir(self.staging_folder) == []
+        quarantined = os.listdir(self.quarantine_folder)
+        assert quarantined == [bad_name]
+        with open(os.path.join(self.quarantine_folder, bad_name),
+                  'rb') as f:
+            assert f.read() == b'{"body": "x"'
+        # exactly one warning: the bad file is reported a single time
+        assert sum('quarantined' in record.getMessage()
+                   for record in caplog.records) == 1
+
+    def test_quarantine_disabled_keeps_existing_error_path(self):
+        conn = Connection(
+            transport='filesystem',
+            transport_options={
+                'data_folder_in': self.data_folder_in,
+                'data_folder_out': self.data_folder_out,
+                'control_folder': self.control_folder,
+            })
+        channel = conn.default_channel
+        self._put_message_file(self._message_file(1, 'a'), b'{"body": "x"')
+
+        with pytest.raises(ValueError):
+            channel._get('q')
+        # the bad file was moved out of the queue and cleaned up as before
+        assert os.listdir(self.data_folder_in) == []
+        assert os.listdir(self.quarantine_folder) == []
+        conn.close()
+
+    def test_recoverable_read_error_retries_and_does_not_quarantine(self):
+        first = self._message_file(1, 'a')
+        self._put_message_file(first, {'body': 'one'})
+        self._put_message_file(self._message_file(2, 'b'), {'body': 'two'})
+
+        real_open = open
+        attempts = []
+
+        def flaky_open(file, *args, **kwargs):
+            if not attempts:
+                attempts.append(file)
+                raise OSError('transient read failure')
+            return real_open(file, *args, **kwargs)
+
+        with patch('builtins.open', flaky_open):
+            with pytest.raises(ChannelError) as excinfo:
+                self.channel._get('q')
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+        # the failing file stays staged for a retry and is never quarantined.
+        # The transport raised before delivery, so a retry re-stages it at
+        # the head of the queue (files sort by name); the read then succeeds
+        # and the second message follows in order.
+        assert os.listdir(self.quarantine_folder) == []
+        assert os.path.exists(os.path.join(self.staging_folder, first))
+        shutil.move(os.path.join(self.staging_folder, first),
+                    os.path.join(self.data_folder_in, first))
+        assert self.channel._get('q') == {'body': 'one'}
+        assert self.channel._get('q') == {'body': 'two'}
+        assert os.listdir(self.staging_folder) == []
+
+    def test_quarantine_never_overwrites_same_named_file(self):
+        first = self._message_file(1, 'a')
+        self._put_message_file(first, b'{"bad": 1')
+        self._put_message_file(self._message_file(2, 'b'), b'{"bad": 2')
+        # simulate a same-named file quarantined earlier (e.g. by another
+        # consumer of the same batch)
+        with open(os.path.join(self.quarantine_folder, first), 'wb') as f:
+            f.write(b'{"bad": 0')
+
+        with pytest.raises(Empty):
+            self.channel._get('q')
+
+        quarantined = sorted(os.listdir(self.quarantine_folder))
+        assert len(quarantined) == 3
+        contents = set()
+        for name in quarantined:
+            with open(os.path.join(self.quarantine_folder, name),
+                      'rb') as f:
+                contents.add(f.read())
+        assert contents == {b'{"bad": 0', b'{"bad": 1', b'{"bad": 2'}
+
+    def test_quarantine_skips_file_already_handled_by_other_consumer(
+            self, caplog):
+        first = self._message_file(1, 'a')
+        self._put_message_file(first, b'{"bad": 1')
+        staged = os.path.join(self.staging_folder, first)
+
+        def consumer_wins(src, dst):
+            # another consumer removes the staged file before we rename it
+            os.remove(src)
+            raise FileNotFoundError(2, 'No such file or directory', src)
+
+        with patch.object(FilesystemChannel, '_rename_without_overwrite',
+                          side_effect=consumer_wins):
+            with pytest.raises(Empty):
+                self.channel._get('q')
+
+        assert not os.path.exists(staged)
+        assert os.listdir(self.quarantine_folder) == []
+        # the lost-race is logged, but no success report is emitted
+        assert sum('another consumer' in record.getMessage()
+                   for record in caplog.records) == 1
+        assert not any('quarantined as' in record.getMessage()
+                       for record in caplog.records)
+
+    def test_quarantine_failure_raises_channel_error(self):
+        first = self._message_file(1, 'a')
+        self._put_message_file(first, b'{"bad": 1')
+        staged = os.path.join(self.staging_folder, first)
+
+        def permission_denied(src, dst):
+            raise PermissionError(13, 'Permission denied', src)
+
+        with patch.object(FilesystemChannel, '_rename_without_overwrite',
+                          side_effect=permission_denied):
+            with pytest.raises(ChannelError) as excinfo:
+                self.channel._get('q')
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+        # the file stays staged for the next attempt, not quarantined
+        assert os.path.exists(staged)
+        assert os.listdir(self.quarantine_folder) == []

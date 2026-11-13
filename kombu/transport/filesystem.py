@@ -87,10 +87,21 @@ Transport Options
   ``processed_folder``.
 * ``processed_folder`` - directory where are backed up processed files.
 * ``control_folder`` - directory where are exchange-queue table stored.
+* ``quarantine_bad_files`` - if set to True, a message file that cannot be
+  deserialized (e.g. a file left half-written by a power failure) is moved
+  aside into ``quarantine_folder`` instead of failing every subsequent read,
+  so the messages queued behind it can still be consumed.  The original
+  content is preserved for auditing.  I/O errors are *not* quarantined:
+  they keep raising :class:`~kombu.exceptions.ChannelError` so the caller
+  can retry.  Disabled by default, in which case a bad file keeps raising
+  the deserialization error (a ``ValueError`` for the JSON transport) as
+  before.
+* ``quarantine_folder`` - directory where quarantined files are moved to.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shutil
@@ -102,6 +113,7 @@ from queue import Empty
 from time import monotonic
 
 from kombu.exceptions import ChannelError
+from kombu.log import get_logger
 from kombu.transport import virtual
 from kombu.utils.encoding import bytes_to_str, str_to_bytes
 from kombu.utils.json import dumps, loads
@@ -109,6 +121,8 @@ from kombu.utils.objects import cached_property
 
 VERSION = (1, 0, 0)
 __version__ = '.'.join(map(str, VERSION))
+
+logger = get_logger(__name__)
 
 # needs win32all to work on Windows
 if os.name == 'nt':
@@ -155,6 +169,15 @@ else:
 
 exchange_queue_t = namedtuple("exchange_queue_t",
                               ["routing_key", "pattern", "queue"])
+
+
+def _remove_quietly(filename):
+    """Remove `filename`, ignoring a concurrent removal by another worker."""
+    try:
+        os.remove(filename)
+    except OSError:
+        pass
+
 
 #: Characters accepted in an exchange name.  The name is interpolated into a
 #: filename under ``control_folder``, so rather than blocklisting the
@@ -295,10 +318,10 @@ class Channel(virtual.Channel):
             else:
                 processed_folder = tempfile.gettempdir()
 
+            source_path = os.path.join(self.data_folder_in, filename)
             try:
                 # move the file to the tmp/processed folder
-                shutil.move(os.path.join(self.data_folder_in, filename),
-                            processed_folder)
+                shutil.move(source_path, processed_folder)
             except OSError:
                 # file could be locked, or removed in meantime so ignore
                 continue
@@ -307,15 +330,89 @@ class Channel(virtual.Channel):
             try:
                 with open(filename, 'rb') as f:
                     payload = f.read()
-                if not self.store_processed:
-                    os.remove(filename)
             except OSError as exc:
                 raise ChannelError(
                     f'Cannot read file {filename!r} from queue.') from exc
 
-            return loads(bytes_to_str(payload))
+            try:
+                message = loads(bytes_to_str(payload))
+            except (ValueError, TypeError, UnicodeError) as exc:
+                # The content itself is undecodable, typically because the
+                # file was only half-written.  Retrying cannot help, so when
+                # quarantine is enabled it is moved aside (keeping the raw
+                # bytes) and the next queued file is tried instead.  With
+                # quarantine disabled the existing path is kept verbatim:
+                # the file is cleaned up and the decode error propagates.
+                if not self.quarantine_bad_files:
+                    if not self.store_processed:
+                        _remove_quietly(filename)
+                    raise
+                self._quarantine_bad_file(filename, exc)
+                continue
+
+            if not self.store_processed:
+                _remove_quietly(filename)
+
+            return message
 
         raise Empty()
+
+    def _quarantine_bad_file(self, filename, decode_exc):
+        """Move an undecodable message file to the quarantine folder.
+
+        The original bytes are preserved for auditing.  The destination name
+        is chosen without clobbering any file already present (a same-named
+        file can exist when another consumer quarantines concurrently), and
+        the move is skipped when another consumer wins the race, so the file
+        is reported only once.
+        """
+        self.quarantine_folder.mkdir(parents=True, exist_ok=True)
+        basename = os.path.basename(filename)
+        destination = self.quarantine_folder / basename
+        while True:
+            try:
+                self._rename_without_overwrite(filename, destination)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    logger.warning(
+                        'Bad message file %r already handled by another '
+                        'consumer, skipping quarantine.', filename)
+                    return
+                if exc.errno == errno.EEXIST:
+                    destination = self._unique_quarantine_path(basename)
+                    continue
+                raise ChannelError(
+                    f'Cannot quarantine file {filename!r}.') from exc
+            break
+        logger.warning(
+            'Bad message file %r quarantined as %s: %s',
+            filename, destination, decode_exc)
+
+    def _rename_without_overwrite(self, source, destination):
+        """Rename `source` to `destination`, never clobbering an existing
+        destination.
+
+        POSIX :func:`os.rename` silently replaces the destination, so on
+        Linux the atomic ``RENAME_NOREPLACE`` flag is used.  Elsewhere the
+        destination is checked first, with an ``EEXIST`` fallback covering
+        a concurrent rename by another consumer.
+        """
+        noreplace = getattr(os, 'RENAME_NOREPLACE', None)
+        if noreplace is not None:
+            os.rename(source, destination, noreplace)
+        elif not destination.exists():
+            os.rename(source, destination)
+        else:
+            raise FileExistsError(
+                errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
+
+    def _unique_quarantine_path(self, basename):
+        stem, suffix = os.path.splitext(basename)
+        while True:
+            candidate = self.quarantine_folder / (
+                f'{stem}.{uuid.uuid4().hex}{suffix}')
+            if not candidate.exists():
+                return candidate
 
     def _delete(self, queue, exchange, routing_key, pattern, *args, **kwargs):
         super()._delete(queue, exchange, routing_key, pattern, *args, **kwargs)
@@ -409,6 +506,15 @@ class Channel(virtual.Channel):
     @cached_property
     def processed_folder(self):
         return self.transport_options.get('processed_folder', 'processed')
+
+    @cached_property
+    def quarantine_bad_files(self):
+        return self.transport_options.get('quarantine_bad_files', False)
+
+    @cached_property
+    def quarantine_folder(self):
+        return Path(
+            self.transport_options.get('quarantine_folder', 'quarantine'))
 
     @property
     def control_folder(self):
