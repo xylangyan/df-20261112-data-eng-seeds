@@ -54,6 +54,8 @@
 
         .. autoattribute:: exchange_types
 
+        .. autoattribute:: queue_order_strategy
+
         .. automethod:: exchange_declare
 
         .. automethod:: exchange_delete

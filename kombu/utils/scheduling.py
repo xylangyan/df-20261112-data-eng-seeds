@@ -7,7 +7,8 @@ from itertools import count
 from .imports import symbol_by_name
 
 __all__ = (
-    'FairCycle', 'priority_cycle', 'round_robin_cycle', 'sorted_cycle',
+    'FairCycle', 'QoSFairCycle',
+    'priority_cycle', 'round_robin_cycle', 'sorted_cycle',
 )
 
 CYCLE_ALIASES = {
@@ -64,6 +65,70 @@ class FairCycle:
     def __repr__(self):
         """``repr(cycle)``."""
         return '<FairCycle: {self.pos}/{size} {self.resources}>'.format(
+            self=self, size=len(self.resources))
+
+
+class QoSFairCycle:
+    """Round-robin cycle that honors per-channel prefetch limits.
+
+    Like :class:`FairCycle`, each resource gets an equal chance, but one
+    full pass over :attr:`resources` is treated as an explicit round:
+
+    - empty resources (those raising :attr:`predicate`) are skipped and the
+      round continues with the next resource,
+    - resources whose channel already holds as many unacknowledged messages
+      as its ``prefetch_count`` allows are skipped without consuming from
+      them. A skipped resource stays part of the rotation, so it is revisited
+      as soon as an acknowledgement reopens the prefetch budget,
+    - fairness only applies *between* queues. Message order inside a single
+      queue is left entirely to the transport (FIFO for the in-memory
+      transport).
+
+    Arguments:
+    ---------
+        fun (Callable): Callback to call.
+        resources (Sequence[Any]): List of resources.
+        predicate (type): Exception raised when a resource has no message.
+        can_consume (Callable): Optional predicate returning :const:`True`
+            when the channel may receive another message. When it returns
+            :const:`False`, every resource is skipped for this call.
+    """
+
+    def __init__(self, fun, resources, predicate=Exception,
+                 can_consume=None):
+        self.fun = fun
+        self.resources = resources
+        self.predicate = predicate
+        self.can_consume = can_consume
+        self.pos = 0
+
+    def get(self, callback, **kwargs):
+        """Get one message from the next eligible resource."""
+        if self.can_consume is not None and not self.can_consume():
+            raise self.predicate()
+        resources = self.resources
+        size = len(resources)
+        if not size:
+            raise self.predicate()
+        # One call scans each resource at most once, starting at the cursor.
+        # The cursor advances by one per call, so consecutive calls rotate
+        # the starting point and no resource can starve the others.
+        start = self.pos % size
+        self.pos = (start + 1) % size
+        for offset in range(size):
+            resource = resources[(start + offset) % size]
+            try:
+                return self.fun(resource, callback, **kwargs)
+            except self.predicate:
+                continue
+        raise self.predicate()
+
+    def close(self):
+        """Close cycle."""
+
+    def __repr__(self):
+        """``repr(cycle)``."""
+        return '<QoSFairCycle: {self.pos}/{size} {self.resources}>'.format(
             self=self, size=len(self.resources))
 
 

@@ -127,7 +127,7 @@ from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ, poll
 from kombu.utils.json import dumps, loads
 from kombu.utils.objects import cached_property
-from kombu.utils.scheduling import cycle_by_name
+from kombu.utils.scheduling import FairCycle, cycle_by_name
 from kombu.utils.url import _parse_url
 
 from . import virtual
@@ -1299,6 +1299,14 @@ class Channel(virtual.Channel):
 
     def _restore_at_beginning(self, message):
         return self._restore(message, leftmost=True)
+
+    def _reset_cycle(self):
+        # Redis keeps the historical drain cycle: its queue_order_strategy
+        # option drives the BRPOP _queue_cycle instead, including the
+        # redis-specific 'priority' and 'sorted' aliases.
+        self._cycle = FairCycle(
+            self._get_and_deliver, self._active_queues, virtual.Empty,
+        )
 
     def basic_consume(self, queue, *args, **kwargs):
         if queue in self._fanout_queues:

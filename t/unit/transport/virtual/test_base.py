@@ -16,6 +16,7 @@ from kombu import Connection, Queue
 from kombu.compression import compress
 from kombu.exceptions import ChannelError, ResourceError
 from kombu.transport import virtual
+from kombu.utils.scheduling import FairCycle, QoSFairCycle
 from kombu.utils.uuid import uuid
 
 PRINT_FQDN = 'builtins.print'
@@ -541,6 +542,54 @@ class test_Channel:
 
     def test_cycle_property(self):
         assert self.channel.cycle
+
+    def test_default_cycle_is_legacy_fair_cycle(self):
+        assert self.channel.queue_order_strategy == 'fair'
+        self.channel._reset_cycle()
+        assert isinstance(self.channel._cycle, FairCycle)
+        assert not isinstance(self.channel._cycle, QoSFairCycle)
+
+    def test_round_robin_strategy_builds_qos_cycle(self):
+        c = client(transport_options={
+            'queue_order_strategy': 'round_robin',
+        }).channel()
+        assert c.queue_order_strategy == 'round_robin'
+        c._reset_cycle()
+        assert isinstance(c._cycle, QoSFairCycle)
+        assert c._cycle.can_consume == c.qos.can_consume
+
+    def test_round_robin_strategy_unknown_value_rejected_lazily(self):
+        c = client(transport_options={
+            'queue_order_strategy': 'weighted',
+        }).channel()
+        with pytest.raises(ValueError, match='queue_order_strategy'):
+            c._reset_cycle()
+
+    def test_round_robin_drains_alternate_queue(self):
+        c = Connection(
+            transport='memory',
+            transport_options={'queue_order_strategy': 'round_robin'},
+        ).channel()
+        delivered = []
+        c.connection._deliver = lambda message, queue: delivered.append(queue)
+        for queue in ('a', 'b'):
+            c.exchange_declare('ex')
+            c.queue_declare(queue)
+            c.queue_bind(queue, 'ex', queue)
+            c.basic_consume(
+                queue, False, callback=lambda *a: None,
+                consumer_tag='tag-' + queue)
+
+        def put(queue, body):
+            c.basic_publish(c.prepare_message(body), 'ex', queue)
+
+        for i in range(4):
+            put('a', 'a%d' % i)
+        put('b', 'b0')
+        # first round starts at a, second round starts at b
+        c.drain_events()
+        c.drain_events()
+        assert delivered == ['a', 'b']
 
     def test_flow(self):
         with pytest.raises(NotImplementedError):

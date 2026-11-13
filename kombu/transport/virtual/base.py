@@ -23,7 +23,7 @@ from kombu.log import get_logger
 from kombu.transport import base
 from kombu.utils.div import emergency_dump_state
 from kombu.utils.encoding import bytes_to_str, str_to_bytes
-from kombu.utils.scheduling import FairCycle
+from kombu.utils.scheduling import FairCycle, QoSFairCycle
 from kombu.utils.uuid import uuid
 
 from .exchange import STANDARD_EXCHANGE_TYPES
@@ -61,6 +61,9 @@ binding_key_t = namedtuple('binding_key_t', (
 queue_binding_t = namedtuple('queue_binding_t', (
     'exchange', 'routing_key', 'arguments',
 ))
+
+#: Supported virtual :attr:`Channel.queue_order_strategy` values.
+QUEUE_ORDER_STRATEGIES = frozenset({'fair', 'round_robin'})
 
 
 class Base64:
@@ -467,8 +470,24 @@ class Channel(AbstractChannel, base.StdChannel):
     #: Set by ``transport_options['deadletter_queue']``.
     deadletter_queue = None
 
+    #: Strategy used to choose the next active queue while draining.
+    #:
+    #: - ``fair`` (default): the historical :class:`~kombu.utils.scheduling.FairCycle`
+    #:   behavior; publishing and delivery semantics are unchanged.
+    #: - ``round_robin``: :class:`~kombu.utils.scheduling.QoSFairCycle`, an
+    #:   explicit round over the active queues that skips empty queues and
+    #:   queues blocked by this channel's ``prefetch_count``. A queue blocked
+    #:   on unacknowledged messages rejoins the rotation as soon as a message
+    #:   is acknowledged. FIFO is only guaranteed within each queue.
+    #:
+    #: Set via ``transport_options['queue_order_strategy']``. Transports that
+    #: implement their own queue rotation (e.g. redis) may use other values.
+    queue_order_strategy = 'fair'
+
     # List of options to transfer from :attr:`transport_options`.
-    from_transport_options = ('body_encoding', 'deadletter_queue')
+    from_transport_options = (
+        'body_encoding', 'deadletter_queue', 'queue_order_strategy',
+    )
 
     # Priority defaults
     default_priority = 0
@@ -822,8 +841,19 @@ class Channel(AbstractChannel, base.StdChannel):
         return body
 
     def _reset_cycle(self):
-        self._cycle = FairCycle(
-            self._get_and_deliver, self._active_queues, Empty)
+        strategy = self.queue_order_strategy
+        if strategy == 'round_robin':
+            self._cycle = QoSFairCycle(
+                self._get_and_deliver, self._active_queues, Empty,
+                can_consume=self.qos.can_consume,
+            )
+        elif strategy == 'fair':
+            self._cycle = FairCycle(
+                self._get_and_deliver, self._active_queues, Empty)
+        else:
+            raise ValueError(
+                'Unknown queue_order_strategy {!r}, expected one of {}'.format(
+                    strategy, sorted(QUEUE_ORDER_STRATEGIES)))
 
     def __enter__(self):
         return self

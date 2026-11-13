@@ -5,6 +5,21 @@
 ================
 
 
+.. _version-5.8.0:
+
+5.8.0
+========
+:release-date: TBA
+
+- feat(virtual): add opt-in ``queue_order_strategy='round_robin'`` transport
+  option. The new :class:`~kombu.utils.scheduling.QoSFairCycle` drains one
+  explicit round per call, skipping empty queues and queues blocked by the
+  channel's ``prefetch_count``; a blocked queue rejoins the rotation once a
+  message is acknowledged. The default ``fair`` strategy, publishing, and
+  per-queue FIFO order are unchanged. Intended for in-memory tests and
+  lightweight jobs.
+
+
 .. _version-5.7.0:
 
 5.7.0
