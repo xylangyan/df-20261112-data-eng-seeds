@@ -106,6 +106,67 @@ def _resolve_field_instance(cls_or_instance: Field | type[Field]) -> Field:
     return cls_or_instance
 
 
+def copy_field(field: Field, memo: dict[int, Field] | None = None) -> Field:
+    """Return a per-instance copy of a declared `Field`.
+
+    ``Field`` instances on a Schema class are shared templates that must be
+    copied whenever a Schema is instantiated, so this runs on the hot path of
+    deep schema construction. It mirrors ``copy.deepcopy`` for Fields while
+    skipping the generic reductor machinery:
+
+    * a custom ``__deepcopy__`` (as defined on `Field`) or ``__copy__`` wins,
+      so custom Field subclasses keep full control over their copy;
+    * the default path is a shallow copy via ``__dict__`` (plus any slots),
+      matching `Field.__deepcopy__`, which intentionally does not recurse into
+      nested mutable attributes;
+    * a shared ``memo`` keyed by object id makes sure a Field referenced by
+      several declared Fields is copied only once per Schema construction.
+    """
+    if memo is not None:
+        cached = memo.get(id(field))
+        if cached is not None:
+            return cached
+
+    field_type = type(field)
+    custom_deepcopy = field_type.__deepcopy__
+    if (
+        custom_deepcopy is not Field.__deepcopy__
+        or "__deepcopy__" in getattr(field, "__dict__", {})
+    ):
+        copied = field.__deepcopy__(memo if memo is not None else {})
+    else:
+        custom_copy = getattr(field_type, "__copy__", None)
+        if custom_copy is not None:
+            copied = custom_copy(field)
+        elif (
+            field_type.__reduce_ex__ is not object.__reduce_ex__
+            or field_type.__reduce__ is not object.__reduce__
+            or getattr(field_type, "__getstate__", None)
+            is not getattr(object, "__getstate__", None)
+            or getattr(field_type, "__setstate__", None) is not None
+            or getattr(field_type, "__getnewargs__", None) is not None
+            or getattr(field_type, "__getnewargs_ex__", None) is not None
+        ):
+            # A subclass customizes pickling/copy state: defer to copy.copy
+            # (which Field.__deepcopy__ uses) to preserve those semantics.
+            copied = copy.copy(field)
+        else:
+            copied = field_type.__new__(field_type)
+            field_dict = getattr(field, "__dict__", None)
+            if field_dict is not None:
+                copied.__dict__.update(field_dict)
+            for klass in reversed(field_type.__mro__):
+                slots = getattr(klass, "__slots__", ())
+                if isinstance(slots, str):
+                    slots = (slots,)
+                for slot in slots:
+                    if hasattr(field, slot):
+                        setattr(copied, slot, getattr(field, slot))
+    if memo is not None:
+        memo[id(field)] = copied
+    return copied
+
+
 class Field(typing.Generic[_InternalT]):
     """Base field from which all other fields inherit.
     This class should not be used directly within Schemas.
@@ -549,6 +610,9 @@ class Nested(Field):
         self.many = many
         self.unknown = unknown
         self._schema: Schema | None = None  # Cached Schema instance
+        # Cached resolved Schema class. Only the immutable class is shared;
+        # every access still builds a fresh, independently bound Schema below.
+        self._schema_class: SchemaMeta | None = None
         super().__init__(**kwargs)
 
     @property
@@ -561,9 +625,6 @@ class Nested(Field):
             nested = self.nested
             if callable(nested) and not isinstance(nested, SchemaMeta):
                 nested = nested()
-
-            if isinstance(nested, dict):
-                nested = Schema.from_dict(nested)
 
             if isinstance(nested, Schema):
                 self._schema = copy.copy(nested)
@@ -582,16 +643,7 @@ class Nested(Field):
                     self._schema.many = self.many
                 self._schema._init_fields()
             else:
-                if isinstance(nested, type) and issubclass(nested, Schema):
-                    schema_class: type[Schema] = nested
-                elif not isinstance(nested, (str, bytes)):
-                    raise ValueError(
-                        "`Nested` fields must be passed a "
-                        f"`Schema`, not {nested.__class__}."
-                    )
-                else:
-                    schema_class = class_registry.get_class(nested, all=False)
-                self._schema = schema_class(
+                self._schema = self._resolve_schema_class(nested)(
                     many=bool(self.many),
                     only=self.only,
                     exclude=self.exclude,
@@ -599,6 +651,33 @@ class Nested(Field):
                     dump_only=self._nested_normalized_option("dump_only"),
                 )
         return self._schema
+
+    def _resolve_schema_class(
+        self, nested: SchemaMeta | str | dict[str, Field]
+    ) -> SchemaMeta:
+        """Resolve a non-callable ``nested`` value to a Schema class.
+
+        The resolved class is cached on this field instance. Schema classes are
+        immutable, so reusing one is safe; the caller still creates and binds a
+        new Schema instance for this field, preserving per-instance options and
+        mutable Field state.
+        """
+        from marshmallow.schema import Schema, SchemaMeta  # noqa: PLC0415
+
+        if isinstance(nested, type) and issubclass(nested, Schema):
+            return nested
+        if isinstance(nested, (str, bytes)):
+            if self._schema_class is None:
+                self._schema_class = class_registry.get_class(nested, all=False)
+            return self._schema_class
+        if isinstance(nested, dict):
+            if self._schema_class is None:
+                self._schema_class = Schema.from_dict(nested)
+            return self._schema_class
+        raise ValueError(
+            "`Nested` fields must be passed a "
+            f"`Schema`, not {nested.__class__}."
+        )
 
     def _nested_normalized_option(self, option_name: str) -> list[str]:
         nested_field = f"{self.name}."
@@ -756,7 +835,7 @@ class List(Field[list[_InternalT | None]]):
 
     def _bind_to_schema(self, field_name: str, parent: Schema | Field) -> None:
         super()._bind_to_schema(field_name, parent)
-        self.inner = copy.deepcopy(self.inner)
+        self.inner = copy_field(self.inner)
         self.inner._bind_to_schema(field_name, self)
         if isinstance(self.inner, Nested):
             self.inner.only = self.only
@@ -836,7 +915,7 @@ class Tuple(Field[tuple]):
         super()._bind_to_schema(field_name, parent)
         new_tuple_fields = []
         for field in self.tuple_fields:
-            new_field = copy.deepcopy(field)
+            new_field = copy_field(field)
             new_field._bind_to_schema(field_name, self)
             new_tuple_fields.append(new_field)
 
@@ -1640,13 +1719,13 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
     def _bind_to_schema(self, field_name, parent):
         super()._bind_to_schema(field_name, parent)
         if self.value_field:
-            self.value_field = copy.deepcopy(self.value_field)
+            self.value_field = copy_field(self.value_field)
             self.value_field._bind_to_schema(field_name, self)
         if isinstance(self.value_field, Nested):
             self.value_field.only = self.only
             self.value_field.exclude = self.exclude
         if self.key_field:
-            self.key_field = copy.deepcopy(self.key_field)
+            self.key_field = copy_field(self.key_field)
             self.key_field._bind_to_schema(field_name, self)
 
     def _serialize(self, value, attr, obj, **kwargs):

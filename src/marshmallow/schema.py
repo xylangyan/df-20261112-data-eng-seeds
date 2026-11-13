@@ -3,7 +3,6 @@
 # ruff: noqa: SLF001
 from __future__ import annotations
 
-import copy
 import datetime as dt
 import decimal
 import functools
@@ -421,8 +420,15 @@ class Schema(metaclass=SchemaMeta):
             raise StringNotCollectionError('"only" should be a list of strings')
         if not is_collection(exclude):
             raise StringNotCollectionError('"exclude" should be a list of strings')
-        # copy declared fields from metaclass
-        self.declared_fields = copy.deepcopy(self._declared_fields)
+        # copy declared fields from metaclass. One memo for the whole copy so
+        # that a Field referenced by more than one declared Field (e.g. nested
+        # containers) is copied only once and the copies stay internally
+        # consistent. Every Schema instance still gets its own Field objects.
+        declared_memo: dict[int, Field] = {}
+        self.declared_fields = {
+            field_name: ma_fields.copy_field(field, declared_memo)
+            for field_name, field in self._declared_fields.items()
+        }
         self.many = self.opts.many if many is None else many
         self.only = only
         self.exclude: set[typing.Any] | typing.MutableSet[typing.Any] = set(

@@ -769,3 +769,110 @@ class TestFieldPreAndPostLoad:
             match="The 'post_load' parameter must be a callable or an iterable of callables.",
         ):
             fields.Int(post_load="not_callable")  # type: ignore[arg-type]
+
+class TestFieldCopy:
+    def test_each_schema_instance_gets_distinct_fields(self):
+        class ChildSchema(Schema):
+            name = fields.Str()
+
+        class ParentSchema(Schema):
+            child = fields.Nested(ChildSchema)
+            names = fields.List(fields.Str())
+
+        first = ParentSchema()
+        second = ParentSchema()
+        assert first.declared_fields is not second.declared_fields
+        assert first.fields["child"] is not second.fields["child"]
+        assert first.fields["names"].inner is not second.fields["names"].inner
+
+        first.fields["names"].inner.load_only = True
+        assert second.fields["names"].inner.load_only is False
+
+    def test_shared_declared_field_is_copied_once(self):
+        shared = fields.Str()
+
+        class ReuseSchema(Schema):
+            first = shared
+            second = shared
+
+        schema = ReuseSchema()
+        assert schema.declared_fields["first"] is schema.declared_fields["second"]
+        assert schema.declared_fields["first"] is not shared
+        assert schema.dump({"first": "a", "second": "b"}) == {
+            "first": "a",
+            "second": "b",
+        }
+
+    def test_copy_field_honors_custom_deepcopy(self):
+        class CustomDeepCopyField(fields.Field):
+            def __deepcopy__(self, memo):
+                copied = super().__deepcopy__(memo)
+                copied.copied_via = "deepcopy"
+                return copied
+
+        field = CustomDeepCopyField()
+        copied = fields.copy_field(field)
+        assert copied is not field
+        assert copied.copied_via == "deepcopy"
+
+    def test_copy_field_honors_custom_copy(self):
+        class CustomCopyField(fields.Field):
+            def __copy__(self):
+                copied = self.__class__.__new__(self.__class__)
+                copied.__dict__.update(self.__dict__)
+                copied.copied_via = "copy"
+                return copied
+
+        copied = fields.copy_field(CustomCopyField())
+        assert copied.copied_via == "copy"
+
+    def test_copy_field_supports_slots(self):
+        class SlotField(fields.Field):
+            __slots__ = ("extra",)
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.extra = {"value": 1}
+
+        field = SlotField()
+        copied = fields.copy_field(field)
+        assert copied is not field
+        assert copied.extra == {"value": 1}
+        assert copied.extra is field.extra
+
+    def test_copy_field_memo_deduplicates(self):
+        field = fields.Nested(Schema)
+        memo = {}
+        assert fields.copy_field(field, memo) is fields.copy_field(field, memo)
+
+    def test_nested_resolved_schema_class_is_cached_but_schema_is_not_shared(self):
+        class CopyTestChildSchema(Schema):
+            name = fields.Str(required=True)
+
+        class ParentSchema(Schema):
+            child = fields.Nested("CopyTestChildSchema")
+
+        first = ParentSchema()
+        second = ParentSchema()
+        first_nested = first.fields["child"]
+        second_nested = second.fields["child"]
+        assert first_nested is not second_nested
+        first.dump({"child": {"name": "a"}})
+        second.dump({"child": {"name": "b"}})
+        assert first_nested._schema_class is second_nested._schema_class
+        assert first_nested.schema is not second_nested.schema
+        assert first_nested.schema.fields["name"] is not (
+            second_nested.schema.fields["name"]
+        )
+
+    def test_nested_callable_is_not_resolved_at_construction(self):
+        class RecursiveSchema(Schema):
+            value = fields.Int()
+            children = fields.List(fields.Nested(lambda: RecursiveSchema))
+
+        schema = RecursiveSchema()
+        nested = schema.fields["children"].inner
+        assert nested._schema is None
+        assert schema.dump(
+            {"value": 1, "children": [{"value": 2, "children": []}]}
+        ) == {"value": 1, "children": [{"value": 2, "children": []}]}

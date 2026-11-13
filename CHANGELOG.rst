@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+Features:
+
+- Speed up repeated `Schema` construction with nested fields. Declared
+  ``Field`` objects are now copied with a dedicated ``copy_field`` helper
+  (shared memo per construction, custom ``__deepcopy__``/``__copy__`` still
+  honored) instead of generic ``copy.deepcopy``, and `Nested` caches the
+  resolved Schema class per field instance. Each Schema instance still gets
+  its own mutable Field and nested Schema objects.
+
 4.4.0 (2026-11-03)
 ------------------
 
