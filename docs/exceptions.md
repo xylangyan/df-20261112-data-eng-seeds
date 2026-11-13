@@ -32,6 +32,11 @@ The most common use-cases are already covered by the following processors:
 {class}`structlog.tracebacks.ExceptionDictTransformer` can be customized with a number of parameters.
 If these prove insufficient, see {ref}`Custom Filtering of Dict Tracebacks <custom-dict-tracebacks>`.
 
+For JSON pipelines with a maximum event size, `max_stacks` limits how many exception stacks are rendered from an exception tree.
+Stacks are kept in stable depth-first order, so an exception chain is kept before its group children and earlier group children are kept before later ones.
+If group children are omitted, their parent contains an `unexpanded_exceptions` field with the number of omitted child stacks.
+Without `max_stacks`, the output format is unchanged.
+
 
 ## Console rendering
 

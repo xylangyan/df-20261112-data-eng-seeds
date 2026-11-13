@@ -15,6 +15,11 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.tracebacks.ExceptionDictTransformer` now accepts a `max_stacks` argument that limits the number of exception stacks rendered from exception groups.
+  Truncated group children are reported through a parent's `unexpanded_exceptions` field, keeping the JSON event parseable and the pruning order stable.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

@@ -8,9 +8,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import sys
 
 from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -21,6 +23,7 @@ import pytest
 import structlog
 
 from structlog import tracebacks
+from structlog.processors import JSONRenderer
 
 
 try:
@@ -1010,6 +1013,243 @@ def test_json_exception_groups() -> None:
             }
         ],
     ] == exceptions
+
+
+def _make_budget_exception_tree():
+    try:
+        try:
+            raise KeyError("direct cause")
+        except KeyError as cause:
+            raise ValueError("direct branch") from cause
+    except ValueError as branch_error:
+        return ExceptionGroup(
+            "parallel failure",
+            [branch_error, RuntimeError("second branch")],
+        )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_max_stacks_pruning_path() -> None:
+    """
+    Stack budgets preserve the root, cause chain, and group relationship while
+    removing later group branches.
+    """
+    exception = _make_budget_exception_tree()
+    result = tracebacks.ExceptionDictTransformer(
+        show_locals=False, max_stacks=3
+    )((type(exception), exception, exception.__traceback__))
+
+    root = result[0]
+    branch = root["exceptions"][0]
+
+    assert root["exc_type"] == "ExceptionGroup"
+    assert root["is_group"] is True
+    assert root["unexpanded_exceptions"] == 1
+    assert [stack["exc_type"] for stack in branch] == [
+        "ValueError",
+        "KeyError",
+    ]
+    assert branch[1]["is_cause"] is True
+    assert len(root["exceptions"]) == 1
+    assert _count_stacks(result) == 3
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_max_stacks_stable_order() -> None:
+    """
+    Repeated transforms keep the first branches and remove later ones in
+    stable depth-first order.
+    """
+    exception = _make_budget_exception_tree()
+    transformer = tracebacks.ExceptionDictTransformer(
+        show_locals=False, max_stacks=2
+    )
+
+    first = transformer((type(exception), exception, exception.__traceback__))
+    second = transformer((type(exception), exception, exception.__traceback__))
+
+    assert first == second
+    assert first[0]["exc_type"] == "ExceptionGroup"
+    assert first[0]["exceptions"][0][0]["exc_type"] == "ValueError"
+    assert first[0]["unexpanded_exceptions"] == 2
+    assert _count_stacks(first) == 2
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_max_stacks_nested_groups() -> None:
+    """
+    Each pruned group reports its own omitted child stacks.
+    """
+    inner_group = ExceptionGroup(
+        "inner",
+        [RuntimeError("first child"), ValueError("second child")],
+    )
+    outer_group = ExceptionGroup(
+        "outer",
+        [inner_group, KeyError("sibling")],
+    )
+    result = tracebacks.ExceptionDictTransformer(
+        show_locals=False, max_stacks=3
+    )((type(outer_group), outer_group, outer_group.__traceback__))
+
+    root = result[0]
+    inner = root["exceptions"][0][0]
+
+    assert root["unexpanded_exceptions"] == 1
+    assert inner["unexpanded_exceptions"] == 1
+    assert inner["exceptions"][0][0]["exc_type"] == "RuntimeError"
+    assert _count_stacks(result) == 3
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_without_max_stacks_keeps_format() -> None:
+    """
+    No stack budget means no stack-budget metadata is emitted.
+    """
+    exception = _make_budget_exception_tree()
+    transformer = tracebacks.ExceptionDictTransformer(show_locals=False)
+
+    assert transformer.max_stacks is None
+    result = transformer(
+        (type(exception), exception, exception.__traceback__)
+    )
+
+    assert "unexpanded_exceptions" not in result[0]
+    assert _count_stacks(result) == 4
+    assert all(
+        "unexpanded_exceptions" not in stack
+        for stack in _iter_stacks(result)
+    )
+
+
+@pytest.mark.parametrize("max_stacks", [0, -1])
+def test_json_traceback_max_stacks_value_error(max_stacks: int) -> None:
+    """
+    Invalid stack budgets raise a ValueError containing the argument name.
+    """
+    with pytest.raises(ValueError, match="max_stacks"):
+        tracebacks.ExceptionDictTransformer(max_stacks=max_stacks)
+
+
+def test_json_traceback_custom_fields_and_empty_cause() -> None:
+    """
+    Custom log fields and empty causes stay JSON-serializable.
+    """
+
+    class CustomError(Exception):
+        pass
+
+    class CustomField:
+        def __structlog__(self) -> dict[str, str]:
+            return {"worker": "local"}
+
+    exception = CustomError("")
+    exception.__cause__ = None
+    transformer = tracebacks.ExceptionDictTransformer(show_locals=False)
+    rendered = transformer(
+        (type(exception), exception, exception.__traceback__)
+    )
+    event = {
+        "event": "collection failed",
+        "custom_field": CustomField(),
+        "exception": rendered,
+    }
+    line = JSONRenderer()(None, None, event)
+
+    assert json.loads(line)["custom_field"] == {"worker": "local"}
+    assert rendered[0]["exc_type"] == "CustomError"
+    assert rendered[0]["exc_value"] == ""
+
+
+def _count_stacks(stacks: list[dict[str, Any]]) -> int:
+    return sum(1 for _ in _iter_stacks(stacks))
+
+
+def _iter_stacks(stacks: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    for stack in stacks:
+        yield stack
+        for child in stack.get("exceptions", []):
+            yield from _iter_stacks(child)
+
+
+def _json_traceback_transformer() -> structlog.processors.ExceptionRenderer:
+    return structlog.processors.ExceptionRenderer(
+        tracebacks.ExceptionDictTransformer(show_locals=False, max_stacks=3)
+    )
+
+
+def _render_local_structlog_entry(exception: BaseException) -> str:
+    capturing_factory = structlog.testing.CapturingLoggerFactory()
+    structlog.configure(
+        processors=[_json_traceback_transformer(), JSONRenderer()],
+        logger_factory=capturing_factory,
+    )
+    structlog.get_logger().exception(
+        "collection failed",
+        exc_info=exception,
+        custom_field={"worker": "local"},
+    )
+    call = capturing_factory.logger.calls[0]
+
+    return call.args[0]
+
+
+def _render_local_stdlib_entry(exception: BaseException) -> str:
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            processors=[
+                structlog.stdlib.ExtraAdder(allow={"custom_field"}),
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                _json_traceback_transformer(),
+                JSONRenderer(),
+            ]
+        )
+    )
+    logger = logging.getLogger("test_traceback_budget")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.ERROR)
+    logger.exception(
+        "collection failed",
+        exc_info=(type(exception), exception, exception.__traceback__),
+        extra={"custom_field": {"worker": "local"}},
+    )
+
+    return stream.getvalue().strip()
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_local_logging_entries_use_same_pruned_json_tree() -> None:
+    """
+    Both local logging entry points serialize the same pruned exception tree
+    as one valid JSON line.
+    """
+    exception = _make_budget_exception_tree()
+    structlog_line = _render_local_structlog_entry(exception)
+    stdlib_line = _render_local_stdlib_entry(exception)
+
+    structlog_event = json.loads(structlog_line)
+    stdlib_event = json.loads(stdlib_line)
+
+    assert structlog_event["custom_field"] == {"worker": "local"}
+    assert stdlib_event["custom_field"] == {"worker": "local"}
+    assert structlog_event["exception"] == stdlib_event["exception"]
+    assert _count_stacks(structlog_event["exception"]) == 3
+    assert structlog_event["exception"][0]["unexpanded_exceptions"] == 1
+    assert structlog_line.count("\n") == 0
+    assert stdlib_line.count("\n") == 0
 
 
 class TestLogException:

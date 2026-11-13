@@ -25,7 +25,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from traceback import walk_tb
 from types import ModuleType, TracebackType
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 
 try:
@@ -92,6 +92,9 @@ class Stack:
 
     .. versionchanged:: 25.4.0
        Added the *is_group* and *exceptions* fields.
+
+    .. versionchanged:: 26.2.0
+       Added the *unexpanded_exceptions* field.
     """
 
     exc_type: str
@@ -102,6 +105,7 @@ class Stack:
     frames: list[Frame] = field(default_factory=list)
     is_group: bool = False
     exceptions: list[Trace] = field(default_factory=list)
+    unexpanded_exceptions: int = 0
 
 
 @dataclass
@@ -407,6 +411,13 @@ class ExceptionDictTransformer:
             the exception actually happened.  With larger web frameworks, this
             does not always work, so you should stick with the default.
 
+        max_stacks:
+            Maximum number of stacks in the exception tree, or ``None`` for no
+            limit.  Stacks are kept in stable depth-first order: an exception
+            chain is kept before its group children, and earlier child
+            branches are kept before later ones.  Removed group children are
+            reported in their parent's ``unexpanded_exceptions`` field.
+
         use_rich: If ``True`` (the default), use rich_ to compute the repr of
             locals.  If ``False`` or if rich_ is not installed, fall back to
             a simpler algorithm.
@@ -425,6 +436,9 @@ class ExceptionDictTransformer:
 
     .. versionchanged:: 25.4.0
        Handle exception groups.
+
+    .. versionchanged:: 26.2.0
+       Added *max_stacks*.
     """
 
     show_locals: bool
@@ -434,6 +448,7 @@ class ExceptionDictTransformer:
     locals_hide_sunder: bool
     suppress: Sequence[str]
     max_frames: int
+    max_stacks: int | None
     use_rich: bool
 
     def __init__(
@@ -446,6 +461,7 @@ class ExceptionDictTransformer:
         locals_hide_sunder: bool = False,
         suppress: Iterable[str | ModuleType] = (),
         max_frames: int = MAX_FRAMES,
+        max_stacks: int | None = None,
         use_rich: bool = True,
     ) -> None:
         if locals_max_length is not None and locals_max_length < 0:
@@ -456,6 +472,9 @@ class ExceptionDictTransformer:
             raise ValueError(msg)
         if max_frames < 2:
             msg = f'"max_frames" must be >= 2: {max_frames}'
+            raise ValueError(msg)
+        if max_stacks is not None and max_stacks < 1:
+            msg = f'"max_stacks" must be >= 1: {max_stacks}'
             raise ValueError(msg)
         self.show_locals = show_locals
         self.locals_max_length = locals_max_length
@@ -477,6 +496,7 @@ class ExceptionDictTransformer:
             path = os.path.normpath(os.path.abspath(path))
             self.suppress.append(path)
         self.max_frames = max_frames
+        self.max_stacks = max_stacks
         self.use_rich = use_rich
 
     def __call__(self, exc_info: ExcInfo) -> list[dict[str, Any]]:
@@ -508,12 +528,56 @@ class ExceptionDictTransformer:
                 *stack.frames[-half:],
             ]
 
+        if self.max_stacks is not None:
+            self._trim_to_max_stacks(trace)
+
         return self._as_dict(trace)
+
+    def _trim_to_max_stacks(self, trace: Trace) -> None:
+        """
+        Trim *trace* to *max_stacks* stacks in stable depth-first order.
+
+        The first stacks in each chain and the first children of each group
+        are kept, so the trimming order is stable.  The number of removed
+        group children is stored on their parent and rendered by
+        ``_as_dict()``.
+        """
+        budget = cast(int, self.max_stacks)
+
+        def trim_stacks(stacks: list[Stack]) -> int:
+            nonlocal budget
+
+            kept_stacks: list[Stack] = []
+            unexpanded_children = 0
+            for stack in stacks:
+                if budget <= 0:
+                    unexpanded_children += 1
+                    continue
+
+                budget -= 1
+                kept_stacks.append(stack)
+                if stack.is_group:
+                    kept_exceptions: list[Trace] = []
+                    unexpanded_exceptions = 0
+                    for child in stack.exceptions:
+                        unexpanded_exceptions += trim_stacks(child.stacks)
+                        if child.stacks:
+                            kept_exceptions.append(child)
+                    stack.exceptions[:] = kept_exceptions
+                    if unexpanded_exceptions:
+                        stack.unexpanded_exceptions = unexpanded_exceptions
+
+            stacks[:] = kept_stacks
+            return unexpanded_children
+
+        trim_stacks(trace.stacks)
 
     def _as_dict(self, trace: Trace) -> list[dict[str, Any]]:
         stack_dicts = []
         for stack in trace.stacks:
             stack_dict = asdict(stack)
+            if not stack.unexpanded_exceptions:
+                del stack_dict["unexpanded_exceptions"]
             for frame_dict in stack_dict["frames"]:
                 if frame_dict["locals"] is None or any(
                     frame_dict["filename"].startswith(path)
