@@ -1,5 +1,5 @@
 import random
-from collections.abc import Callable, Iterator, MutableMapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, MutableMapping, Sequence
 from contextlib import AbstractContextManager
 from typing import (
     Any,
@@ -164,6 +164,7 @@ class _cached_wrapper(Generic[_P, _R]):
     cache_key: Callable[..., Any] = ...
     cache_lock: AbstractContextManager[Any] | None = None
     cache_condition: _AbstractCondition | None = None
+    cache_group: Hashable | None = None
     @overload  # class access, e.g. Cls.method
     def __get__(
         self, obj: None, objtype: type | None = None
@@ -179,7 +180,8 @@ class _cached_wrapper(Generic[_P, _R]):
         self, obj: object, objtype: type | None = None
     ) -> _cached_wrapper[_P, _R]: ...
     def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _R: ...
-    def cache_clear(self) -> None: ...
+    def cache_clear(self, group: Hashable | None = None) -> None: ...
+    def cache_invalidate(self, group: Hashable | None = None) -> None: ...
 
 @type_check_only
 class _cached_wrapper_info(_cached_wrapper[_P, _R]):
@@ -209,6 +211,7 @@ def cached(
     condition: _AbstractCondition | None = None,
     *,
     info: Literal[True],
+    group: Hashable | None = ...,
 ) -> Callable[[Callable[_P, _R]], _cached_wrapper_info[_P, _R]]: ...
 @overload
 def cached(
@@ -217,6 +220,7 @@ def cached(
     lock: AbstractContextManager[Any] | None = None,
     condition: _AbstractCondition | None = None,
     info: Literal[False] = ...,
+    group: Hashable | None = ...,
 ) -> Callable[[Callable[_P, _R]], _cached_wrapper[_P, _R]]: ...
 @overload
 def cached(
@@ -225,6 +229,7 @@ def cached(
     lock: AbstractContextManager[Any] | None,
     condition: _AbstractCondition | None,
     info: Literal[True],
+    group: Hashable | None = ...,
 ) -> Callable[[Callable[_P, _R]], _cached_wrapper_info[_P, _R]]: ...
 
 @type_check_only
@@ -253,6 +258,7 @@ class _cachedmethod_wrapper(Generic[_P, _R]):
     cache_key: Callable[..., Any] = ...
     cache_lock: AbstractContextManager[Any] | None = None
     cache_condition: _AbstractCondition | None = None
+    cache_group: Hashable | None = None
     def __set_name__(self, owner: type, name: str) -> None: ...
     @overload
     def __get__(
@@ -263,7 +269,8 @@ class _cachedmethod_wrapper(Generic[_P, _R]):
         self, obj: Any, objtype: type | None = None
     ) -> _cachedmethod_wrapper[_P, _R]: ...
     def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _R: ...
-    def cache_clear(self) -> None: ...
+    def cache_clear(self, group: Hashable | None = None) -> None: ...
+    def cache_invalidate(self, group: Hashable | None = None) -> None: ...
 
 @type_check_only
 class _cachedmethod_wrapper_info(_cachedmethod_wrapper[_P, _R]):
@@ -285,6 +292,7 @@ def cachedmethod(
     condition: Callable[[Any], _AbstractCondition] | None = None,
     *,
     info: Literal[True],
+    group: Hashable | None = ...,
 ) -> Callable[
     [Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper_info[_P, _R]
 ]: ...
@@ -295,6 +303,7 @@ def cachedmethod(
     lock: Callable[[Any], AbstractContextManager[Any]] | None = None,
     condition: Callable[[Any], _AbstractCondition] | None = None,
     info: Literal[False] = ...,
+    group: Hashable | None = ...,
 ) -> Callable[[Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper[_P, _R]]: ...
 @overload
 def cachedmethod(
@@ -303,6 +312,7 @@ def cachedmethod(
     lock: Callable[[Any], AbstractContextManager[Any]] | None,
     condition: Callable[[Any], _AbstractCondition] | None,
     info: Literal[True],
+    group: Hashable | None = ...,
 ) -> Callable[
     [Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper_info[_P, _R]
 ]: ...

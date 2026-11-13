@@ -1,4 +1,5 @@
 import unittest
+from functools import partial
 
 import cachetools
 import cachetools.keys
@@ -495,6 +496,119 @@ class CacheWrapperTest(unittest.TestCase, DecoratorTestMixin):
         self.assertEqual(wrapper(self=1), {"self": 1})
         self.assertIn(cachetools.keys.hashkey(self=1), cache)
         self.assertEqual(len(cache), 1)
+
+
+class CacheGroupTest(unittest.TestCase):
+    def test_group_invalidation(self):
+        cache = cachetools.Cache(maxsize=4)
+        counts = {}
+
+        def make_func(source):
+            def func(value):
+                counts[source] = counts.get(source, 0) + 1
+                return source, value, counts[source]
+
+            return cachetools.cached(
+                cache,
+                key=partial(cachetools.keys.hashkey, source),
+                group=source,
+            )(func)
+
+        first = make_func("first")
+        second = make_func("second")
+
+        self.assertEqual(first.cache_group, "first")
+        self.assertEqual(second.cache_group, "second")
+        self.assertEqual(first(1), ("first", 1, 1))
+        self.assertEqual(second(1), ("second", 1, 1))
+        self.assertEqual(first(1), ("first", 1, 1))
+        self.assertEqual(second(1), ("second", 1, 1))
+        self.assertEqual(counts, {"first": 1, "second": 1})
+        self.assertEqual(
+            sorted(cache),
+            [("first", 1), ("second", 1)],
+        )
+
+        first.cache_clear("first")
+        self.assertEqual(list(cache), [("second", 1)])
+        self.assertEqual(first(1), ("first", 1, 2))
+        self.assertEqual(second(1), ("second", 1, 1))
+        self.assertEqual(counts, {"first": 2, "second": 1})
+        self.assertEqual(sorted(cache), [("first", 1), ("second", 1)])
+
+    def test_custom_key_convention_and_deleted_metadata(self):
+        cache = cachetools.Cache(maxsize=2)
+        count = 0
+
+        def key(value):
+            return ("custom", value)
+
+        @cachetools.cached(cache, key=key, group="source")
+        def func(value):
+            nonlocal count
+            count += 1
+            return value
+
+        self.assertEqual(func(1), 1)
+        self.assertEqual(func(1), 1)
+        self.assertEqual(count, 1)
+        self.assertEqual(list(cache), [("custom", 1)])
+
+        del cache[("custom", 1)]
+        func.cache_invalidate("source")
+        self.assertEqual(list(cache), [])
+        self.assertEqual(func(1), 1)
+        self.assertEqual(count, 2)
+
+    def test_legacy_entry_without_group_survives_group_invalidation(self):
+        cache = cachetools.Cache(maxsize=2)
+        count = 0
+
+        @cachetools.cached(cache, group="source")
+        def func(value):
+            nonlocal count
+            count += 1
+            return value
+
+        cache[(0,)] = "legacy"
+        self.assertEqual(func(1), 1)
+        func.cache_invalidate("source")
+        self.assertEqual(list(cache), [(0,)])
+        self.assertEqual(cache[(0,)], "legacy")
+        self.assertEqual(func(0), "legacy")
+        self.assertEqual(count, 1)
+
+    def test_unhashable_group(self):
+        with self.assertRaises(TypeError):
+            cachetools.cached(cachetools.Cache(maxsize=2), group=[])  # type: ignore
+
+    def test_group_invalidation_without_group_entries(self):
+        cache = cachetools.Cache(maxsize=2)
+
+        @cachetools.cached(cache)
+        def func(value):
+            return value
+
+        func.cache_invalidate("source")
+        self.assertEqual(list(cache), [])
+
+    def test_group_invalidation_with_condition(self):
+        cache = cachetools.Cache(maxsize=2)
+        cond = CountedCondition()
+        count = 0
+
+        @cachetools.cached(cache, condition=cond, group="source")
+        def func(value):
+            nonlocal count
+            count += 1
+            return value
+
+        self.assertEqual(func(1), 1)
+        self.assertEqual(func(1), 1)
+        func.cache_invalidate("source")
+        self.assertEqual(list(cache), [])
+        self.assertEqual(func(1), 1)
+        self.assertEqual(count, 2)
 
 
 class DictTest(unittest.TestCase, DecoratorTestMixin):

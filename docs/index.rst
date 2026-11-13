@@ -317,7 +317,7 @@ often called with the same arguments:
    >>> fib(42)
    267914296
 
-.. decorator:: cached(cache, key=cachetools.keys.hashkey, lock=None, condition=None, info=False)
+.. decorator:: cached(cache, key=cachetools.keys.hashkey, lock=None, condition=None, info=False, group=None)
 
    Decorator to wrap a function with a memoizing callable that saves
    results in a cache.
@@ -383,11 +383,12 @@ often called with the same arguments:
       e.g. ``condition=threading.Condition(lock)``; an unrelated
       :class:`threading.Condition` will raise :exc:`RuntimeError`.
 
-   The decorator's `cache`, `key`, `lock` and `condition` parameters
-   are also available as :attr:`cache`, :attr:`cache_key`,
-   :attr:`cache_lock` and :attr:`cache_condition` attributes of the
-   memoizing wrapper function.  These can be used for clearing the
-   cache or invalidating individual cache items, for example.
+   The decorator's `cache`, `key`, `lock`, `condition` and `group`
+   parameters are also available as :attr:`cache`, :attr:`cache_key`,
+   :attr:`cache_lock`, :attr:`cache_condition` and :attr:`cache_group`
+   attributes of the memoizing wrapper function.  These can be used
+   for clearing the cache or invalidating individual cache items, for
+   example.
 
    .. testcode::
 
@@ -412,6 +413,35 @@ often called with the same arguments:
 
       # no need for get_pep.cache_lock here
       get_pep.cache_clear()
+
+   If several functions share one cache, `group` may specify any
+   hashable object identifying the source of their results.  Calling
+   ``cache_clear(group)`` then removes only entries created by
+   functions that declared the same `group`, while other entries in
+   the cache remain available.  ``cache_invalidate(group)`` is an
+   alias for ``cache_clear(group)``.  Entries without group
+   information, e.g. created before groups were introduced, are left
+   untouched.  Grouping does not change cache keys or the way a custom
+   `key` function is called.
+
+   .. testcode::
+
+      from functools import partial
+      from cachetools.keys import hashkey
+
+      shared = LRUCache(maxsize=100)
+
+      @cached(shared, key=partial(hashkey, 'a'), group='source-a')
+      def get_a(num):
+          return 'a', num
+
+      @cached(shared, key=partial(hashkey, 'b'), group='source-b')
+      def get_b(num):
+          return 'b', num
+
+      get_a(1)
+      get_b(1)
+      get_a.cache_clear('source-a')  # get_b(1) is still cached
 
    If `info` is set to :const:`True`, the wrapped function is
    instrumented with a :meth:`cache_info()` function that returns a
@@ -557,7 +587,7 @@ often called with the same arguments:
       supported, and now raises a :exc:`TypeError`.
 
 
-.. decorator:: cachedmethod(cache, key=cachetools.keys.methodkey, lock=None, condition=None, info=False)
+.. decorator:: cachedmethod(cache, key=cachetools.keys.methodkey, lock=None, condition=None, info=False, group=None)
 
    Decorator to wrap an instance method with a memoizing callable that
    saves results in a cache.
@@ -578,12 +608,18 @@ often called with the same arguments:
       must be associated with a lock returned by `lock(self)`.
 
    Similarly to the :func:`cached` function decorator, the `cache`,
-   `key`, `lock` and `condition` parameters are also available as
-   :attr:`cache`, :attr:`cache_key`, :attr:`cache_lock` and
-   :attr:`cache_condition` attributes of the wrapped instance method.
-   A :meth:`cache_clear()` function will also be provided, as well as
-   an optional :meth:`cache_info()` function reporting per-instance
-   cache statistics.
+   `key`, `lock`, `condition` and `group` parameters are also
+   available as :attr:`cache`, :attr:`cache_key`, :attr:`cache_lock`,
+   :attr:`cache_condition` and :attr:`cache_group` attributes of the
+   wrapped instance method.  A :meth:`cache_clear()` function will
+   also be provided, as well as an optional :meth:`cache_info()`
+   function reporting per-instance cache statistics.
+
+   As with :func:`cached`, `group` may be used to identify a source
+   shared by one or more methods and instances.  Calling
+   ``cache_clear(group)`` invalidates only that group in the shared
+   cache, so a schema change for one source does not make another
+   source recompute its cached results.
 
    Also, mostly for efficiency, this decorator requires that the
    :attr:`__dict__` attribute on each instance be a mutable mapping.

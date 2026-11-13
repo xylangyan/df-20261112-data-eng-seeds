@@ -754,7 +754,7 @@ class CacheInfo(collections.namedtuple("CacheInfo", "hits misses maxsize currsiz
             return cls(hits, misses, None, len(cache))
 
 
-def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False):
+def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False, group=None):
     """Decorator to wrap a function with a memoizing callable that saves
     results in a cache.
 
@@ -763,23 +763,30 @@ def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False):
 
     if cache is None:  # no longer supported since v8.0.0
         raise TypeError("cache must not be None")
+    if group is not None:
+        hash(group)
 
     def decorator(func):
         make_info = CacheInfo._make_info if info else None
-        return _wrapper(func, cache, key, lock, condition, make_info)
+        return _wrapper(func, cache, key, lock, condition, make_info, group)
 
     return decorator
 
 
-def cachedmethod(cache, key=keys.methodkey, lock=None, condition=None, info=False):
+def cachedmethod(
+    cache, key=keys.methodkey, lock=None, condition=None, info=False, group=None
+):
     """Decorator to wrap a method with a memoizing callable that saves
     results in a cache.
 
     """
     from ._cachedmethod import _wrapper
 
+    if group is not None:
+        hash(group)
+
     def decorator(method):
         make_info = CacheInfo._make_info if info else None
-        return _wrapper(method, cache, key, lock, condition, make_info)
+        return _wrapper(method, cache, key, lock, condition, make_info, group)
 
     return decorator

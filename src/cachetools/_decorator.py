@@ -10,10 +10,13 @@ valid combinations of parameters lock, condition and info.
 
 __all__ = ()
 
+from ._groups import _clear_group, _clear_registry, _set_group
+
 
 class _BasicMixin:
-    def __init__(self, func):
+    def __init__(self, func, group=None):
         self.__func = func
+        self.__group = group
 
     def __call__(self, /, *args, **kwargs):
         cache = self.cache
@@ -28,15 +31,25 @@ class _BasicMixin:
             cache[key] = val
         except ValueError:
             pass  # value too large
+        else:
+            if self.__group is not None:
+                _set_group(cache, key, self.__group)
         return val
 
-    def cache_clear(self):
-        self.cache.clear()
+    def cache_clear(self, group=None):
+        if group is None:
+            self.cache.clear()
+            _clear_registry(self.cache)
+        else:
+            _clear_group(self.cache, group)
+
+    cache_invalidate = cache_clear
 
 
 class _LockedMixin:
-    def __init__(self, func):
+    def __init__(self, func, group=None):
         self.__func = func
+        self.__group = group
 
     def __call__(self, /, *args, **kwargs):
         cache = self.cache
@@ -54,18 +67,28 @@ class _LockedMixin:
                 # In case of a race condition, i.e. if another thread
                 # stored a value for this key while we were calling
                 # self.__func(), prefer the cached value.
-                return cache.setdefault(key, val)
+                result = cache.setdefault(key, val)
             except ValueError:
                 return val  # value too large
+            if self.__group is not None:
+                _set_group(cache, key, self.__group)
+            return result
 
-    def cache_clear(self):
+    def cache_clear(self, group=None):
         with self.cache_lock:
-            self.cache.clear()
+            if group is None:
+                self.cache.clear()
+                _clear_registry(self.cache)
+            else:
+                _clear_group(self.cache, group)
+
+    cache_invalidate = cache_clear
 
 
 class _ConditionMixin:
-    def __init__(self, func):
+    def __init__(self, func, group=None):
         self.__func = func
+        self.__group = group
         self.__pending = set()
 
     def __call__(self, /, *args, **kwargs):
@@ -89,21 +112,31 @@ class _ConditionMixin:
                     cache[key] = val
                 except ValueError:
                     pass  # value too large
+                else:
+                    if self.__group is not None:
+                        _set_group(cache, key, self.__group)
                 return val
         finally:
             with lock:
                 self.__pending.remove(key)
                 cond.notify_all()
 
-    def cache_clear(self):
+    def cache_clear(self, group=None):
         with self.cache_lock:
-            self.cache.clear()
+            if group is None:
+                self.cache.clear()
+                _clear_registry(self.cache)
+            else:
+                _clear_group(self.cache, group)
+
+    cache_invalidate = cache_clear
 
 
 class _InfoMixin:
-    def __init__(self, func, info):
+    def __init__(self, func, info, group=None):
         self.__func = func
         self.__info = info
+        self.__group = group
         self.__hits = self.__misses = 0
 
     def __call__(self, /, *args, **kwargs):
@@ -121,20 +154,30 @@ class _InfoMixin:
             cache[key] = val
         except ValueError:
             pass  # value too large
+        else:
+            if self.__group is not None:
+                _set_group(cache, key, self.__group)
         return val
 
-    def cache_clear(self):
-        self.cache.clear()
-        self.__hits = self.__misses = 0
+    def cache_clear(self, group=None):
+        if group is None:
+            self.cache.clear()
+            _clear_registry(self.cache)
+            self.__hits = self.__misses = 0
+        else:
+            _clear_group(self.cache, group)
+
+    cache_invalidate = cache_clear
 
     def cache_info(self):
         return self.__info(self.cache, self.__hits, self.__misses)
 
 
 class _LockedInfoMixin:
-    def __init__(self, func, info):
+    def __init__(self, func, info, group=None):
         self.__func = func
         self.__info = info
+        self.__group = group
         self.__hits = self.__misses = 0
 
     def __call__(self, /, *args, **kwargs):
@@ -155,14 +198,23 @@ class _LockedInfoMixin:
                 # In case of a race condition, i.e. if another thread
                 # stored a value for this key while we were calling
                 # self.__func(), prefer the cached value.
-                return cache.setdefault(key, val)
+                result = cache.setdefault(key, val)
             except ValueError:
                 return val  # value too large
+            if self.__group is not None:
+                _set_group(cache, key, self.__group)
+            return result
 
-    def cache_clear(self):
+    def cache_clear(self, group=None):
         with self.cache_lock:
-            self.cache.clear()
-            self.__hits = self.__misses = 0
+            if group is None:
+                self.cache.clear()
+                _clear_registry(self.cache)
+                self.__hits = self.__misses = 0
+            else:
+                _clear_group(self.cache, group)
+
+    cache_invalidate = cache_clear
 
     def cache_info(self):
         with self.cache_lock:
@@ -170,9 +222,10 @@ class _LockedInfoMixin:
 
 
 class _ConditionInfoMixin:
-    def __init__(self, func, info):
+    def __init__(self, func, info, group=None):
         self.__func = func
         self.__info = info
+        self.__group = group
         self.__hits = self.__misses = 0
         self.__pending = set()
 
@@ -200,16 +253,25 @@ class _ConditionInfoMixin:
                     cache[key] = val
                 except ValueError:
                     pass  # value too large
+                else:
+                    if self.__group is not None:
+                        _set_group(cache, key, self.__group)
                 return val
         finally:
             with lock:
                 self.__pending.remove(key)
                 cond.notify_all()
 
-    def cache_clear(self):
+    def cache_clear(self, group=None):
         with self.cache_lock:
-            self.cache.clear()
-            self.__hits = self.__misses = 0
+            if group is None:
+                self.cache.clear()
+                _clear_registry(self.cache)
+                self.__hits = self.__misses = 0
+            else:
+                _clear_group(self.cache, group)
+
+    cache_invalidate = cache_clear
 
     def cache_info(self):
         with self.cache_lock:

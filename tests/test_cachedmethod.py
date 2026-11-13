@@ -1,5 +1,6 @@
 import unittest
 from collections.abc import Callable
+from functools import partial
 
 from cachetools import Cache, cachedmethod, keys
 
@@ -744,6 +745,118 @@ class MethodDecoratorTestMixin(SimplifiedTestCaseProtocol):
 
         with self.assertRaises(TypeError):
             cached.baz()  # type: ignore
+
+
+class CacheMethodGroupTest(unittest.TestCase):
+    def test_group_invalidation_shared_cache(self):
+        cache = Cache(maxsize=10)
+
+        class Grouped:
+            def __init__(self, name):
+                self.name = name
+                self.cache = cache
+                self.counts = {"a": 0, "b": 0}
+
+            def compute_a(self, value):
+                self.counts["a"] += 1
+                return self.name, "a", value, self.counts["a"]
+
+            def compute_b(self, value):
+                self.counts["b"] += 1
+                return self.name, "b", value, self.counts["b"]
+
+            @cachedmethod(
+                lambda self: self.cache,
+                key=lambda self, value: keys.hashkey("a", self, value),
+                group="a",
+            )
+            def source_a(self, value):
+                return self.compute_a(value)
+
+            @cachedmethod(
+                lambda self: self.cache,
+                key=lambda self, value: keys.hashkey("b", self, value),
+                group="b",
+            )
+            def source_b(self, value):
+                return self.compute_b(value)
+
+            alias_a = cachedmethod(
+                lambda self: self.cache,
+                key=lambda self, value: keys.hashkey("a", self, value),
+                group="a",
+            )(compute_a)
+
+        first = Grouped("first")
+        second = Grouped("second")
+
+        self.assertEqual(first.source_a.cache_group, "a")
+        self.assertEqual(first.source_b.cache_group, "b")
+        self.assertEqual(first.source_a(1), ("first", "a", 1, 1))
+        self.assertEqual(second.source_a(1), ("second", "a", 1, 1))
+        self.assertEqual(first.source_b(1), ("first", "b", 1, 1))
+        self.assertEqual(second.source_b(1), ("second", "b", 1, 1))
+        self.assertEqual(first.alias_a(1), ("first", "a", 1, 1))
+        self.assertEqual(second.alias_a(1), ("second", "a", 1, 1))
+        self.assertEqual(first.counts, {"a": 1, "b": 1})
+        self.assertEqual(second.counts, {"a": 1, "b": 1})
+        self.assertEqual(len(cache), 4)
+
+        first.source_a.cache_clear("a")
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(
+            set(cache),
+            {
+                ("b", first, 1),
+                ("b", second, 1),
+            },
+        )
+        self.assertEqual(first.source_a(1), ("first", "a", 1, 2))
+        self.assertEqual(second.alias_a(1), ("second", "a", 1, 2))
+        self.assertEqual(first.source_b(1), ("first", "b", 1, 1))
+        self.assertEqual(second.source_b(1), ("second", "b", 1, 1))
+        self.assertEqual(first.counts, {"a": 2, "b": 1})
+        self.assertEqual(second.counts, {"a": 2, "b": 1})
+
+        first.source_a.cache_clear()
+        self.assertEqual(len(cache), 0)
+
+    def test_group_invalidation_with_lock_and_info(self):
+        cache = Cache(maxsize=4)
+        lock = CountedLock()
+        count = 0
+
+        class Grouped:
+            def __init__(self):
+                self.cache = cache
+                self.lock = lock
+
+            @cachedmethod(
+                lambda self: self.cache,
+                lock=lambda self: self.lock,
+                group="source",
+                info=True,
+            )
+            def get(self, value):
+                nonlocal count
+                count += 1
+                return value
+
+        cached = Grouped()
+        wrapper = cached.get
+        self.assertEqual(wrapper(1), 1)
+        self.assertEqual(wrapper(1), 1)
+        self.assertEqual(wrapper.cache_info(), (1, 1, 4, 1))
+        wrapper.cache_invalidate("source")
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(wrapper.cache_info(), (1, 1, 4, 0))
+        self.assertEqual(wrapper(1), 1)
+        self.assertEqual(count, 2)
+        self.assertEqual(wrapper.cache_info(), (1, 2, 4, 1))
+
+    def test_unhashable_group(self):
+        with self.assertRaises(TypeError):
+            cachedmethod(lambda self: self.cache, group=[])  # type: ignore
 
 
 class CacheMethodTest(unittest.TestCase, MethodDecoratorTestMixin):
